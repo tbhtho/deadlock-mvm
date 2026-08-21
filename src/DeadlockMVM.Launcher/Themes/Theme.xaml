@@ -456,6 +456,9 @@
     <converters:BooleanToBrushConverter x:Key="BoolToBrush"
                                         TrueBrush="#22C55E"
                                         FalseBrush="#EF4444" />
+    <converters:BooleanToBrushConverter x:Key="BoolToAccent"
+                                        TrueBrush="{StaticResource AccentBrush}"
+                                        FalseBrush="{StaticResource TextSecondaryBrush}" />
     <converters:BoolToToolTipConverter x:Key="BoolToToolTip" />
     <converters:StateToBrushConverter x:Key="StateToBrush" />
     <converters:InverseBoolToVisibilityConverter x:Key="InverseBoolToVisibility" />

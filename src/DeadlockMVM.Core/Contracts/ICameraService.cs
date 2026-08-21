@@ -1,4 +1,5 @@
 using DeadlockMVM.Core.Models;
+using DeadlockMVM.Core.Services;
 
 namespace DeadlockMVM.Core.Contracts;
 
@@ -7,9 +8,18 @@ namespace DeadlockMVM.Core.Contracts;
 /// The interface deliberately reports capabilities so callers cannot present
 /// unsupported state writes as if they were deterministic.
 /// </summary>
-public interface ICameraService
+public interface ICameraService : ICameraServicePollerSource
 {
     CameraCapabilities Capabilities { get; }
+
+    /// <summary>
+    /// The spectator target/mode as tracked from MVM-issued commands. This is
+    /// locally tracked, not engine-authoritative — see <see cref="SpectatorSelection"/>.
+    /// </summary>
+    SpectatorSelection Selection { get; }
+
+    /// <summary>Raised after an MVM-issued command changes the tracked selection.</summary>
+    event EventHandler? SelectionChanged;
 
     Task<CameraState?> ReadStateAsync(CancellationToken cancellationToken = default);
 

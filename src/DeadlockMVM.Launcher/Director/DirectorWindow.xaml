@@ -4,7 +4,7 @@
         xmlns:local="clr-namespace:DeadlockMVM.Launcher.Director"
         Title="Deadlock MVM Director"
         Width="380"
-        Height="530"
+        Height="500"
         WindowStyle="None"
         ResizeMode="NoResize"
         ShowInTaskbar="False"
@@ -159,12 +159,13 @@
                                 <ColumnDefinition Width="*" />
                                 <ColumnDefinition Width="Auto" />
                             </Grid.ColumnDefinitions>
-                            <TextBlock Text="CAMERA V0.2" Style="{StaticResource SectionLabel}" />
+                            <TextBlock Text="CAMERA V0.3" Style="{StaticResource SectionLabel}" />
                             <TextBlock Grid.Column="1" Text="{Binding Status}" Style="{StaticResource MutedText}" />
                         </Grid>
 
                         <Border Height="1" Background="{StaticResource BorderBrush}" Margin="0,7,0,7" />
 
+                        <!-- Live: updates continuously while this page is visible and connected -->
                         <TextBlock Text="ACTIVE TRANSFORM" Style="{StaticResource SectionLabel}" />
                         <Grid Margin="0,5,0,0">
                             <Grid.ColumnDefinitions>
@@ -200,49 +201,24 @@
                             <TextBlock Grid.Row="3" Grid.Column="4" Text="{Binding RollText}" FontFamily="Consolas" Style="{StaticResource MutedText}" Margin="8,0,0,0" />
                         </Grid>
 
-                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,8,0,0">
-                            <Button Content="READ CAMERA" Style="{StaticResource SmallButton}" Command="{Binding ReadCameraCommand}" />
-                            <Button Content="FREE ROAM" Style="{StaticResource SmallButton}" Command="{Binding FreeRoamCommand}" Margin="6,0,0,0" />
-                        </StackPanel>
-
-                        <Border Height="1" Background="{StaticResource BorderBrush}" Margin="0,9,0,7" />
-
-                        <TextBlock Text="GO TO POSITION" Style="{StaticResource SectionLabel}" ToolTip="Moves the roaming camera. Rotation is not yet restorable." />
-                        <Grid Margin="0,5,0,0">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="Auto" />
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="Auto" />
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="Auto" />
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="Auto" />
-                            </Grid.ColumnDefinitions>
-                            <TextBlock Grid.Column="0" Text="X" Style="{StaticResource MutedText}" VerticalAlignment="Center" />
-                            <TextBox Grid.Column="1" Style="{StaticResource DarkTextBox}" Text="{Binding GotoX, UpdateSourceTrigger=PropertyChanged}" Padding="4,2" Margin="3,0,6,0" />
-                            <TextBlock Grid.Column="2" Text="Y" Style="{StaticResource MutedText}" VerticalAlignment="Center" />
-                            <TextBox Grid.Column="3" Style="{StaticResource DarkTextBox}" Text="{Binding GotoY, UpdateSourceTrigger=PropertyChanged}" Padding="4,2" Margin="3,0,6,0" />
-                            <TextBlock Grid.Column="4" Text="Z" Style="{StaticResource MutedText}" VerticalAlignment="Center" />
-                            <TextBox Grid.Column="5" Style="{StaticResource DarkTextBox}" Text="{Binding GotoZ, UpdateSourceTrigger=PropertyChanged}" Padding="4,2" Margin="3,0,0,0" />
-                            <Button Grid.Column="6" Content="GO" Style="{StaticResource SmallButton}" Command="{Binding GoToPositionCommand}" Margin="6,0,0,0" MinWidth="44" />
-                        </Grid>
-
                         <Border Height="1" Background="{StaticResource BorderBrush}" Margin="0,9,0,7" />
 
                         <TextBlock Text="PLAYER / POV" Style="{StaticResource SectionLabel}" />
-                        <Grid Margin="0,5,0,0">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="Auto" />
-                            </Grid.ColumnDefinitions>
-                            <TextBox Grid.Column="0" Style="{StaticResource DarkTextBox}" Text="{Binding PlayerTarget, UpdateSourceTrigger=PropertyChanged}" Padding="6,2" />
-                            <Button Grid.Column="1" Content="SELECT" Style="{StaticResource SmallButton}" Command="{Binding SelectPlayerCommand}" Margin="6,0,0,0" />
-                        </Grid>
-                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,6,0,0">
+                        <TextBlock Text="{Binding PlayerSlotText}" Style="{StaticResource BodyText}" FontWeight="SemiBold" HorizontalAlignment="Center" Margin="0,4,0,2"
+                                   ToolTip="Tracked from MVM actions — engine does not expose a spectator-target query." />
+
+                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,4,0,0">
                             <Button Content="◀ PREV" Style="{StaticResource SmallButton}" Command="{Binding PrevPlayerCommand}" />
                             <Button Content="NEXT ▶" Style="{StaticResource SmallButton}" Command="{Binding NextPlayerCommand}" Margin="6,0,0,0" />
-                            <Button Content="IN EYE" Style="{StaticResource SmallButton}" Command="{Binding InEyeCommand}" Margin="6,0,0,0" />
-                            <Button Content="CHASE" Style="{StaticResource SmallButton}" Command="{Binding ChaseCommand}" Margin="6,0,0,0" />
+                        </StackPanel>
+
+                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,6,0,0">
+                            <Button Content="IN EYE" Style="{StaticResource SmallButton}" Command="{Binding InEyeCommand}"
+                                    Foreground="{Binding IsInEyeActive, Converter={StaticResource BoolToAccent}}" />
+                            <Button Content="CHASE" Style="{StaticResource SmallButton}" Command="{Binding ChaseCommand}" Margin="6,0,0,0"
+                                    Foreground="{Binding IsChaseActive, Converter={StaticResource BoolToAccent}}" />
+                            <Button Content="FREE ROAM" Style="{StaticResource SmallButton}" Command="{Binding FreeRoamCommand}" Margin="6,0,0,0"
+                                    Foreground="{Binding IsFreeRoamActive, Converter={StaticResource BoolToAccent}}" />
                         </StackPanel>
 
                         <Border Height="1" Background="{StaticResource BorderBrush}" Margin="0,9,0,7" />
@@ -253,17 +229,8 @@
                                 <ColumnDefinition Width="Auto" />
                                 <ColumnDefinition Width="*" />
                             </Grid.ColumnDefinitions>
-                            <Grid.RowDefinitions>
-                                <RowDefinition Height="Auto" />
-                                <RowDefinition Height="Auto" />
-                                <RowDefinition Height="Auto" />
-                            </Grid.RowDefinitions>
-                            <TextBlock Grid.Row="0" Grid.Column="0" Text="Base" Style="{StaticResource MutedText}" />
-                            <TextBlock Grid.Row="0" Grid.Column="1" Text="{Binding BaseFovText}" FontFamily="Consolas" Style="{StaticResource MutedText}" Margin="10,0,0,0" />
-                            <TextBlock Grid.Row="1" Grid.Column="0" Text="Hero Follow" Style="{StaticResource MutedText}" />
-                            <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding HeroFovText}" FontFamily="Consolas" Style="{StaticResource MutedText}" Margin="10,0,0,0" />
-                            <TextBlock Grid.Row="2" Grid.Column="0" Text="Active Camera" Style="{StaticResource MutedText}" />
-                            <TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding ActiveFovText}" Style="{StaticResource MutedText}" Margin="10,0,0,0" />
+                            <TextBlock Grid.Column="0" Text="Active Camera" Style="{StaticResource MutedText}" />
+                            <TextBlock Grid.Column="1" Text="{Binding ActiveFovText}" Style="{StaticResource MutedText}" Margin="10,0,0,0" />
                         </Grid>
 
                         <Border Height="1" Background="{StaticResource BorderBrush}" Margin="0,9,0,7" />

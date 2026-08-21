@@ -85,6 +85,7 @@ public sealed class DirectorViewModel : INotifyPropertyChanged
             OnPropertyChanged(nameof(IsReplayPage));
             OnPropertyChanged(nameof(IsCameraPage));
             OnPropertyChanged(nameof(IsOtherPage));
+            Camera.SetPageActive(IsCameraPage);
         }
     }
 
