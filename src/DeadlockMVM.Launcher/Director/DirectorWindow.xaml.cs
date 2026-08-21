@@ -17,11 +17,11 @@ public partial class DirectorWindow : Window
     private readonly ILogService _log;
     private readonly int _vconPort;
 
-    public DirectorWindow(ReplayController controller, IAppSettings settings, ILogService log)
+    public DirectorWindow(ICameraService camera, ReplayController controller, IAppSettings settings, ILogService log)
     {
         InitializeComponent();
 
-        _vm = new DirectorViewModel(controller, settings, log);
+        _vm = new DirectorViewModel(camera, controller, settings, log);
         DataContext = _vm;
         _vconPort = settings.VConsolePort;
         _log = log;

@@ -17,6 +17,7 @@ namespace DeadlockMVM.Launcher.Director;
 /// </summary>
 public sealed class DirectorViewModel : INotifyPropertyChanged
 {
+    private readonly ICameraService _camera;
     private readonly ReplayController _controller;
     private readonly IAppSettings _settings;
     private readonly ILogService _log;
@@ -31,8 +32,9 @@ public sealed class DirectorViewModel : INotifyPropertyChanged
     private double _gotoTickValue;
     private NavItem _selectedNav;
 
-    public DirectorViewModel(ReplayController controller, IAppSettings settings, ILogService log)
+    public DirectorViewModel(ICameraService camera, ReplayController controller, IAppSettings settings, ILogService log)
     {
+        _camera = camera;
         _controller = controller;
         _settings = settings;
         _log = log;
@@ -40,17 +42,19 @@ public sealed class DirectorViewModel : INotifyPropertyChanged
 
         NavItems = new ObservableCollection<NavItem>();
         NavItems.Add(new NavItem("REPLAY", true, new RelayCommand(() => SelectedNav = NavItems[0])));
-        NavItems.Add(new NavItem("CAMERA", false, new RelayCommand(() => SelectedNav = NavItems[1])));
+        NavItems.Add(new NavItem("CAMERA", true, new RelayCommand(() => SelectedNav = NavItems[1])));
         NavItems.Add(new NavItem("DOLLY", false, new RelayCommand(() => SelectedNav = NavItems[2])));
         NavItems.Add(new NavItem("VISUALS", false, new RelayCommand(() => SelectedNav = NavItems[3])));
         NavItems.Add(new NavItem("CAPTURE", false, new RelayCommand(() => SelectedNav = NavItems[4])));
         _selectedNav = NavItems[0];
+        Camera = new CameraViewModel(_camera, _controller, _log);
 
         _controller.StateChanged += OnStateChanged;
 
         PlayCommand = new RelayCommand(() => _controller.Play(), () => _controller.IsConnected);
         PauseCommand = new RelayCommand(() => _controller.Pause(), () => _controller.IsConnected);
-        TogglePauseCommand = new RelayCommand(() => _controller.TogglePause(), () => _controller.IsConnected);
+        TogglePlaybackCommand = new RelayCommand(() => _controller.TogglePause(), () => _controller.IsConnected);
+        TogglePauseCommand = TogglePlaybackCommand;
         StepBackCommand = new RelayCommand(() => _controller.StepBack(), () => _controller.IsConnected);
         StepForwardCommand = new RelayCommand(() => _controller.StepTick(1), () => _controller.IsConnected);
         SetSpeedCommand = new RelayCommand<double>(s => { if (s is { } v) _controller.SetSpeed(v); }, () => _controller.IsConnected);
@@ -69,13 +73,27 @@ public sealed class DirectorViewModel : INotifyPropertyChanged
 
     public ReplayController Controller => _controller;
 
+    public CameraViewModel Camera { get; }
+
     public NavItem SelectedNav
     {
         get => _selectedNav;
-        set { if (SetProperty(ref _selectedNav, value)) OnPropertyChanged(nameof(IsReplayPage)); }
+        set
+        {
+            if (!SetProperty(ref _selectedNav, value))
+                return;
+
+            OnPropertyChanged(nameof(IsReplayPage));
+            OnPropertyChanged(nameof(IsCameraPage));
+            OnPropertyChanged(nameof(IsOtherPage));
+        }
     }
 
     public bool IsReplayPage => _selectedNav?.Name == "REPLAY";
+
+    public bool IsCameraPage => _selectedNav?.Name == "CAMERA";
+
+    public bool IsOtherPage => !IsReplayPage && !IsCameraPage;
 
     public string ConnectionStatus
     {
@@ -98,8 +116,19 @@ public sealed class DirectorViewModel : INotifyPropertyChanged
     public string PlaybackState
     {
         get => _playbackState;
-        private set => SetProperty(ref _playbackState, value);
+        private set
+        {
+            if (!SetProperty(ref _playbackState, value))
+                return;
+
+            OnPropertyChanged(nameof(PlaybackToggleGlyph));
+            OnPropertyChanged(nameof(PlaybackToggleToolTip));
+        }
     }
+
+    public string PlaybackToggleGlyph => PlaybackState == "PAUSED" ? "▶" : "⏸";
+
+    public string PlaybackToggleToolTip => PlaybackState == "PAUSED" ? "Resume" : "Pause";
 
     public string TimescaleDisplay
     {
@@ -127,6 +156,7 @@ public sealed class DirectorViewModel : INotifyPropertyChanged
 
     public ICommand PlayCommand { get; }
     public ICommand PauseCommand { get; }
+    public ICommand TogglePlaybackCommand { get; }
     public ICommand TogglePauseCommand { get; }
     public ICommand StepBackCommand { get; }
     public ICommand StepForwardCommand { get; }
@@ -193,6 +223,7 @@ public sealed class DirectorViewModel : INotifyPropertyChanged
     {
         (PlayCommand as RelayCommand)?.RaiseCanExecuteChanged();
         (PauseCommand as RelayCommand)?.RaiseCanExecuteChanged();
+        (TogglePlaybackCommand as RelayCommand)?.RaiseCanExecuteChanged();
         (TogglePauseCommand as RelayCommand)?.RaiseCanExecuteChanged();
         (StepBackCommand as RelayCommand)?.RaiseCanExecuteChanged();
         (StepForwardCommand as RelayCommand)?.RaiseCanExecuteChanged();

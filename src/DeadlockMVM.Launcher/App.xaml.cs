@@ -46,11 +46,12 @@ public partial class App : System.Windows.Application
             // Core MVM components
             IGameCommandTransport transport = new VConsoleTransport();
             var controller = new ReplayController(transport);
+            ICameraService camera = new ReplayCameraService(transport);
 
             var viewModel = new MainViewModel(steam, process, launcher, log, settings, replayService);
 
             // Director window (hidden initially; shown on playback confirm or hotkey)
-            var director = new DirectorWindow(controller, settings, log);
+            var director = new DirectorWindow(camera, controller, settings, log);
             viewModel.SetDirector(director);
 
             var window = new MainWindow { DataContext = viewModel };
