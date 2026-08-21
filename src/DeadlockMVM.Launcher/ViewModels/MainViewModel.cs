@@ -6,7 +6,10 @@ using System.Windows.Threading;
 using DeadlockMVM.Core;
 using DeadlockMVM.Core.Contracts;
 using DeadlockMVM.Core.Models;
-using DeadlockMVM.Core.Services;namespace DeadlockMVM.Launcher.ViewModels;
+using DeadlockMVM.Core.Services;
+using DeadlockMVM.Launcher.Director;
+
+namespace DeadlockMVM.Launcher.ViewModels;
 
 public sealed class MainViewModel : ViewModelBase
 {
@@ -17,9 +20,11 @@ public sealed class MainViewModel : ViewModelBase
     private readonly ILogService _log;
     private readonly IAppSettings _settings;
     private readonly DispatcherTimer _timer;
+    private DirectorWindow? _director;
 
     private string _gameExecutablePath = string.Empty;
     private string _extraArguments = string.Empty;
+    private string _directorHotkey = "Ctrl+Alt+M";
     private string _commandPreview = string.Empty;
     private string _statusMessage = "Ready";
     private string _steamPath = string.Empty;
@@ -56,6 +61,7 @@ public sealed class MainViewModel : ViewModelBase
         _extraArguments = string.IsNullOrWhiteSpace(settings.ExtraLaunchArguments)
             ? DefaultLaunchArguments
             : settings.ExtraLaunchArguments;
+        _directorHotkey = settings.DirectorHotkey;
 
         LaunchCommand = new RelayCommand(Launch, () => CanLaunch);
         RefreshCommand = new RelayCommand(Refresh);
@@ -66,6 +72,7 @@ public sealed class MainViewModel : ViewModelBase
         ShowHomeCommand = new RelayCommand(() => IsReplaysPage = false);
         ShowReplaysCommand = new RelayCommand(ShowReplaysPage);
         UseSelectedReplayCommand = new RelayCommand(UseSelectedReplay);
+        OpenDirectorCommand = new RelayCommand(OpenDirector, () => _director is not null);
 
         _timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(3) };
         _timer.Tick += (_, _) => RefreshProcesses();
@@ -90,6 +97,14 @@ public sealed class MainViewModel : ViewModelBase
     public ICommand ShowReplaysCommand { get; }
 
     public ICommand UseSelectedReplayCommand { get; }
+
+    public ICommand OpenDirectorCommand { get; }
+
+    public void SetDirector(DirectorWindow director)
+    {
+        _director = director;
+        (OpenDirectorCommand as RelayCommand)?.RaiseCanExecuteChanged();
+    }
 
     public ObservableCollection<ReplayInfo> Replays { get; } = new();
 
@@ -170,6 +185,19 @@ public sealed class MainViewModel : ViewModelBase
                 _settings.ExtraLaunchArguments = _extraArguments;
                 UpdateCommandPreview();
             }
+        }
+    }
+
+    public string DirectorHotkey
+    {
+        get => _directorHotkey;
+        set
+        {
+            if (!SetProperty(ref _directorHotkey, value ?? string.Empty))
+                return;
+
+            _settings.DirectorHotkey = _directorHotkey;
+            _settings.Save();
         }
     }
 
@@ -422,6 +450,11 @@ public sealed class MainViewModel : ViewModelBase
                     _log.Info(confirmed
                         ? $"Playback confirmed by engine: '{gamePath}.dem'"
                         : $"Playback NOT confirmed within timeout: '{gamePath}.dem'");
+
+                    if (confirmed && _director is not null)
+                    {
+                        System.Windows.Application.Current.Dispatcher.Invoke(() => _director.ToggleVisibility());
+                    }
                 },
                 CancellationToken.None,
                 TaskCreationOptions.None,
@@ -452,6 +485,11 @@ public sealed class MainViewModel : ViewModelBase
         _settings.Save();
         StatusMessage = "Searching Steam libraries...";
         Refresh();
+    }
+
+    private void OpenDirector()
+    {
+        _director?.ToggleVisibility();
     }
 
     public void RefreshReplays()

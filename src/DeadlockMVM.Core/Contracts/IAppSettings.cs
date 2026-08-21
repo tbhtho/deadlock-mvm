@@ -12,6 +12,12 @@ public interface IAppSettings
     /// <summary>Most recently selected replay path.</summary>
     string SelectedReplayPath { get; set; }
 
+    /// <summary>TCP port of Deadlock's VConsole2 command channel.</summary>
+    int VConsolePort { get; set; }
+
+    /// <summary>Global show/hide hotkey for the Director window (e.g. "Ctrl+Alt+M").</summary>
+    string DirectorHotkey { get; set; }
+
     void Load();
 
     void Save();

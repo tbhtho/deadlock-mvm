@@ -1,6 +1,5 @@
 using System.Text.Json;
 using DeadlockMVM.Core.Contracts;
-
 namespace DeadlockMVM.Core.Services;
 
 /// <summary>JSON-backed settings store for user configurable options.</summary>
@@ -13,6 +12,10 @@ public sealed class AppSettings : IAppSettings
         public string ExtraLaunchArguments { get; set; } = string.Empty;
 
         public string SelectedReplayPath { get; set; } = string.Empty;
+
+        public int VConsolePort { get; set; } = DeadlockConstants.DefaultVConsolePort;
+
+        public string DirectorHotkey { get; set; } = "Ctrl+Alt+M";
     }
 
     private readonly string _filePath;
@@ -37,6 +40,18 @@ public sealed class AppSettings : IAppSettings
     {
         get => _document.SelectedReplayPath;
         set => _document.SelectedReplayPath = value ?? string.Empty;
+    }
+
+    public int VConsolePort
+    {
+        get => _document.VConsolePort;
+        set => _document.VConsolePort = value > 0 ? value : DeadlockConstants.DefaultVConsolePort;
+    }
+
+    public string DirectorHotkey
+    {
+        get => _document.DirectorHotkey;
+        set => _document.DirectorHotkey = string.IsNullOrWhiteSpace(value) ? "Ctrl+Alt+M" : value;
     }
 
     public void Load()

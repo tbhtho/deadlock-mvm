@@ -36,4 +36,10 @@ public static class DeadlockConstants
     /// </summary>
     public static readonly IReadOnlyList<string> MovieModeArguments =
         new[] { "-insecure", "-dev", "-console", "-condebug" };
+
+    /// <summary>
+    /// TCP port of Deadlock's VConsole2 command channel (vconcomm.dll listens
+    /// on this localhost port in a normal client launch; verified live).
+    /// </summary>
+    public const int DefaultVConsolePort = 29000;
 }
