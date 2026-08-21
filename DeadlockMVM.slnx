@@ -1,0 +1,6 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/DeadlockMVM.Core/DeadlockMVM.Core.csproj" />
+    <Project Path="src/DeadlockMVM.Launcher/DeadlockMVM.Launcher.csproj" />
+  </Folder>
+</Solution>

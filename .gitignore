@@ -1,0 +1,32 @@
+## Build output
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+publish/
+
+## Published launcher output
+/release/
+
+## Visual Studio
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+## Rider
+.idea/
+
+## Test results
+TestResults/
+*.trx
+
+## Game / runtime artifacts (never commit)
+*.dem
+console.log
+
+## Logs and temp files
+*.log
+*.tmp
+/tests/DeadlockMVM.Core.Tests/
