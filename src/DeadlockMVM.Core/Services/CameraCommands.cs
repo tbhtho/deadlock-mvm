@@ -2,16 +2,19 @@ using System.Globalization;
 
 namespace DeadlockMVM.Core.Services;
 
-/// <summary>Pure command generation for the supported Camera v0.1 surface.</summary>
+/// <summary>Pure command generation for the supported camera surface.</summary>
 public static class CameraCommands
 {
     public const string ReadActiveTransform = "getpos";
     public const string ReadSpectatorTransform = "spec_pos";
     public const string ReadBaseFov = "fov_desired";
     public const string ReadHeroFov = "citadel_camera_hero_fov";
+    public const string ReadCameraHeight = "citadel_camera_height";
     public const string FreeRoam = "spec_mode 6";
     public const string InEye = "spec_in_eye";
     public const string Chase = "spec_chase";
+    public const string NextPlayer = "spec_next";
+    public const string PrevPlayer = "spec_prev";
 
     public static string SelectPlayer(string playerOrSlot)
     {
@@ -26,10 +29,16 @@ public static class CameraCommands
 
     /// <summary>
     /// Moves the spectator roam target. Deadlock currently preserves pitch/yaw
-    /// for spec_goto, so rotation is intentionally not accepted here.
+    /// for spec_goto, so rotation is intentionally not accepted here. The engine
+    /// lands the camera citadel_camera_height units above the requested point.
     /// </summary>
     public static string MoveRoamTarget(double x, double y, double z)
-        => string.Create(CultureInfo.InvariantCulture, $"spec_goto {x:0.######} {y:0.######} {z:0.######}");
+    {
+        if (!double.IsFinite(x) || !double.IsFinite(y) || !double.IsFinite(z))
+            throw new ArgumentOutOfRangeException(nameof(x), "Coordinates must be finite numbers.");
+
+        return string.Create(CultureInfo.InvariantCulture, $"spec_goto {x:0.######} {y:0.######} {z:0.######}");
+    }
 
     public static string SetBaseFov(double fov)
     {

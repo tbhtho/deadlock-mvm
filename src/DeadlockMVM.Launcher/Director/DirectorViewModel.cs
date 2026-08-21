@@ -62,7 +62,6 @@ public sealed class DirectorViewModel : INotifyPropertyChanged
         {
             if (_gotoTickValue > 0) _controller.SeekToTick((int)_gotoTickValue);
         }, () => _controller.IsConnected);
-        ToggleDemoUiCommand = new RelayCommand(() => _controller.ToggleDemoUi(), () => _controller.IsConnected);
         RefreshStateCommand = new RelayCommand(() =>
         {
             _controller.SendRaw(ReplayCommands.QueryPosition);
@@ -162,7 +161,6 @@ public sealed class DirectorViewModel : INotifyPropertyChanged
     public ICommand StepForwardCommand { get; }
     public ICommand SetSpeedCommand { get; }
     public ICommand GotoTickCommand { get; }
-    public ICommand ToggleDemoUiCommand { get; }
     public ICommand RefreshStateCommand { get; }
 
     public IReadOnlyList<double> SpeedPresets => ReplayCommands.SpeedPresets;
@@ -229,7 +227,6 @@ public sealed class DirectorViewModel : INotifyPropertyChanged
         (StepForwardCommand as RelayCommand)?.RaiseCanExecuteChanged();
         (SetSpeedCommand as RelayCommand<double>)?.RaiseCanExecuteChanged();
         (GotoTickCommand as RelayCommand)?.RaiseCanExecuteChanged();
-        (ToggleDemoUiCommand as RelayCommand)?.RaiseCanExecuteChanged();
         (RefreshStateCommand as RelayCommand)?.RaiseCanExecuteChanged();
     }
 }

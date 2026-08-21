@@ -29,4 +29,7 @@ console.log
 ## Logs and temp files
 *.log
 *.tmp
+
+## Live-probe output artifacts
+tools/out/
 /tests/DeadlockMVM.Core.Tests/

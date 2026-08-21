@@ -11,21 +11,27 @@ using DeadlockMVM.Launcher.ViewModels;
 
 namespace DeadlockMVM.Launcher.Director;
 
-/// <summary>External Director view model for Camera v0.1 discovery.</summary>
+/// <summary>External Director view model for the Camera page.</summary>
 public sealed class CameraViewModel : INotifyPropertyChanged
 {
     private readonly ICameraService _camera;
     private readonly ReplayController _controller;
     private readonly ILogService _log;
     private readonly System.Windows.Threading.Dispatcher? _dispatcher;
-    private string _status = "Camera discovery ready";
-    private string _positionText = "Unavailable";
-    private string _rotationText = "Unavailable";
-    private string _baseFovText = "Unavailable";
-    private string _heroFovText = "Unavailable";
+    private string _status = "Camera ready";
+    private string _posXText = "—";
+    private string _posYText = "—";
+    private string _posZText = "—";
+    private string _pitchText = "—";
+    private string _yawText = "—";
+    private string _rollText = "—";
+    private string _baseFovText = "—";
+    private string _heroFovText = "—";
     private string _activeFovText = "Unavailable";
     private string _playerTarget = "1";
-    private string _baseFovInput = "75";
+    private string _gotoX = string.Empty;
+    private string _gotoY = string.Empty;
+    private string _gotoZ = string.Empty;
     private bool _isConnected;
 
     public CameraViewModel(ICameraService camera, ReplayController controller, ILogService log)
@@ -38,9 +44,11 @@ public sealed class CameraViewModel : INotifyPropertyChanged
         ReadCameraCommand = new RelayCommand(() => _ = ReadCameraAsync(), () => IsConnected);
         FreeRoamCommand = new RelayCommand(() => Send("free roam", _camera.EnterFreeRoam), () => IsConnected);
         SelectPlayerCommand = new RelayCommand(() => Send("player selection", () => _camera.SelectPlayer(PlayerTarget)), () => IsConnected);
+        PrevPlayerCommand = new RelayCommand(() => Send("previous player", _camera.SelectPrevPlayer), () => IsConnected);
+        NextPlayerCommand = new RelayCommand(() => Send("next player", _camera.SelectNextPlayer), () => IsConnected);
         InEyeCommand = new RelayCommand(() => Send("in-eye POV", _camera.SelectInEye), () => IsConnected);
         ChaseCommand = new RelayCommand(() => Send("chase POV", _camera.SelectChase), () => IsConnected);
-        SetBaseFovCommand = new RelayCommand(SetBaseFov, () => IsConnected);
+        GoToPositionCommand = new RelayCommand(() => _ = GoToPositionAsync(), () => IsConnected && Capabilities.CanWritePosition);
 
         _controller.StateChanged += OnStateChanged;
     }
@@ -53,16 +61,40 @@ public sealed class CameraViewModel : INotifyPropertyChanged
         private set => SetProperty(ref _status, value);
     }
 
-    public string PositionText
+    public string PosXText
     {
-        get => _positionText;
-        private set => SetProperty(ref _positionText, value);
+        get => _posXText;
+        private set => SetProperty(ref _posXText, value);
     }
 
-    public string RotationText
+    public string PosYText
     {
-        get => _rotationText;
-        private set => SetProperty(ref _rotationText, value);
+        get => _posYText;
+        private set => SetProperty(ref _posYText, value);
+    }
+
+    public string PosZText
+    {
+        get => _posZText;
+        private set => SetProperty(ref _posZText, value);
+    }
+
+    public string PitchText
+    {
+        get => _pitchText;
+        private set => SetProperty(ref _pitchText, value);
+    }
+
+    public string YawText
+    {
+        get => _yawText;
+        private set => SetProperty(ref _yawText, value);
+    }
+
+    public string RollText
+    {
+        get => _rollText;
+        private set => SetProperty(ref _rollText, value);
     }
 
     public string BaseFovText
@@ -89,10 +121,22 @@ public sealed class CameraViewModel : INotifyPropertyChanged
         set => SetProperty(ref _playerTarget, value);
     }
 
-    public string BaseFovInput
+    public string GotoX
     {
-        get => _baseFovInput;
-        set => SetProperty(ref _baseFovInput, value);
+        get => _gotoX;
+        set => SetProperty(ref _gotoX, value);
+    }
+
+    public string GotoY
+    {
+        get => _gotoY;
+        set => SetProperty(ref _gotoY, value);
+    }
+
+    public string GotoZ
+    {
+        get => _gotoZ;
+        set => SetProperty(ref _gotoZ, value);
     }
 
     public bool IsConnected
@@ -110,11 +154,15 @@ public sealed class CameraViewModel : INotifyPropertyChanged
     public ICommand ReadCameraCommand { get; }
     public ICommand FreeRoamCommand { get; }
     public ICommand SelectPlayerCommand { get; }
+    public ICommand PrevPlayerCommand { get; }
+    public ICommand NextPlayerCommand { get; }
     public ICommand InEyeCommand { get; }
     public ICommand ChaseCommand { get; }
-    public ICommand SetBaseFovCommand { get; }
+    public ICommand GoToPositionCommand { get; }
 
-    public string RestoreLimitation => Capabilities.Limitation;
+    public string RestoreLimitation => Capabilities.CanSaveRestore
+        ? string.Empty
+        : "Unavailable — camera rotation control is required.";
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
@@ -142,25 +190,50 @@ public sealed class CameraViewModel : INotifyPropertyChanged
     {
         if (state.ActiveTransform is { } transform)
         {
-            PositionText = $"{transform.X:0.000000}  {transform.Y:0.000000}  {transform.Z:0.000000}";
-            RotationText = $"Pitch {transform.Pitch:0.000000}  Yaw {transform.Yaw:0.000000}  Roll {transform.Roll:0.000000}";
+            PosXText = $"{transform.X:0.000}";
+            PosYText = $"{transform.Y:0.000}";
+            PosZText = $"{transform.Z:0.000}";
+            PitchText = $"{transform.Pitch:0.000}";
+            YawText = $"{transform.Yaw:0.000}";
+            RollText = $"{transform.Roll:0.000}";
         }
 
-        BaseFovText = state.BaseFov is { } baseFov ? $"{baseFov:0.##} (base)" : "Unavailable";
-        HeroFovText = state.HeroFov is { } heroFov ? $"{heroFov:0.##} (hero follow)" : "Unavailable";
-        ActiveFovText = state.ActiveFov is { } activeFov ? $"{activeFov:0.##}" : "Unavailable";
-        Status = "Read from engine getpos";
+        BaseFovText = state.BaseFov is { } baseFov ? $"{baseFov:0.#}°" : "—";
+        HeroFovText = state.HeroFov is { } heroFov ? $"{heroFov:0.#}°" : "—";
+        ActiveFovText = "Unavailable";
+        Status = "Camera read OK";
     }
 
-    private void SetBaseFov()
+    private async Task GoToPositionAsync()
     {
-        if (!double.TryParse(BaseFovInput, NumberStyles.Float, CultureInfo.InvariantCulture, out var fov))
+        if (!double.TryParse(GotoX, NumberStyles.Float, CultureInfo.InvariantCulture, out var x)
+            || !double.TryParse(GotoY, NumberStyles.Float, CultureInfo.InvariantCulture, out var y)
+            || !double.TryParse(GotoZ, NumberStyles.Float, CultureInfo.InvariantCulture, out var z))
         {
-            Status = "Enter a numeric base FOV.";
+            Status = "Enter numeric X/Y/Z.";
             return;
         }
 
-        Send("base FOV", () => _camera.SetBaseFov(fov));
+        try
+        {
+            SetOnUi(() => Status = "Moving camera…");
+            var state = await _camera.GoToPositionAsync(x, y, z).ConfigureAwait(false);
+            SetOnUi(() =>
+            {
+                if (state is null)
+                {
+                    Status = "Position read back unavailable.";
+                    return;
+                }
+
+                ApplyState(state);
+            });
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Camera go-to-position failed: {ex.Message}");
+            SetOnUi(() => Status = "Go to position unavailable.");
+        }
     }
 
     private void Send(string label, Action action)
@@ -198,9 +271,11 @@ public sealed class CameraViewModel : INotifyPropertyChanged
         (ReadCameraCommand as RelayCommand)?.RaiseCanExecuteChanged();
         (FreeRoamCommand as RelayCommand)?.RaiseCanExecuteChanged();
         (SelectPlayerCommand as RelayCommand)?.RaiseCanExecuteChanged();
+        (PrevPlayerCommand as RelayCommand)?.RaiseCanExecuteChanged();
+        (NextPlayerCommand as RelayCommand)?.RaiseCanExecuteChanged();
         (InEyeCommand as RelayCommand)?.RaiseCanExecuteChanged();
         (ChaseCommand as RelayCommand)?.RaiseCanExecuteChanged();
-        (SetBaseFovCommand as RelayCommand)?.RaiseCanExecuteChanged();
+        (GoToPositionCommand as RelayCommand)?.RaiseCanExecuteChanged();
     }
 
     private bool SetProperty<T>(ref T field, T value, [System.Runtime.CompilerServices.CallerMemberName] string? name = null)

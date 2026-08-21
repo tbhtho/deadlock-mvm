@@ -19,11 +19,15 @@ public static partial class CameraStateParser
     [GeneratedRegex(@"^citadel_camera_hero_fov\s*=\s*([-+]?\d+(?:\.\d+)?)", RegexOptions.IgnoreCase)]
     private static partial Regex HeroFovLine();
 
+    [GeneratedRegex(@"^citadel_camera_height\s*=\s*([-+]?\d+(?:\.\d+)?)", RegexOptions.IgnoreCase)]
+    private static partial Regex CameraHeightLine();
+
     public static CameraState Merge(IEnumerable<string> lines)
     {
         CameraTransform? transform = null;
         double? baseFov = null;
         double? heroFov = null;
+        double? cameraHeight = null;
 
         foreach (var line in lines)
         {
@@ -54,7 +58,14 @@ public static partial class CameraStateParser
 
             var heroFovMatch = HeroFovLine().Match(line);
             if (heroFovMatch.Success)
+            {
                 heroFov = Number(heroFovMatch, 1);
+                continue;
+            }
+
+            var cameraHeightMatch = CameraHeightLine().Match(line);
+            if (cameraHeightMatch.Success)
+                cameraHeight = Number(cameraHeightMatch, 1);
         }
 
         return new CameraState
@@ -63,6 +74,7 @@ public static partial class CameraStateParser
             BaseFov = baseFov,
             HeroFov = heroFov,
             ActiveFov = null,
+            CameraHeight = cameraHeight,
         };
     }
 

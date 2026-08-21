@@ -23,4 +23,10 @@ public sealed record CameraState
     public double? HeroFov { get; init; }
 
     public double? ActiveFov { get; init; }
+
+    /// <summary>
+    /// The citadel_camera_height cvar. spec_goto lands the roaming camera this
+    /// many units above the requested point, so position writes compensate by it.
+    /// </summary>
+    public double? CameraHeight { get; init; }
 }
