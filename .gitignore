@@ -32,4 +32,7 @@ console.log
 
 ## Live-probe output artifacts
 tools/out/
+
+## Reverse-engineering research work area (IDA databases, binary copies, temp)
+tools/research/ida/
 /tests/DeadlockMVM.Core.Tests/
