@@ -10,6 +10,14 @@ public static class CameraCommands
     public const string ReadBaseFov = "fov_desired";
     public const string ReadHeroFov = "citadel_camera_hero_fov";
     public const string ReadCameraHeight = "citadel_camera_height";
+
+    /// <summary>
+    /// The auto-director hijacks the spectator camera on its own schedule
+    /// (live-tested: it moves the fly camera between action spots), so manual
+    /// camera control starts by disabling it. Idempotent and silent.
+    /// </summary>
+    public const string DisableAutoDirector = "spec_autodirector false";
+
     public const string FreeRoam = "spec_mode 6";
     public const string InEye = "spec_in_eye";
     public const string Chase = "spec_chase";
@@ -28,9 +36,12 @@ public static class CameraCommands
     }
 
     /// <summary>
-    /// Moves the spectator roam target. Deadlock currently preserves pitch/yaw
-    /// for spec_goto, so rotation is intentionally not accepted here. The engine
-    /// lands the camera citadel_camera_height units above the requested point.
+    /// Moves the spectator roam target. spec_goto always forces roaming mode
+    /// and drops the follow target (live-tested). From roam it preserves the
+    /// current view angles; from a follow mode the engine re-aims the camera
+    /// on roam entry (no rotation writer exists in this build), so rotation is
+    /// intentionally not accepted here. The engine lands the camera
+    /// citadel_camera_height units above the requested point.
     /// </summary>
     public static string MoveRoamTarget(double x, double y, double z)
     {

@@ -51,43 +51,120 @@ public sealed class ReplayCameraService : ICameraService
     public Task<CameraState?> ReadTransformAsync(CancellationToken cancellationToken = default)
         => ReadLinesAsync(cancellationToken, CameraCommands.ReadActiveTransform);
 
-    public void EnterFreeRoam()
+    /// <summary>
+    /// Enters free roam from any state in one editor action. Live-tested engine
+    /// behavior: the auto-director hijacks manual camera
+    /// control, so it is disabled first; spec_mode 6 is silently ignored while
+    /// a live player is being followed, but spec_goto always forces roaming
+    /// (and drops the follow target) in a single command. The roam target is
+    /// therefore the camera's own current position (height-compensated), so
+    /// entering roam does not visibly move the camera. If the transform cannot
+    /// be read, a bare spec_mode 6 is sent as a best-effort fallback.
+    /// </summary>
+    public async Task<CameraState?> EnterFreeRoamAsync(CancellationToken cancellationToken = default)
     {
-        Send(CameraCommands.FreeRoam);
-        TrackSelection(_selection with { Mode = SpecCameraMode.FreeRoam });
+        EnsureConnected();
+        Send(CameraCommands.DisableAutoDirector);
+
+        var state = await ReadTransformAsync(cancellationToken).ConfigureAwait(false);
+        if (state?.ActiveTransform is { } transform)
+        {
+            var height = state.CameraHeight ?? 63;
+            Send(CameraCommands.MoveRoamTarget(transform.X, transform.Y, transform.Z - height));
+        }
+        else
+        {
+            Send(CameraCommands.FreeRoam);
+        }
+
+        // Roaming has no follow target; the engine drops it on roam entry.
+        TrackSelection(new SpectatorSelection { Mode = SpecCameraMode.FreeRoam });
+        return state;
     }
 
     public void SelectPlayer(string playerOrSlot)
     {
+        EnsureConnected();
+        Send(CameraCommands.DisableAutoDirector);
         Send(CameraCommands.SelectPlayer(playerOrSlot));
         TrackSelection(_selection with
         {
             PlayerSlot = int.TryParse(playerOrSlot?.Trim(), out var slot) ? slot : null,
+            // Selecting a player from roaming enters a follow mode on the engine side.
+            Mode = _selection.Mode == SpecCameraMode.FreeRoam ? SpecCameraMode.Chase : _selection.Mode,
         });
     }
 
     public void SelectNextPlayer()
     {
+        EnsureConnected();
+        Send(CameraCommands.DisableAutoDirector);
+
+        // Roaming has no target: spec_next acquires one and the engine enters
+        // a follow mode, so pin chase explicitly to keep the result deterministic.
+        var fromRoam = _selection.Mode == SpecCameraMode.FreeRoam;
         Send(CameraCommands.NextPlayer);
-        TrackSelection(_selection with { PlayerSlot = (_selection.PlayerSlot ?? 0) + 1 });
+        if (fromRoam)
+            Send(CameraCommands.Chase);
+
+        TrackSelection(new SpectatorSelection
+        {
+            PlayerSlot = (_selection.PlayerSlot ?? 0) + 1,
+            Mode = fromRoam ? SpecCameraMode.Chase : _selection.Mode,
+        });
     }
 
     public void SelectPrevPlayer()
     {
+        EnsureConnected();
+        Send(CameraCommands.DisableAutoDirector);
+
+        var fromRoam = _selection.Mode == SpecCameraMode.FreeRoam;
         Send(CameraCommands.PrevPlayer);
-        TrackSelection(_selection with { PlayerSlot = Math.Max(1, (_selection.PlayerSlot ?? 2) - 1) });
+        if (fromRoam)
+            Send(CameraCommands.Chase);
+
+        TrackSelection(new SpectatorSelection
+        {
+            PlayerSlot = Math.Max(1, (_selection.PlayerSlot ?? 2) - 1),
+            Mode = fromRoam ? SpecCameraMode.Chase : _selection.Mode,
+        });
     }
 
     public void SelectInEye()
     {
+        EnsureConnected();
+        Send(CameraCommands.DisableAutoDirector);
+
+        // spec_in_eye is a no-op without a follow target (live-tested), and
+        // roaming has none — acquire a target first, then force the mode.
+        var acquireTarget = _selection.Mode == SpecCameraMode.FreeRoam;
+        if (acquireTarget)
+            Send(CameraCommands.NextPlayer);
+
         Send(CameraCommands.InEye);
-        TrackSelection(_selection with { Mode = SpecCameraMode.InEye });
+        TrackSelection(new SpectatorSelection
+        {
+            Mode = SpecCameraMode.InEye,
+            PlayerSlot = acquireTarget ? (_selection.PlayerSlot ?? 0) + 1 : _selection.PlayerSlot,
+        });
     }
 
     public void SelectChase()
     {
+        EnsureConnected();
+        Send(CameraCommands.DisableAutoDirector);
+
+        var acquireTarget = _selection.Mode == SpecCameraMode.FreeRoam;
+        if (acquireTarget)
+            Send(CameraCommands.NextPlayer);
+
         Send(CameraCommands.Chase);
-        TrackSelection(_selection with { Mode = SpecCameraMode.Chase });
+        TrackSelection(new SpectatorSelection
+        {
+            Mode = SpecCameraMode.Chase,
+            PlayerSlot = acquireTarget ? (_selection.PlayerSlot ?? 0) + 1 : _selection.PlayerSlot,
+        });
     }
 
     public void MoveRoamTarget(double x, double y, double z)
@@ -105,12 +182,14 @@ public sealed class ReplayCameraService : ICameraService
     public async Task<CameraState?> GoToPositionAsync(double x, double y, double z, CancellationToken cancellationToken = default)
     {
         EnsureConnected();
+        Send(CameraCommands.DisableAutoDirector);
 
         var current = await ReadStateAsync(cancellationToken).ConfigureAwait(false);
         var height = current?.CameraHeight ?? 63;
         MoveRoamTarget(x, y, z - height);
-        // spec_goto switches the spectator mode to roaming.
-        TrackSelection(_selection with { Mode = SpecCameraMode.FreeRoam });
+        // spec_goto switches the spectator mode to roaming and drops the
+        // follow target.
+        TrackSelection(new SpectatorSelection { Mode = SpecCameraMode.FreeRoam });
 
         CameraTransform? previous = null;
         var deadline = DateTime.UtcNow + SettleTimeout;

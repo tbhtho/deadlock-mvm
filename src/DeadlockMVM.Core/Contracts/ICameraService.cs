@@ -23,7 +23,12 @@ public interface ICameraService : ICameraServicePollerSource
 
     Task<CameraState?> ReadStateAsync(CancellationToken cancellationToken = default);
 
-    void EnterFreeRoam();
+    /// <summary>
+    /// Enters free roam from any state in one editor action. Reads the current
+    /// transform so the roam entry keeps the camera where it is; returns the
+    /// state that was read, or null when the transform was unavailable.
+    /// </summary>
+    Task<CameraState?> EnterFreeRoamAsync(CancellationToken cancellationToken = default);
 
     void SelectPlayer(string playerOrSlot);
 

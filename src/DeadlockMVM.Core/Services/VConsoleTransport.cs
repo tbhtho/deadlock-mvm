@@ -23,6 +23,7 @@ public sealed class VConsoleTransport : IGameCommandTransport
     private const byte ProtocolVersionLow = 0xD4;
 
     private readonly object _gate = new();
+    private readonly object _sendLock = new();
     private readonly MemoryStream _raw = new();
     private string _textBuffer = string.Empty;
     private readonly Queue<string> _pendingLines = new();
@@ -105,14 +106,19 @@ public sealed class VConsoleTransport : IGameCommandTransport
 
         try
         {
-            var socket = _client.Client;
-            var offset = 0;
-            while (offset < message.Length)
+            // Serialize writes: the replay controller, camera poller, and UI
+            // actions all send on this socket from different threads.
+            lock (_sendLock)
             {
-                var sent = socket.Send(message, offset, message.Length - offset, SocketFlags.None);
-                if (sent <= 0)
-                    throw new IOException("The VConsole socket closed while sending a command.");
-                offset += sent;
+                var socket = _client.Client;
+                var offset = 0;
+                while (offset < message.Length)
+                {
+                    var sent = socket.Send(message, offset, message.Length - offset, SocketFlags.None);
+                    if (sent <= 0)
+                        throw new IOException("The VConsole socket closed while sending a command.");
+                    offset += sent;
+                }
             }
         }
         catch

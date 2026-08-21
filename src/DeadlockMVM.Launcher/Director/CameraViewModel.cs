@@ -44,7 +44,7 @@ public sealed class CameraViewModel : INotifyPropertyChanged
         _poller = new CameraStatePoller(_camera);
         _poller.StateUpdated += OnPolledState;
 
-        FreeRoamCommand = new RelayCommand(() => Send("free roam", _camera.EnterFreeRoam), () => IsConnected);
+        FreeRoamCommand = new RelayCommand(() => _ = FreeRoamAsync(), () => IsConnected);
         PrevPlayerCommand = new RelayCommand(() => Send("previous player", _camera.SelectPrevPlayer), () => IsConnected);
         NextPlayerCommand = new RelayCommand(() => Send("next player", _camera.SelectNextPlayer), () => IsConnected);
         InEyeCommand = new RelayCommand(() => Send("in-eye POV", _camera.SelectInEye), () => IsConnected);
@@ -220,6 +220,20 @@ public sealed class CameraViewModel : INotifyPropertyChanged
         {
             _log.Warn($"Camera {label} failed: {ex.Message}");
             Status = $"{label} unavailable.";
+        }
+    }
+
+    private async Task FreeRoamAsync()
+    {
+        try
+        {
+            await _camera.EnterFreeRoamAsync().ConfigureAwait(true);
+            Status = "Sent free roam command.";
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Camera free roam failed: {ex.Message}");
+            Status = "free roam unavailable.";
         }
     }
 
