@@ -139,4 +139,36 @@ public partial class DirectorWindow : Window
     {
         Hide();
     }
+
+    // ---- Camera page FOV editor (input plumbing only; logic lives in CameraViewModel)
+
+    // _vm is null while InitializeComponent runs; control events can fire that early.
+    private CameraViewModel? Camera => _vm?.Camera;
+
+    private void FovInput_KeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+    {
+        if (e.Key == System.Windows.Input.Key.Enter)
+        {
+            Camera?.CommitFovInput();
+            e.Handled = true;
+        }
+    }
+
+    private void FovInput_GotFocus(object sender, RoutedEventArgs e)
+        => Camera?.SetFovEditing(true);
+
+    private void FovInput_LostFocus(object sender, RoutedEventArgs e)
+        => Camera?.CommitFovInput();
+
+    private void FovSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+        => Camera?.OnFovSliderChanged(e.NewValue);
+
+    private void FovSlider_DragStarted(object sender, MouseButtonEventArgs e)
+        => Camera?.SetFovEditing(true);
+
+    private void FovSlider_DragCompleted(object sender, MouseButtonEventArgs e)
+    {
+        Camera?.SetFovEditing(false);
+        Camera?.CommitFovSlider();
+    }
 }

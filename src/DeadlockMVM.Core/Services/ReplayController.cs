@@ -18,7 +18,7 @@ namespace DeadlockMVM.Core.Services;
 ///    not track it), so the last commanded value is surfaced and null until
 ///    MVM sets one.
 /// </summary>
-public sealed class ReplayController : IDisposable
+public sealed class ReplayController : IReplayPlaybackState, IDisposable
 {
     private readonly IGameCommandTransport _transport;
     private readonly ReplayStateParser _parser = new();

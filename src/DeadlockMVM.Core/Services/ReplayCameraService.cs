@@ -40,6 +40,29 @@ public sealed class ReplayCameraService : ICameraService
 
     public event EventHandler? SelectionChanged;
 
+    /// <summary>The VConsole backend's capabilities are static; this never fires.</summary>
+    public event EventHandler? CapabilitiesChanged
+    {
+        add { }
+        remove { }
+    }
+
+    /// <summary>Not supported over VConsole.</summary>
+    public Task<bool> SetActiveFovAsync(double fov, CancellationToken cancellationToken = default)
+        => Task.FromResult(false);
+
+    /// <summary>Not supported over VConsole.</summary>
+    public Task<bool> SetCameraRotationAsync(double pitch, double yaw, double roll, CancellationToken cancellationToken = default)
+        => Task.FromResult(false);
+
+    public CameraShot? SavedShot => null;
+
+    public Task<CameraShot?> SaveCameraAsync(CancellationToken cancellationToken = default)
+        => Task.FromResult<CameraShot?>(null);
+
+    public Task<bool> RestoreCameraAsync(CancellationToken cancellationToken = default)
+        => Task.FromResult(false);
+
     public Task<CameraState?> ReadStateAsync(CancellationToken cancellationToken = default)
         => ReadLinesAsync(cancellationToken,
             CameraCommands.ReadActiveTransform,
@@ -177,7 +200,12 @@ public sealed class ReplayCameraService : ICameraService
     /// camera citadel_camera_height units above the target, so the request is
     /// compensated by the live height readback. The camera glides to the target,
     /// so completion is detected by polling getpos until the position is stable
-    /// (two identical consecutive reads) rather than by a fixed delay.
+    /// (two identical consecutive reads) rather than by a fixed delay. If the
+    /// settled landing misses the target, the actual engine landing offset is
+    /// measured and one corrected goto is issued (live-tested: the effective
+    /// offset can exceed the documented height cvar; a systematic offset cancels
+    /// exactly, while world-geometry slides still surface as an off-target
+    /// landing for the caller to judge).
     /// </summary>
     public async Task<CameraState?> GoToPositionAsync(double x, double y, double z, CancellationToken cancellationToken = default)
     {
@@ -191,6 +219,21 @@ public sealed class ReplayCameraService : ICameraService
         // follow target.
         TrackSelection(new SpectatorSelection { Mode = SpecCameraMode.FreeRoam });
 
+        var settled = await WaitForSettleAsync(cancellationToken).ConfigureAwait(false);
+        if (settled?.ActiveTransform is { } landed &&
+            (Math.Abs(landed.X - x) > 1.0 || Math.Abs(landed.Y - y) > 1.0 || Math.Abs(landed.Z - z) > 1.0))
+        {
+            // One corrected goto: subtract the measured landing error.
+            MoveRoamTarget(x - (landed.X - x), y - (landed.Y - y), z - (landed.Z - z) - height);
+            settled = await WaitForSettleAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        return settled;
+    }
+
+    /// <summary>Polls getpos until the position is stable (two identical reads).</summary>
+    private async Task<CameraState?> WaitForSettleAsync(CancellationToken cancellationToken)
+    {
         CameraTransform? previous = null;
         var deadline = DateTime.UtcNow + SettleTimeout;
         while (DateTime.UtcNow < deadline)
@@ -244,20 +287,25 @@ public sealed class ReplayCameraService : ICameraService
 
         void OnLine(object? sender, string line)
         {
-            if (!started)
+            // Transport output arrives on the transport thread while the awaiting
+            // continuation may already be snapshotting — all access under the lock.
+            lock (lines)
             {
-                if (line.Contains(begin, StringComparison.Ordinal))
-                    started = true;
-                return;
-            }
+                if (!started)
+                {
+                    if (line.Contains(begin, StringComparison.Ordinal))
+                        started = true;
+                    return;
+                }
 
-            if (line.Contains(end, StringComparison.Ordinal))
-            {
-                completion.TrySetResult(true);
-                return;
-            }
+                if (line.Contains(end, StringComparison.Ordinal))
+                {
+                    completion.TrySetResult(true);
+                    return;
+                }
 
-            lines.Add(line);
+                lines.Add(line);
+            }
         }
 
         _transport.OutputLineReceived += OnLine;
@@ -268,7 +316,13 @@ public sealed class ReplayCameraService : ICameraService
                 _transport.SendCommand(command);
             _transport.SendCommand($"echo {end}");
             await completion.Task.WaitAsync(TimeSpan.FromSeconds(5), cancellationToken).ConfigureAwait(false);
-            return CameraStateParser.Merge(lines);
+            string[] snapshot;
+            lock (lines)
+            {
+                snapshot = lines.ToArray();
+            }
+
+            return CameraStateParser.Merge(snapshot);
         }
         finally
         {

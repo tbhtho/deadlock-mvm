@@ -1,7 +1,8 @@
-﻿using System.Windows;
+using System.Windows;
 using DeadlockMVM.Core;
 using DeadlockMVM.Core.Contracts;
 using DeadlockMVM.Core.Models;
+using DeadlockMVM.Core.Native;
 using DeadlockMVM.Core.Services;
 using DeadlockMVM.Launcher.Director;
 using DeadlockMVM.Launcher.ViewModels;
@@ -46,7 +47,11 @@ public partial class App : System.Windows.Application
             // Core MVM components
             IGameCommandTransport transport = new VConsoleTransport();
             var controller = new ReplayController(transport);
-            ICameraService camera = new ReplayCameraService(transport);
+            // VConsole camera path (transform/position/POV/roam) composed with the
+            // native replay-camera backend (active FOV, roaming rotation).
+            var nativeCamera = new NativeCameraBackend(log);
+            ICameraService camera = new CompositeCameraService(
+                new ReplayCameraService(transport), nativeCamera, controller, log);
 
             var viewModel = new MainViewModel(steam, process, launcher, log, settings, replayService);
 

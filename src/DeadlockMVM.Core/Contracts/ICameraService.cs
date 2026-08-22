@@ -21,6 +21,12 @@ public interface ICameraService : ICameraServicePollerSource
     /// <summary>Raised after an MVM-issued command changes the tracked selection.</summary>
     event EventHandler? SelectionChanged;
 
+    /// <summary>
+    /// Raised when <see cref="Capabilities"/> may have changed — e.g. a native
+    /// backend attached/detached, or the spectator mode changed what is writable.
+    /// </summary>
+    event EventHandler? CapabilitiesChanged;
+
     Task<CameraState?> ReadStateAsync(CancellationToken cancellationToken = default);
 
     /// <summary>
@@ -50,4 +56,31 @@ public interface ICameraService : ICameraServicePollerSource
     Task<CameraState?> GoToPositionAsync(double x, double y, double z, CancellationToken cancellationToken = default);
 
     void SetBaseFov(double fov);
+
+    /// <summary>
+    /// Writes the FOV of the camera actually being rendered. Only available when a
+    /// backend has live-proven control of the active camera FOV (see Capabilities).
+    /// </summary>
+    Task<bool> SetActiveFovAsync(double fov, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Writes the roaming camera's rotation (degrees). Free-roam only: follow modes
+    /// derive their view from the observed target.
+    /// </summary>
+    Task<bool> SetCameraRotationAsync(double pitch, double yaw, double roll, CancellationToken cancellationToken = default);
+
+    /// <summary>The shot captured by <see cref="SaveCameraAsync"/>, when one exists.</summary>
+    CameraShot? SavedShot { get; }
+
+    /// <summary>
+    /// Captures the current transform and active FOV as a movie-camera shot.
+    /// Null when Save/Restore is not currently supported (see Capabilities).
+    /// </summary>
+    Task<CameraShot?> SaveCameraAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Brings back the exact saved composition: position, rotation and FOV.
+    /// Verifies the engine-reported result before reporting success.
+    /// </summary>
+    Task<bool> RestoreCameraAsync(CancellationToken cancellationToken = default);
 }

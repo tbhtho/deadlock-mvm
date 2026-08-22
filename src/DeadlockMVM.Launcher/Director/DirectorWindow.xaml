@@ -159,7 +159,7 @@
                                 <ColumnDefinition Width="*" />
                                 <ColumnDefinition Width="Auto" />
                             </Grid.ColumnDefinitions>
-                            <TextBlock Text="CAMERA V0.3" Style="{StaticResource SectionLabel}" />
+                            <TextBlock Text="CAMERA V0.4" Style="{StaticResource SectionLabel}" />
                             <TextBlock Grid.Column="1" Text="{Binding Status}" Style="{StaticResource MutedText}" />
                         </Grid>
 
@@ -224,22 +224,58 @@
                         <Border Height="1" Background="{StaticResource BorderBrush}" Margin="0,9,0,7" />
 
                         <TextBlock Text="FOV" Style="{StaticResource SectionLabel}" />
-                        <Grid Margin="0,4,0,0">
+
+                        <!-- Editor: shown only while active-camera FOV control is live-proven available -->
+                        <StackPanel Visibility="{Binding IsFovEditorVisible, Converter={StaticResource BoolToVisibility}}" Margin="0,2,0,0">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Text="{Binding ActiveFovText}" Style="{StaticResource BodyText}" FontWeight="SemiBold" VerticalAlignment="Center" />
+                                <TextBox Grid.Column="1" Width="62" Style="{StaticResource DarkTextBox}" Padding="6,3"
+                                         Text="{Binding FovInputText, UpdateSourceTrigger=PropertyChanged}"
+                                         KeyDown="FovInput_KeyDown" GotFocus="FovInput_GotFocus" LostFocus="FovInput_LostFocus"
+                                         ToolTip="Exact FOV in degrees (5–170). Enter applies." />
+                            </Grid>
+                            <Slider Style="{StaticResource DarkSlider}" Margin="0,5,0,0"
+                                    Value="{Binding FovSliderValue, Mode=OneWay}"
+                                    ValueChanged="FovSlider_ValueChanged"
+                                    PreviewMouseLeftButtonDown="FovSlider_DragStarted"
+                                    PreviewMouseLeftButtonUp="FovSlider_DragCompleted" />
+                            <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,5,0,0">
+                                <Button Content="20" Style="{StaticResource SmallButton}" Command="{Binding SetFovPresetCommand}" CommandParameter="20" />
+                                <Button Content="30" Style="{StaticResource SmallButton}" Command="{Binding SetFovPresetCommand}" CommandParameter="30" Margin="6,0,0,0" />
+                                <Button Content="40" Style="{StaticResource SmallButton}" Command="{Binding SetFovPresetCommand}" CommandParameter="40" Margin="6,0,0,0" />
+                                <Button Content="60" Style="{StaticResource SmallButton}" Command="{Binding SetFovPresetCommand}" CommandParameter="60" Margin="6,0,0,0" />
+                                <Button Content="90" Style="{StaticResource SmallButton}" Command="{Binding SetFovPresetCommand}" CommandParameter="90" Margin="6,0,0,0" />
+                            </StackPanel>
+                        </StackPanel>
+
+                        <!-- Unavailable state: informational only, no fake control -->
+                        <Grid Visibility="{Binding IsFovEditorVisible, Converter={StaticResource InverseBoolToVisibility}}" Margin="0,4,0,0">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="Auto" />
                                 <ColumnDefinition Width="*" />
                             </Grid.ColumnDefinitions>
                             <TextBlock Grid.Column="0" Text="Active Camera" Style="{StaticResource MutedText}" />
-                            <TextBlock Grid.Column="1" Text="{Binding ActiveFovText}" Style="{StaticResource MutedText}" Margin="10,0,0,0" />
+                            <TextBlock Grid.Column="1" Text="{Binding ActiveFovText}" Style="{StaticResource MutedText}" Margin="10,0,0,0"
+                                       ToolTip="{Binding Capabilities.Limitation}" />
                         </Grid>
 
                         <Border Height="1" Background="{StaticResource BorderBrush}" Margin="0,9,0,7" />
                         <TextBlock Text="SAVE / RESTORE" Style="{StaticResource SectionLabel}" />
+                        <StackPanel Visibility="{Binding IsSaveRestoreVisible, Converter={StaticResource BoolToVisibility}}"
+                                    Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,5,0,0">
+                            <Button Content="SAVE CAMERA" Style="{StaticResource SmallButton}" Command="{Binding SaveCameraCommand}" />
+                            <Button Content="RESTORE CAMERA" Style="{StaticResource SmallButton}" Command="{Binding RestoreCameraCommand}" Margin="6,0,0,0" />
+                        </StackPanel>
                         <TextBlock Text="{Binding RestoreLimitation}"
                                    ToolTip="{Binding Capabilities.Limitation}"
                                    Style="{StaticResource MutedText}"
                                    TextWrapping="Wrap"
-                                   Margin="0,4,0,0" />
+                                   Margin="0,4,0,0"
+                                   Visibility="{Binding IsSaveRestoreVisible, Converter={StaticResource InverseBoolToVisibility}}" />
                     </StackPanel>
                 </Border>
 

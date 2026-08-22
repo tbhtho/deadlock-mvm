@@ -34,6 +34,17 @@ public sealed class CameraViewModel : INotifyPropertyChanged
     private bool _isChaseActive;
     private bool _isConnected;
     private bool _isPageActive;
+    private string _activeFovText = "Unavailable";
+    private string _fovInputText = string.Empty;
+    private double _fovSliderValue = 90;
+    private bool _suppressFovEvents;
+    private bool _fovEditing;
+    private long _lastFovSliderWriteUtcTicks;
+    private bool _cameraOpInFlight;
+
+    private const double SliderMinFov = 10;
+    private const double SliderMaxFov = 120;
+    private static readonly TimeSpan SliderWriteInterval = TimeSpan.FromMilliseconds(66);
 
     public CameraViewModel(ICameraService camera, ReplayController controller, ILogService log)
     {
@@ -49,8 +60,18 @@ public sealed class CameraViewModel : INotifyPropertyChanged
         NextPlayerCommand = new RelayCommand(() => Send("next player", _camera.SelectNextPlayer), () => IsConnected);
         InEyeCommand = new RelayCommand(() => Send("in-eye POV", _camera.SelectInEye), () => IsConnected);
         ChaseCommand = new RelayCommand(() => Send("chase POV", _camera.SelectChase), () => IsConnected);
+        SetFovPresetCommand = new RelayCommand<string>(
+            preset => _ = ApplyFovAsync(double.Parse(preset!, System.Globalization.CultureInfo.InvariantCulture)),
+            () => IsConnected && Capabilities.CanWriteActiveFov);
+        SaveCameraCommand = new RelayCommand(
+            () => _ = SaveCameraAsync(),
+            () => IsConnected && Capabilities.CanSaveRestore && !_cameraOpInFlight);
+        RestoreCameraCommand = new RelayCommand(
+            () => _ = RestoreCameraAsync(),
+            () => IsConnected && Capabilities.CanSaveRestore && _camera.SavedShot is not null && !_cameraOpInFlight);
 
         _camera.SelectionChanged += OnSelectionChanged;
+        _camera.CapabilitiesChanged += OnCapabilitiesChanged;
         _controller.StateChanged += OnStateChanged;
     }
 
@@ -141,12 +162,89 @@ public sealed class CameraViewModel : INotifyPropertyChanged
     public ICommand NextPlayerCommand { get; }
     public ICommand InEyeCommand { get; }
     public ICommand ChaseCommand { get; }
+    public ICommand SetFovPresetCommand { get; }
+    public ICommand SaveCameraCommand { get; }
+    public ICommand RestoreCameraCommand { get; }
 
-    public string ActiveFovText => Capabilities.CanReadActiveFov ? "—" : "Unavailable";
+    /// <summary>Live active-camera FOV ("40°"), or Unavailable when not engine-backed.</summary>
+    public string ActiveFovText
+    {
+        get => _activeFovText;
+        private set => SetProperty(ref _activeFovText, value);
+    }
 
-    public string RestoreLimitation => Capabilities.CanSaveRestore
-        ? string.Empty
-        : "Unavailable — camera rotation control is required.";
+    /// <summary>Exact FOV entry text. Commits on Enter / focus loss, never mid-typing.</summary>
+    public string FovInputText
+    {
+        get => _fovInputText;
+        set => SetProperty(ref _fovInputText, value);
+    }
+
+    public double FovSliderValue
+    {
+        get => _fovSliderValue;
+        private set => SetProperty(ref _fovSliderValue, value);
+    }
+
+    public bool IsFovEditorVisible => Capabilities.CanWriteActiveFov;
+
+    public bool IsSaveRestoreVisible => Capabilities.CanSaveRestore;
+
+    public string RestoreLimitation
+    {
+        get
+        {
+            if (Capabilities.CanSaveRestore)
+                return string.Empty;
+            var limitation = Capabilities.Limitation;
+            return limitation.Length > 0 ? limitation : "Unavailable.";
+        }
+    }
+
+    /// <summary>TextBox commit (Enter key / focus loss): parse and apply exact FOV.</summary>
+    public void CommitFovInput()
+    {
+        _fovEditing = false;
+        var text = FovInputText.Trim().TrimEnd('°').Trim();
+        if (!double.TryParse(text, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var fov) ||
+            !double.IsFinite(fov))
+        {
+            Status = "FOV must be a number.";
+            SyncFovFromEngine();
+            return;
+        }
+
+        _ = ApplyFovAsync(fov);
+    }
+
+    /// <summary>Slider movement: throttled live writes; the exact value lands on release.</summary>
+    public void OnFovSliderChanged(double value)
+    {
+        if (_suppressFovEvents)
+            return;
+
+        FovSliderValue = value;
+        if (!Capabilities.CanWriteActiveFov)
+            return;
+
+        var now = DateTime.UtcNow.Ticks;
+        if (now - _lastFovSliderWriteUtcTicks < SliderWriteInterval.Ticks)
+            return;
+
+        _lastFovSliderWriteUtcTicks = now;
+        _ = ApplyFovAsync(value);
+    }
+
+    /// <summary>Called when a slider drag completes — commits the exact final value.</summary>
+    public void CommitFovSlider()
+    {
+        if (Capabilities.CanWriteActiveFov)
+            _ = ApplyFovAsync(FovSliderValue);
+    }
+
+    /// <summary>While the user edits (text focus / slider drag), poll sync must not fight them.</summary>
+    public void SetFovEditing(bool editing) => _fovEditing = editing;
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
@@ -176,15 +274,31 @@ public sealed class CameraViewModel : INotifyPropertyChanged
 
     private void ApplyTransform(CameraState state)
     {
-        if (state.ActiveTransform is not { } transform)
-            return;
+        if (state.ActiveTransform is { } transform)
+        {
+            PosXText = $"{transform.X:0.000}";
+            PosYText = $"{transform.Y:0.000}";
+            PosZText = $"{transform.Z:0.000}";
+            PitchText = $"{transform.Pitch:0.000}";
+            YawText = $"{transform.Yaw:0.000}";
+            RollText = $"{transform.Roll:0.000}";
+        }
 
-        PosXText = $"{transform.X:0.000}";
-        PosYText = $"{transform.Y:0.000}";
-        PosZText = $"{transform.Z:0.000}";
-        PitchText = $"{transform.Pitch:0.000}";
-        YawText = $"{transform.Yaw:0.000}";
-        RollText = $"{transform.Roll:0.000}";
+        if (state.ActiveFov is { } fov)
+        {
+            ActiveFovText = $"{fov:0.0#}°";
+            if (!_fovEditing)
+            {
+                _suppressFovEvents = true;
+                FovInputText = $"{fov:0.0#}";
+                FovSliderValue = Math.Clamp(fov, SliderMinFov, SliderMaxFov);
+                _suppressFovEvents = false;
+            }
+        }
+        else
+        {
+            ActiveFovText = "Unavailable";
+        }
     }
 
     private void ClearTransform()
@@ -199,6 +313,86 @@ public sealed class CameraViewModel : INotifyPropertyChanged
 
     private void OnSelectionChanged(object? sender, EventArgs e)
         => SetOnUi(ApplySelection);
+
+    private void OnCapabilitiesChanged(object? sender, EventArgs e)
+        => SetOnUi(() =>
+        {
+            OnPropertyChanged(nameof(Capabilities));
+            OnPropertyChanged(nameof(IsFovEditorVisible));
+            OnPropertyChanged(nameof(IsSaveRestoreVisible));
+            OnPropertyChanged(nameof(RestoreLimitation));
+            RaiseCommandStates();
+        });
+
+    private async Task ApplyFovAsync(double fov)
+    {
+        try
+        {
+            var ok = await _camera.SetActiveFovAsync(fov).ConfigureAwait(true);
+            Status = ok ? $"FOV set to {fov:0.0#}°." : "FOV control unavailable.";
+            if (ok)
+            {
+                _suppressFovEvents = true;
+                FovInputText = $"{fov:0.0#}";
+                _suppressFovEvents = false;
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Camera FOV write failed: {ex.Message}");
+            Status = "FOV control unavailable.";
+        }
+    }
+
+    private void SyncFovFromEngine()
+    {
+        _suppressFovEvents = true;
+        var text = ActiveFovText.TrimEnd('°');
+        FovInputText = text == "Unavailable" ? string.Empty : text;
+        _suppressFovEvents = false;
+    }
+
+    private async Task SaveCameraAsync()
+    {
+        _cameraOpInFlight = true;
+        RaiseCommandStates();
+        try
+        {
+            var shot = await _camera.SaveCameraAsync().ConfigureAwait(true);
+            Status = shot is null ? "Save unavailable." : "Camera saved.";
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Camera save failed: {ex.Message}");
+            Status = "Save unavailable.";
+        }
+        finally
+        {
+            _cameraOpInFlight = false;
+            RaiseCommandStates();
+        }
+    }
+
+    private async Task RestoreCameraAsync()
+    {
+        _cameraOpInFlight = true;
+        RaiseCommandStates();
+        try
+        {
+            var ok = await _camera.RestoreCameraAsync().ConfigureAwait(true);
+            Status = ok ? "Camera restored." : "Restore could not be verified.";
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Camera restore failed: {ex.Message}");
+            Status = "Restore unavailable.";
+        }
+        finally
+        {
+            _cameraOpInFlight = false;
+            RaiseCommandStates();
+        }
+    }
 
     private void ApplySelection()
     {
@@ -260,7 +454,13 @@ public sealed class CameraViewModel : INotifyPropertyChanged
         (NextPlayerCommand as RelayCommand)?.RaiseCanExecuteChanged();
         (InEyeCommand as RelayCommand)?.RaiseCanExecuteChanged();
         (ChaseCommand as RelayCommand)?.RaiseCanExecuteChanged();
+        (SetFovPresetCommand as RelayCommand<string>)?.RaiseCanExecuteChanged();
+        (SaveCameraCommand as RelayCommand)?.RaiseCanExecuteChanged();
+        (RestoreCameraCommand as RelayCommand)?.RaiseCanExecuteChanged();
     }
+
+    private void OnPropertyChanged(string name)
+        => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
 
     private bool SetProperty<T>(ref T field, T value, [System.Runtime.CompilerServices.CallerMemberName] string? name = null)
     {
