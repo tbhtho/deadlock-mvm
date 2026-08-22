@@ -16,6 +16,8 @@ public sealed class AppSettings : IAppSettings
         public int VConsolePort { get; set; } = DeadlockConstants.DefaultVConsolePort;
 
         public string DirectorHotkey { get; set; } = "Ctrl+Alt+M";
+
+        public string CampathAddHotkey { get; set; } = "Mouse3";
     }
 
     private readonly string _filePath;
@@ -52,6 +54,12 @@ public sealed class AppSettings : IAppSettings
     {
         get => _document.DirectorHotkey;
         set => _document.DirectorHotkey = string.IsNullOrWhiteSpace(value) ? "Ctrl+Alt+M" : value;
+    }
+
+    public string CampathAddHotkey
+    {
+        get => _document.CampathAddHotkey;
+        set => _document.CampathAddHotkey = value?.Trim() ?? string.Empty;
     }
 
     public void Load()

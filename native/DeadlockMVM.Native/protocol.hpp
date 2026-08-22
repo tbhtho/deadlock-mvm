@@ -8,8 +8,8 @@
 namespace deadlock_mvm {
 
 constexpr std::uint32_t kProtocolMagic = 0x4D564D43; // "CMVM" little-endian
-constexpr std::uint16_t kProtocolVersion = 2;
-constexpr std::size_t kMaxMessageBytes = 512;
+constexpr std::uint16_t kProtocolVersion = 3;
+constexpr std::size_t kMaxCampathKeyframes = 128;
 constexpr double kMinFov = 5.0;
 constexpr double kMaxFov = 170.0;
 constexpr double kMaxWorldCoordinate = 200000.0;
@@ -22,8 +22,9 @@ enum class MessageType : std::uint16_t {
     set_camera_sample = 5,
     get_status = 6,
     shutdown = 7,
-    set_linear_campath = 8,
+    set_campath = 8,
     clear_campath = 9,
+    prepare_camera_observation = 10,
     status = 100,
 };
 
@@ -64,6 +65,19 @@ enum StatusFlags : std::uint32_t {
     status_has_sample = 1u << 6,
     status_command_line_replay = 1u << 7,
     status_campath_active = 1u << 8,
+    status_camera_observed = 1u << 9,
+};
+
+enum class CampathInterpolation : std::uint32_t {
+    linear = 0,
+    smooth = 1,
+};
+
+enum class CampathEasing : std::uint32_t {
+    linear = 0,
+    ease_in = 1,
+    ease_out = 2,
+    ease_in_out = 3,
 };
 
 #pragma pack(push, 1)
@@ -103,9 +117,11 @@ struct CampathKeyframe final {
     CameraSample camera;
 };
 
-struct LinearCampathPayload final {
-    CampathKeyframe from;
-    CampathKeyframe to;
+struct CampathPayloadHeader final {
+    std::uint32_t keyframe_count;
+    CampathInterpolation interpolation;
+    CampathEasing easing;
+    std::uint32_t reserved;
 };
 
 struct StatusPayload final {
@@ -125,8 +141,11 @@ static_assert(sizeof(MessageHeader) == 20);
 static_assert(sizeof(HeartbeatPayload) == 24);
 static_assert(sizeof(CameraSample) == 56);
 static_assert(sizeof(CampathKeyframe) == 64);
-static_assert(sizeof(LinearCampathPayload) == 128);
+static_assert(sizeof(CampathPayloadHeader) == 16);
 static_assert(sizeof(StatusPayload) == 104);
+
+constexpr std::size_t kMaxMessageBytes =
+    sizeof(CampathPayloadHeader) + (sizeof(CampathKeyframe) * kMaxCampathKeyframes);
 
 [[nodiscard]] inline bool IsKnownMessageType(const MessageType type) noexcept {
     switch (type) {
@@ -137,8 +156,9 @@ static_assert(sizeof(StatusPayload) == 104);
         case MessageType::set_camera_sample:
         case MessageType::get_status:
         case MessageType::shutdown:
-        case MessageType::set_linear_campath:
+        case MessageType::set_campath:
         case MessageType::clear_campath:
+        case MessageType::prepare_camera_observation:
         case MessageType::status:
             return true;
     }
@@ -167,9 +187,22 @@ static_assert(sizeof(StatusPayload) == 104);
            sample.fov >= kMinFov && sample.fov <= kMaxFov;
 }
 
-[[nodiscard]] inline bool ValidateCampath(const LinearCampathPayload& path) noexcept {
-    return path.from.demo_tick >= 0 && path.to.demo_tick > path.from.demo_tick &&
-           ValidateSample(path.from.camera) && ValidateSample(path.to.camera);
+[[nodiscard]] inline bool ValidateCampath(
+    const CampathPayloadHeader& header, const CampathKeyframe* keyframes) noexcept {
+    if (keyframes == nullptr || header.keyframe_count < 2 ||
+        header.keyframe_count > kMaxCampathKeyframes || header.reserved != 0 ||
+        (header.interpolation != CampathInterpolation::linear &&
+         header.interpolation != CampathInterpolation::smooth) ||
+        (header.easing != CampathEasing::linear && header.easing != CampathEasing::ease_in &&
+         header.easing != CampathEasing::ease_out && header.easing != CampathEasing::ease_in_out))
+        return false;
+
+    for (std::uint32_t index = 0; index < header.keyframe_count; ++index) {
+        if (keyframes[index].demo_tick < 0 || !ValidateSample(keyframes[index].camera) ||
+            (index > 0 && keyframes[index - 1].demo_tick >= keyframes[index].demo_tick))
+            return false;
+    }
+    return true;
 }
 
 [[nodiscard]] inline std::size_t ExpectedPayloadSize(const MessageType type) noexcept {
@@ -177,16 +210,27 @@ static_assert(sizeof(StatusPayload) == 104);
         case MessageType::hello: return sizeof(HelloPayload);
         case MessageType::heartbeat: return sizeof(HeartbeatPayload);
         case MessageType::set_camera_sample: return sizeof(CameraSample);
-        case MessageType::set_linear_campath: return sizeof(LinearCampathPayload);
+        case MessageType::set_campath: return kMaxMessageBytes + 1;
         case MessageType::enable_override:
         case MessageType::disable_override:
         case MessageType::get_status:
         case MessageType::shutdown:
         case MessageType::clear_campath:
+        case MessageType::prepare_camera_observation:
             return 0;
         case MessageType::status: return sizeof(StatusPayload);
     }
     return kMaxMessageBytes + 1;
+}
+
+[[nodiscard]] inline bool ValidatePayloadSize(
+    const MessageType type, const std::size_t payload_size) noexcept {
+    if (type == MessageType::set_campath) {
+        return payload_size >= sizeof(CampathPayloadHeader) + (2 * sizeof(CampathKeyframe)) &&
+               payload_size <= kMaxMessageBytes &&
+               (payload_size - sizeof(CampathPayloadHeader)) % sizeof(CampathKeyframe) == 0;
+    }
+    return payload_size == ExpectedPayloadSize(type);
 }
 
 } // namespace deadlock_mvm

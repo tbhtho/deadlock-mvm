@@ -1,3 +1,4 @@
+#include "campath_math.hpp"
 #include "pattern_scan.hpp"
 #include "protocol.hpp"
 
@@ -61,6 +62,14 @@ void ProtocolTests() {
           "sample payload size is fixed");
     Check(ExpectedPayloadSize(MessageType::get_status) == 0, "status request has no payload");
     Check(sizeof(HeartbeatPayload) == 24, "heartbeat carries the replay clock calibration");
+    Check(ValidatePayloadSize(MessageType::prepare_camera_observation, 0),
+          "passive camera observation request has no payload");
+    Check(ValidatePayloadSize(MessageType::set_campath,
+                              sizeof(CampathPayloadHeader) + (5 * sizeof(CampathKeyframe))),
+          "bounded variable multi-keyframe payload size is accepted");
+    Check(!ValidatePayloadSize(MessageType::set_campath,
+                               sizeof(CampathPayloadHeader) + sizeof(CampathKeyframe)),
+          "single-keyframe payload is rejected");
 
     CameraSample sample{100, -200, 300, 5, 120, 0, 70};
     Check(ValidateSample(sample), "cinematic sample is accepted");
@@ -73,12 +82,32 @@ void ProtocolTests() {
     sample = CameraSample{0, 0, 0, 0, std::numeric_limits<double>::quiet_NaN(), 0, 70};
     Check(!ValidateSample(sample), "non-finite sample is rejected");
 
-    const LinearCampathPayload path{{100, {0, 0, 0, 5, 30, 0, 35}},
-                                    {200, {100, 200, 300, -15, 120, 0, 70}}};
-    Check(ValidateCampath(path), "ordered typed linear Campath is accepted");
-    auto invalid_path = path;
-    invalid_path.to.demo_tick = 100;
-    Check(!ValidateCampath(invalid_path), "Campath rejects duplicate or reversed ticks");
+    const CampathPayloadHeader path_header{
+        3, CampathInterpolation::smooth, CampathEasing::ease_in_out, 0};
+    std::array<CampathKeyframe, 3> path{{
+        {100, {0, 0, 0, 5, 350, 0, 35}},
+        {200, {100, 200, 300, -15, 10, 0, 70}},
+        {350, {150, 250, 400, 0, 40, 0, 40}},
+    }};
+    Check(ValidateCampath(path_header, path.data()), "ordered typed multi-keyframe Campath is accepted");
+    path[1].demo_tick = 100;
+    Check(!ValidateCampath(path_header, path.data()), "Campath rejects duplicate or reversed ticks");
+
+    const auto linear = EvaluateLinearCamera(
+        CameraSample{0, 0, 0, 5, 350, 0, 35},
+        CameraSample{100, 200, 300, -15, 10, 0, 70}, 0.5);
+    Check(std::abs(linear.x - 50.0) < 1e-9 && std::abs(linear.yaw) < 1e-9 &&
+          std::abs(linear.fov - 52.5) < 1e-9,
+          "linear camera uses shortest rotation and interpolates FOV");
+
+    const CameraSample p1{0, 0, 0, 0, 350, 0, 30};
+    const CameraSample p2{100, 50, 25, 10, 10, 0, 65};
+    const auto smooth_start = EvaluateSmoothCamera(ReflectCamera(p1, p2), p1, p2, p2, 0.0);
+    const auto smooth_end = EvaluateSmoothCamera(p1, p1, p2, ReflectCamera(p2, p1), 1.0);
+    Check(std::abs(smooth_start.x - p1.x) < 1e-8 && std::abs(smooth_start.yaw + 10.0) < 1e-8,
+          "smooth interpolation starts exactly at the keyframe");
+    Check(std::abs(smooth_end.x - p2.x) < 1e-8 && std::abs(smooth_end.yaw - p2.yaw) < 1e-8,
+          "smooth interpolation ends exactly at the keyframe without a rotation flip");
 }
 
 } // namespace

@@ -18,6 +18,9 @@ public interface IAppSettings
     /// <summary>Global show/hide hotkey for the Director window (e.g. "Ctrl+Alt+M").</summary>
     string DirectorHotkey { get; set; }
 
+    /// <summary>Foreground-scoped Campath Add binding (e.g. "Mouse3" or "Ctrl+F6").</summary>
+    string CampathAddHotkey { get; set; }
+
     void Load();
 
     void Save();

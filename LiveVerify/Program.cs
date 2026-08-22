@@ -578,10 +578,68 @@ static async Task<int> RunInProcessAsync(string dllPath)
 
     var a = new CameraSample(start.X, start.Y, start.Z + 120, 5, 30, 0, 35);
     var b = new CameraSample(start.X + 200, start.Y - 120, start.Z + 200, -15, 120, 0, 70);
+    var c = new CameraSample(start.X + 360, start.Y + 80, start.Z + 260, 12, 175, 0, 45);
+    var d = new CameraSample(start.X + 140, start.Y + 260, start.Z + 180, -8, -120, 0, 80);
+    var e = new CameraSample(start.X - 100, start.Y + 120, start.Z + 100, 3, -25, 0, 50);
     var failures = 0;
 
     try
     {
+        // HLAE-style passive capture: observe exact native frames while replay
+        // playback remains untouched. No pause/resume/seek/POV command occurs here.
+        controller.SetSpeed(1);
+        controller.Play();
+        await WaitForPauseStateAsync(controller, false, TimeSpan.FromSeconds(5));
+        var passiveFrames = new List<CampathKeyframe>();
+        foreach (var label in new[] { "passive key 1", "passive key 2", "passive key 3" })
+        {
+            var before = await native.GetStatusAsync();
+            var prepared = await native.PrepareCameraObservationAsync();
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
+            var observed = prepared;
+            while ((!observed.CameraObserved || observed.HookCalls <= before.HookCalls) && DateTime.UtcNow < deadline)
+            {
+                await Task.Delay(10);
+                observed = await native.GetStatusAsync();
+            }
+            PrintNative(label, observed);
+            if (!observed.CameraObserved || controller.State.IsPaused != false || controller.State.Timescale != 1)
+            {
+                Console.WriteLine("  FAIL: passive capture changed playback or returned no authoritative camera frame");
+                failures++;
+            }
+            else
+            {
+                passiveFrames.Add(new CampathKeyframe(observed.ReplayTick, observed.Camera));
+            }
+            await Task.Delay(300);
+        }
+        var monotonic = passiveFrames.Count == 3 && passiveFrames.Zip(passiveFrames.Skip(1),
+            (left, right) => left.DemoTick < right.DemoTick).All(value => value);
+        Console.WriteLine($"passive playing workflow: keys={passiveFrames.Count} monotonicTicks={monotonic} pause={controller.State.IsPaused} speed={controller.State.Timescale}");
+        if (!monotonic) failures++;
+
+        controller.SetSpeed(0.25);
+        var quarterBefore = await native.GetStatusAsync();
+        await native.PrepareCameraObservationAsync();
+        await Task.Delay(50);
+        var quarterCapture = await native.GetStatusAsync();
+        var quarterPreserved = quarterCapture.CameraObserved && controller.State.IsPaused == false && controller.State.Timescale == 0.25;
+        Console.WriteLine($"passive 0.25x capture: tick {quarterBefore.ReplayTick}->{quarterCapture.ReplayTick} preserved={quarterPreserved}");
+        if (!quarterPreserved) failures++;
+
+        controller.Pause();
+        await WaitForPauseStateAsync(controller, true, TimeSpan.FromSeconds(5));
+        var pausedBefore = await native.GetStatusAsync();
+        await native.PrepareCameraObservationAsync();
+        await Task.Delay(50);
+        var pausedCapture = await native.GetStatusAsync();
+        var pausedPreserved = pausedCapture.CameraObserved && controller.State.IsPaused == true && controller.State.Timescale == 0.25 &&
+                              Math.Abs(pausedCapture.ReplayTick - pausedBefore.ReplayTick) <= 1;
+        Console.WriteLine($"passive paused capture: tick {pausedBefore.ReplayTick}->{pausedCapture.ReplayTick} preserved={pausedPreserved}");
+        if (!pausedPreserved) failures++;
+        controller.SetSpeed(1);
+
         // Foundation 1: exact paused A/B/A.
         controller.Pause();
         await WaitForPauseStateAsync(controller, true, TimeSpan.FromSeconds(5));
@@ -623,15 +681,20 @@ static async Task<int> RunInProcessAsync(string dllPath)
         foreach (var percent in new[] { 25, 50, 75 })
             await ApplyAndVerify($"FULL {percent}%", CameraSample.Linear(a, b, percent / 100.0));
 
-        // Two-keyframe Campath: the hook evaluates from the calibrated demo tick.
+        // Five-keyframe Campath: every segment evaluates from calibrated demo tick.
         controller.Pause();
         await WaitForPauseStateAsync(controller, true, TimeSpan.FromSeconds(5));
         var clock = await native.GetStatusAsync();
         var pathStart = clock.ReplayTick + 128;
-        var path = new LinearCampath(
+        var path = new CampathPath(new[]
+        {
             new CampathKeyframe(pathStart, a),
-            new CampathKeyframe(pathStart + 256, b));
-        var configured = await native.SetLinearCampathAsync(path);
+            new CampathKeyframe(pathStart + 128, b),
+            new CampathKeyframe(pathStart + 320, c),
+            new CampathKeyframe(pathStart + 544, d),
+            new CampathKeyframe(pathStart + 800, e),
+        });
+        var configured = await native.SetCampathAsync(path);
         var enabledPath = await native.EnableOverrideAsync();
         PrintNative("Campath configured", enabledPath);
         if (!configured.Flags.HasFlag(InProcessStatusFlags.CampathActive) ||
@@ -641,9 +704,9 @@ static async Task<int> RunInProcessAsync(string dllPath)
             failures++;
         }
 
-        foreach (var percent in new[] { 0, 25, 50, 75, 100 })
+        foreach (var offset in new long[] { 0, 64, 224, 432, 672, 800, 224 })
         {
-            var requestedTick = pathStart + (long)(256 * (percent / 100.0));
+            var requestedTick = pathStart + offset;
             controller.SeekToTick(checked((int)requestedTick));
             await WaitForNativeTickAsync(requestedTick, TimeSpan.FromSeconds(12));
             controller.Pause();
@@ -651,7 +714,7 @@ static async Task<int> RunInProcessAsync(string dllPath)
             await camera.EnterFreeRoamAsync();
             var status = await WaitForNativeTickStableAsync(TimeSpan.FromSeconds(4));
             var expected = path.Evaluate(status.ReplayTick);
-            PrintNative($"CAMPATH {percent}% requestedTick={requestedTick}", status);
+            PrintNative($"LINEAR offset={offset} requestedTick={requestedTick}", status);
             if (Math.Abs(status.ReplayTick - requestedTick) > 2)
             {
                 Console.WriteLine($"  FAIL: seek landed at native demo tick {status.ReplayTick}");
@@ -662,7 +725,7 @@ static async Task<int> RunInProcessAsync(string dllPath)
         }
 
         // Pausing freezes both the replay clock and the evaluated camera at mid-path.
-        var freezeTick = pathStart + 128;
+        var freezeTick = pathStart + 432;
         controller.SeekToTick(checked((int)freezeTick));
         await WaitForNativeTickAsync(freezeTick, TimeSpan.FromSeconds(12));
         controller.Pause();
@@ -680,8 +743,8 @@ static async Task<int> RunInProcessAsync(string dllPath)
         if (!freezeOk) failures++;
 
         // At quarter speed the same demo-tick function remains authoritative.
-        controller.SeekToTick(checked((int)(pathStart + 64)));
-        await WaitForNativeTickAsync(pathStart + 64, TimeSpan.FromSeconds(12));
+        controller.SeekToTick(checked((int)(pathStart + 224)));
+        await WaitForNativeTickAsync(pathStart + 224, TimeSpan.FromSeconds(12));
         controller.Pause();
         await Task.Delay(250);
         await camera.EnterFreeRoamAsync();
@@ -701,6 +764,33 @@ static async Task<int> RunInProcessAsync(string dllPath)
         Console.WriteLine($"Campath 0.25x: tick {slowStart.ReplayTick}->{slowEnd.ReplayTick} exact={slowOk}");
         if (!slowOk) failures++;
         controller.SetSpeed(1);
+
+        // Centripetal smooth position plus shortest unwrapped rotation and FOV.
+        controller.Pause();
+        await WaitForPauseStateAsync(controller, true, TimeSpan.FromSeconds(5));
+        var smoothPath = new CampathPath(path.Keyframes, CampathInterpolationMode.Smooth, CampathEasingMode.Linear);
+        configured = await native.SetCampathAsync(smoothPath);
+        if (!configured.Flags.HasFlag(InProcessStatusFlags.CampathActive))
+        {
+            Console.WriteLine("FAIL: smooth Campath was rejected");
+            failures++;
+        }
+        foreach (var offset in new long[] { 0, 64, 128, 224, 320, 432, 544, 672, 800 })
+        {
+            var requestedTick = pathStart + offset;
+            controller.SeekToTick(checked((int)requestedTick));
+            await WaitForNativeTickAsync(requestedTick, TimeSpan.FromSeconds(12));
+            controller.Pause();
+            await Task.Delay(250);
+            await camera.EnterFreeRoamAsync();
+            var status = await WaitForNativeTickStableAsync(TimeSpan.FromSeconds(4));
+            var expected = smoothPath.Evaluate(status.ReplayTick);
+            var smoothOk = SampleEquals(expected, status.Camera, 0.001) &&
+                           await VerifyCurrentAsync(expected, 0.075, print: false);
+            PrintNative($"SMOOTH offset={offset}", status);
+            Console.WriteLine($"  managed/native/render exact={smoothOk}");
+            if (!smoothOk) failures++;
+        }
     }
     catch (Exception ex)
     {

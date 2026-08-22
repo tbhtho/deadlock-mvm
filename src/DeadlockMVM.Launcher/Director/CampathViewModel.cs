@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.IO;
 using System.Windows.Input;
 using DeadlockMVM.Core.Contracts;
 using DeadlockMVM.Core.Models;
@@ -9,52 +10,134 @@ using DeadlockMVM.Launcher.ViewModels;
 
 namespace DeadlockMVM.Launcher.Director;
 
-/// <summary>Initial two-keyframe, replay-tick-driven linear Dolly editor.</summary>
+/// <summary>Compact replay-tick Campath editor; capture and playback are deliberately separate.</summary>
 public sealed class CampathViewModel : INotifyPropertyChanged
 {
     private readonly ICameraService _camera;
     private readonly ReplayController _controller;
     private readonly NativeReplayCameraSession _native;
+    private readonly PassiveCampathCapture _capture;
+    private readonly IAppSettings _settings;
+    private readonly IHotkeyService _hotkeys;
+    private readonly CampathStore _store;
     private readonly ILogService _log;
     private readonly System.Windows.Threading.Dispatcher? _dispatcher;
     private CampathKeyframe? _selectedKeyframe;
-    private string _status = "Add two camera keyframes to create a linear path.";
+    private CampathDocumentInfo? _selectedDocument;
+    private string _status = "Fly in Free Roam and add camera keyframes.";
+    private string _pathName = "Untitled Campath";
+    private string? _currentFilePath;
+    private string _addHotkeyDisplay = "—";
+    private bool _capturingHotkey;
+    private bool _suppressAutosave;
     private bool _operationInFlight;
+    private DateTime _clearConfirmationDeadline;
+    private CampathInterpolationMode _interpolationMode = CampathInterpolationMode.Linear;
+    private CampathEasingMode _easingMode = CampathEasingMode.Linear;
+    private string? _lastReplayName;
 
     public CampathViewModel(
         ICameraService camera,
         ReplayController controller,
         NativeReplayCameraSession native,
-        ILogService log)
+        IAppSettings settings,
+        IHotkeyService hotkeys,
+        ILogService log,
+        CampathStore? store = null)
     {
         _camera = camera;
         _controller = controller;
         _native = native;
+        _capture = new PassiveCampathCapture(
+            native.CaptureCurrentCameraAsync,
+            () => new ReplayPlaybackConfiguration(controller.State.IsPaused, controller.State.Timescale));
+        _settings = settings;
+        _hotkeys = hotkeys;
         _log = log;
+        _store = store ?? new CampathStore();
         _dispatcher = System.Windows.Threading.Dispatcher.FromThread(Thread.CurrentThread);
 
-        Keyframes = new ObservableCollection<CampathKeyframe>();
-        AddCommand = new RelayCommand(() => _ = AddAsync(), CanAdd);
+        Keyframes = [];
+        SavedCampaths = [];
+        AddCommand = new RelayCommand(() => _ = AddAsync(false), CanAdd);
         UpdateCommand = new RelayCommand(() => _ = UpdateAsync(), () => SelectedKeyframe is not null && CanCapture());
-        DeleteCommand = new RelayCommand(DeleteSelected, () => SelectedKeyframe is not null && !_native.CampathPlaying);
-        ClearCommand = new RelayCommand(Clear, () => Keyframes.Count > 0 && !_native.CampathPlaying);
-        PlayCommand = new RelayCommand(() => _ = PlayAsync(), () => Keyframes.Count == 2 && _native.Available && !_native.CampathPlaying && !_operationInFlight);
-        StopCommand = new RelayCommand(() => _ = StopAsync(), () => _native.CampathPlaying && !_operationInFlight);
+        DeleteCommand = new RelayCommand(DeleteSelected, () => SelectedKeyframe is not null && !CameraOwned);
+        ClearCommand = new RelayCommand(Clear, () => Keyframes.Count > 0 && !CameraOwned);
+        GoToCommand = new RelayCommand(() => _ = GoToAsync(), () => SelectedKeyframe is not null && _native.Available && !_operationInFlight);
+        PlayCommand = new RelayCommand(() => _ = PlayAsync(), () => Keyframes.Count >= 2 && _native.Available && !CameraOwned && !_operationInFlight);
+        StopCommand = new RelayCommand(() => _ = StopAsync(), () => CameraOwned && !_operationInFlight);
+        SaveCommand = new RelayCommand(Save, () => Keyframes.Count > 0 && CurrentReplayIdentifier() is not null);
+        LoadCommand = new RelayCommand(Load, () => SelectedDocument is not null && !CameraOwned);
+        CaptureHotkeyCommand = new RelayCommand(BeginHotkeyCapture, () => !_capturingHotkey);
+        ClearHotkeyCommand = new RelayCommand(ClearHotkey, () => _addHotkeyDisplay != "—");
 
         _native.StatusChanged += OnNativeStatusChanged;
         _controller.StateChanged += OnReplayStateChanged;
+        _hotkeys.BindingTriggered += OnHotkeyTriggered;
+        _hotkeys.BindingCaptured += OnBindingCaptured;
+        RegisterSavedHotkey();
+        RefreshDocuments();
     }
 
     public ObservableCollection<CampathKeyframe> Keyframes { get; }
+    public ObservableCollection<CampathDocumentInfo> SavedCampaths { get; }
+    public IReadOnlyList<CampathInterpolationMode> InterpolationModes { get; } =
+        Enum.GetValues<CampathInterpolationMode>();
+    public IReadOnlyList<CampathEasingMode> EasingModes { get; } = Enum.GetValues<CampathEasingMode>();
 
     public CampathKeyframe? SelectedKeyframe
     {
         get => _selectedKeyframe;
         set
         {
-            if (!SetProperty(ref _selectedKeyframe, value))
+            if (SetProperty(ref _selectedKeyframe, value))
+                RaiseCommandStates();
+        }
+    }
+
+    public CampathDocumentInfo? SelectedDocument
+    {
+        get => _selectedDocument;
+        set
+        {
+            if (SetProperty(ref _selectedDocument, value))
+                RaiseCommandStates();
+        }
+    }
+
+    public string PathName
+    {
+        get => _pathName;
+        set
+        {
+            var clean = string.IsNullOrWhiteSpace(value) ? "Untitled Campath" : value.Trim();
+            if (!SetProperty(ref _pathName, clean))
                 return;
-            RaiseCommandStates();
+            Autosave();
+        }
+    }
+
+    public CampathInterpolationMode InterpolationMode
+    {
+        get => _interpolationMode;
+        set
+        {
+            if (!SetProperty(ref _interpolationMode, value))
+                return;
+            StopForEditIfNeeded();
+            Autosave();
+        }
+    }
+
+    public CampathEasingMode EasingMode
+    {
+        get => _easingMode;
+        set
+        {
+            if (!SetProperty(ref _easingMode, value))
+                return;
+            StopForEditIfNeeded();
+            Autosave();
         }
     }
 
@@ -67,38 +150,54 @@ public sealed class CampathViewModel : INotifyPropertyChanged
     public string NativeState => $"NATIVE {_native.State.ToString().ToUpperInvariant()}";
     public string NativeMessage => _native.Message;
     public bool IsPlaying => _native.CampathPlaying;
-    public string KeyframeCount => $"{Keyframes.Count} / 2 KEYFRAMES";
+    public bool CameraOwned => _native.CameraOwned;
+    public string KeyframeCount => $"{Keyframes.Count} / {CampathPath.MaxKeyframes}";
+    public string AddHotkeyDisplay => _capturingHotkey ? "PRESS A KEY…" : _addHotkeyDisplay;
 
     public ICommand AddCommand { get; }
     public ICommand UpdateCommand { get; }
     public ICommand DeleteCommand { get; }
     public ICommand ClearCommand { get; }
+    public ICommand GoToCommand { get; }
     public ICommand PlayCommand { get; }
     public ICommand StopCommand { get; }
+    public ICommand SaveCommand { get; }
+    public ICommand LoadCommand { get; }
+    public ICommand CaptureHotkeyCommand { get; }
+    public ICommand ClearHotkeyCommand { get; }
 
-    private bool CanAdd() => CanCapture() && Keyframes.Count < 2;
+    private bool CanAdd() => CanCapture() && Keyframes.Count < CampathPath.MaxKeyframes;
 
-    private bool CanCapture() =>
-        !_operationInFlight && !_native.CampathPlaying && _controller.State.CurrentTick is not null;
+    private bool CanCapture() => CampathCaptureGate.CanCapture(new CampathCaptureAvailability(
+        _controller.State.Connected,
+        !string.IsNullOrWhiteSpace(_controller.State.ReplayName) && _controller.State.CurrentTick is not null,
+        _native.Available,
+        _controller.State.CurrentTick is not null,
+        _camera.Selection.Mode == SpecCameraMode.FreeRoam,
+        CameraOwned,
+        _operationInFlight));
 
-    private async Task AddAsync()
+    private async Task AddAsync(bool fromHotkey)
     {
-        if (Keyframes.Count >= 2)
+        if (!CanAdd())
         {
-            Status = "The initial linear milestone supports exactly two keyframes.";
+            Status = CameraOwned
+                ? "Add Keyframe is disabled while Campath owns the camera."
+                : "Add Keyframe needs an active replay, Free Roam, and a readable native camera.";
             return;
         }
 
         var keyframe = await CaptureAsync().ConfigureAwait(true);
         if (keyframe is null)
             return;
-        var existing = Keyframes.FirstOrDefault(k => k.DemoTick == keyframe.DemoTick);
-        if (existing is not null)
-            Keyframes.Remove(existing);
-        InsertSorted(keyframe);
+        var replaced = CampathKeyframeEditor.Upsert(Keyframes, keyframe);
         SelectedKeyframe = keyframe;
-        Status = $"Added keyframe at demo tick {keyframe.DemoTick}.";
+        Status = !replaced
+            ? $"Keyframe {Keyframes.IndexOf(keyframe) + 1} added at tick {keyframe.DemoTick}."
+            : $"Keyframe at tick {keyframe.DemoTick} updated.";
+        _log.Info($"Campath: {Status}{(fromHotkey ? " (hotkey)" : string.Empty)}");
         OnCollectionChanged();
+        Autosave();
     }
 
     private async Task UpdateAsync()
@@ -106,18 +205,16 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         var selected = SelectedKeyframe;
         if (selected is null)
             return;
-        var updated = await CaptureAsync().ConfigureAwait(true);
-        if (updated is null)
+        var captured = await CaptureAsync().ConfigureAwait(true);
+        if (captured is null)
             return;
 
-        Keyframes.Remove(selected);
-        var collision = Keyframes.FirstOrDefault(k => k.DemoTick == updated.DemoTick);
-        if (collision is not null)
-            Keyframes.Remove(collision);
-        InsertSorted(updated);
+        var updated = new CampathKeyframe(selected.DemoTick, captured.Camera);
+        var index = Keyframes.IndexOf(selected);
+        Keyframes[index] = updated;
         SelectedKeyframe = updated;
-        Status = $"Updated keyframe at demo tick {updated.DemoTick}.";
-        OnCollectionChanged();
+        Status = $"Updated camera at tick {updated.DemoTick}; timing kept unchanged.";
+        Autosave();
     }
 
     private async Task<CampathKeyframe?> CaptureAsync()
@@ -126,39 +223,13 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         RaiseCommandStates();
         try
         {
-            Status = "Pausing replay for an exact keyframe sample…";
-            _controller.Pause();
-            var pauseDeadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
-            while (_controller.State.IsPaused != true && DateTime.UtcNow < pauseDeadline)
-                await Task.Delay(100).ConfigureAwait(true);
-            if (_controller.State.IsPaused != true)
-            {
-                Status = "Replay did not confirm a paused state.";
-                return null;
-            }
-
-            var state = await _camera.ReadStateAsync().ConfigureAwait(true);
-            var tick = _controller.State.CurrentTick;
-            if (tick is null || state?.ActiveTransform is not { } transform || state.ActiveFov is not { } fov)
-            {
-                Status = "Camera transform, active FOV, and demo tick must all be available.";
-                return null;
-            }
-
-            var sample = new CameraSample(
-                transform.X, transform.Y, transform.Z,
-                transform.Pitch, transform.Yaw, transform.Roll, fov);
-            if (!sample.IsValid)
-            {
-                Status = "The active camera sample is outside safe native bounds.";
-                return null;
-            }
-            return new CampathKeyframe(tick.Value, sample);
+            Status = "Capturing current camera…";
+            return await _capture.CaptureAsync().ConfigureAwait(true);
         }
         catch (Exception ex)
         {
-            _log.Warn($"Campath keyframe capture failed: {ex.Message}");
-            Status = "Could not capture the current camera sample.";
+            _log.Warn($"Campath passive capture failed: {ex.Message}");
+            Status = ex.Message;
             return null;
         }
         finally
@@ -170,20 +241,40 @@ public sealed class CampathViewModel : INotifyPropertyChanged
 
     private async Task PlayAsync()
     {
-        if (Keyframes.Count != 2)
+        _operationInFlight = true;
+        RaiseCommandStates();
+        try
+        {
+            var path = new CampathPath(Keyframes, InterpolationMode, EasingMode);
+            await _native.PlayCampathAsync(path).ConfigureAwait(true);
+            Status = $"Playing {InterpolationMode.ToString().ToUpperInvariant()} path across {Keyframes.Count} keyframes.";
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Campath play failed: {ex.Message}");
+            Status = ex.Message;
+        }
+        finally
+        {
+            _operationInFlight = false;
+            RaiseNativeProperties();
+        }
+    }
+
+    private async Task GoToAsync()
+    {
+        if (SelectedKeyframe is not { } selected)
             return;
         _operationInFlight = true;
         RaiseCommandStates();
         try
         {
-            var ordered = Keyframes.OrderBy(k => k.DemoTick).ToArray();
-            var path = new LinearCampath(ordered[0], ordered[1]);
-            await _native.PlayLinearCampathAsync(path).ConfigureAwait(true);
-            Status = $"Playing linear path from tick {path.From.DemoTick} to {path.To.DemoTick}.";
+            await _native.GoToKeyframeAsync(selected).ConfigureAwait(true);
+            Status = $"At keyframe tick {selected.DemoTick}; camera held by MVM.";
         }
         catch (Exception ex)
         {
-            _log.Warn($"Campath play failed: {ex.Message}");
+            _log.Warn($"Campath Go To failed: {ex.Message}");
             Status = ex.Message;
         }
         finally
@@ -200,12 +291,12 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         try
         {
             await _native.StopCampathAsync().ConfigureAwait(true);
-            Status = "Campath stopped; ordinary Free Roam restored.";
+            Status = "Camera ownership released; replay playback state unchanged.";
         }
         catch (Exception ex)
         {
             _log.Warn($"Campath stop failed: {ex.Message}");
-            Status = "Campath release failed; native heartbeat will fail closed.";
+            Status = "Camera release failed; native heartbeat will fail closed.";
         }
         finally
         {
@@ -222,33 +313,210 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         SelectedKeyframe = null;
         Status = "Keyframe deleted.";
         OnCollectionChanged();
+        Autosave();
     }
 
     private void Clear()
     {
+        if (DateTime.UtcNow > _clearConfirmationDeadline)
+        {
+            _clearConfirmationDeadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+            Status = "Press CLEAR again within 5 seconds to remove every keyframe.";
+            return;
+        }
+        _clearConfirmationDeadline = default;
         Keyframes.Clear();
         SelectedKeyframe = null;
         Status = "Campath cleared.";
         OnCollectionChanged();
+        Autosave();
     }
 
-    private void InsertSorted(CampathKeyframe keyframe)
+    private void BeginHotkeyCapture()
     {
-        var index = 0;
-        while (index < Keyframes.Count && Keyframes[index].DemoTick < keyframe.DemoTick)
-            index++;
-        Keyframes.Insert(index, keyframe);
+        _capturingHotkey = true;
+        OnPropertyChanged(nameof(AddHotkeyDisplay));
+        _hotkeys.BeginCapture(HotkeyAction.CampathAddKeyframe);
+        Status = "Press a keyboard key, modifier combination, Mouse3, Mouse4, or Mouse5. Escape cancels.";
+        RaiseCommandStates();
+    }
+
+    private void ClearHotkey()
+    {
+        _hotkeys.Unregister(HotkeyAction.CampathAddKeyframe);
+        _settings.CampathAddHotkey = string.Empty;
+        _settings.Save();
+        _addHotkeyDisplay = "—";
+        OnPropertyChanged(nameof(AddHotkeyDisplay));
+        Status = "Add Keyframe hotkey unbound.";
+        RaiseCommandStates();
+    }
+
+    private void RegisterSavedHotkey()
+    {
+        if (!DeadlockMVM.Core.Models.InputBinding.TryParse(_settings.CampathAddHotkey, out var binding))
+        {
+            _addHotkeyDisplay = "—";
+            return;
+        }
+        if (_hotkeys.TryRegister(HotkeyAction.CampathAddKeyframe, binding, out var error))
+            _addHotkeyDisplay = binding.ToString();
+        else
+        {
+            _addHotkeyDisplay = "—";
+            Status = error ?? "Add Keyframe hotkey could not be registered.";
+        }
+    }
+
+    private void OnHotkeyTriggered(object? sender, HotkeyTriggeredEventArgs args)
+    {
+        if (args.Action == HotkeyAction.CampathAddKeyframe)
+            _ = AddAsync(true);
+    }
+
+    private void OnBindingCaptured(object? sender, BindingCapturedEventArgs args)
+    {
+        if (args.Action != HotkeyAction.CampathAddKeyframe)
+            return;
+        _capturingHotkey = false;
+        if (args.Cancelled || args.Binding is not { } binding)
+        {
+            Status = "Hotkey capture cancelled.";
+        }
+        else if (_hotkeys.TryRegister(args.Action, binding, out var error))
+        {
+            _settings.CampathAddHotkey = binding.ToString();
+            _settings.Save();
+            _addHotkeyDisplay = binding.ToString();
+            Status = $"Add Keyframe bound to {_addHotkeyDisplay}.";
+        }
+        else
+        {
+            Status = error ?? "That hotkey is unavailable.";
+        }
+        OnPropertyChanged(nameof(AddHotkeyDisplay));
+        RaiseCommandStates();
+    }
+
+    private void Save()
+        => SaveCore(true);
+
+    private void SaveCore(bool reportStatus)
+    {
+        try
+        {
+            _currentFilePath = _store.Save(CreateProject(), _currentFilePath);
+            if (reportStatus)
+                Status = $"Saved {Path.GetFileName(_currentFilePath)}.";
+            RefreshDocuments();
+        }
+        catch (Exception ex) when (ex is IOException or InvalidDataException or InvalidOperationException)
+        {
+            _log.Warn($"Campath save failed: {ex.Message}");
+            Status = ex.Message;
+        }
+    }
+
+    private void Autosave()
+    {
+        if (_suppressAutosave || CurrentReplayIdentifier() is null ||
+            (Keyframes.Count == 0 && _currentFilePath is null))
+            return;
+        SaveCore(false);
+    }
+
+    private CampathProject CreateProject() => new()
+    {
+        Name = PathName,
+        ReplayIdentifier = CurrentReplayIdentifier() ?? new CampathReplayIdentifier("Unknown", null),
+        InterpolationMode = InterpolationMode,
+        EasingMode = EasingMode,
+        Keyframes = Keyframes.OrderBy(keyframe => keyframe.DemoTick).ToList(),
+    };
+
+    private void Load()
+    {
+        if (SelectedDocument is not { } document)
+            return;
+        try
+        {
+            var project = _store.Load(document.FilePath, CurrentReplayIdentifier());
+            _suppressAutosave = true;
+            Keyframes.Clear();
+            foreach (var keyframe in project.Keyframes.OrderBy(keyframe => keyframe.DemoTick))
+                Keyframes.Add(keyframe);
+            PathName = project.Name;
+            InterpolationMode = project.InterpolationMode;
+            EasingMode = project.EasingMode;
+            _currentFilePath = document.FilePath;
+            SelectedKeyframe = Keyframes.FirstOrDefault();
+            Status = $"Loaded {project.Name} ({Keyframes.Count} keyframes).";
+            OnCollectionChanged();
+        }
+        catch (Exception ex) when (ex is IOException or InvalidDataException)
+        {
+            _log.Warn($"Campath load failed: {ex.Message}");
+            Status = ex.Message;
+        }
+        finally
+        {
+            _suppressAutosave = false;
+        }
+    }
+
+    private void RefreshDocuments()
+    {
+        SavedCampaths.Clear();
+        foreach (var document in _store.List())
+            SavedCampaths.Add(document);
+    }
+
+    private CampathReplayIdentifier? CurrentReplayIdentifier()
+    {
+        var state = _controller.State;
+        return string.IsNullOrWhiteSpace(state.ReplayName)
+            ? null
+            : new CampathReplayIdentifier(state.ReplayName, state.TotalTicks);
+    }
+
+    private void StopForEditIfNeeded()
+    {
+        if (CameraOwned)
+            _ = StopAsync();
     }
 
     private void OnNativeStatusChanged(object? sender, EventArgs e) => SetOnUi(RaiseNativeProperties);
 
-    private void OnReplayStateChanged(object? sender, ReplayState state) => SetOnUi(RaiseCommandStates);
+    private void OnReplayStateChanged(object? sender, ReplayState state) => SetOnUi(() =>
+    {
+        if (!string.Equals(_lastReplayName, state.ReplayName, StringComparison.OrdinalIgnoreCase))
+        {
+            var changedBetweenReplays = !string.IsNullOrWhiteSpace(_lastReplayName) &&
+                                        !string.IsNullOrWhiteSpace(state.ReplayName);
+            _lastReplayName = state.ReplayName;
+            if (changedBetweenReplays)
+            {
+                _suppressAutosave = true;
+                Keyframes.Clear();
+                SelectedKeyframe = null;
+                _currentFilePath = null;
+                _pathName = "Untitled Campath";
+                OnPropertyChanged(nameof(PathName));
+                _suppressAutosave = false;
+                Status = "Replay changed; load a matching Campath or start a new path.";
+                OnCollectionChanged();
+            }
+            RefreshDocuments();
+        }
+        RaiseCommandStates();
+    });
 
     private void RaiseNativeProperties()
     {
         OnPropertyChanged(nameof(NativeState));
         OnPropertyChanged(nameof(NativeMessage));
         OnPropertyChanged(nameof(IsPlaying));
+        OnPropertyChanged(nameof(CameraOwned));
         RaiseCommandStates();
     }
 
@@ -264,8 +532,13 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         (UpdateCommand as RelayCommand)?.RaiseCanExecuteChanged();
         (DeleteCommand as RelayCommand)?.RaiseCanExecuteChanged();
         (ClearCommand as RelayCommand)?.RaiseCanExecuteChanged();
+        (GoToCommand as RelayCommand)?.RaiseCanExecuteChanged();
         (PlayCommand as RelayCommand)?.RaiseCanExecuteChanged();
         (StopCommand as RelayCommand)?.RaiseCanExecuteChanged();
+        (SaveCommand as RelayCommand)?.RaiseCanExecuteChanged();
+        (LoadCommand as RelayCommand)?.RaiseCanExecuteChanged();
+        (CaptureHotkeyCommand as RelayCommand)?.RaiseCanExecuteChanged();
+        (ClearHotkeyCommand as RelayCommand)?.RaiseCanExecuteChanged();
     }
 
     private void SetOnUi(Action action)

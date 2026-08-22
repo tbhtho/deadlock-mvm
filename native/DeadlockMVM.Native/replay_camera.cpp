@@ -1,5 +1,6 @@
 #include "replay_camera.hpp"
 
+#include "campath_math.hpp"
 #include "pattern_scan.hpp"
 #include "protocol.hpp"
 
@@ -127,34 +128,29 @@ private:
     std::atomic<std::uint64_t> fov_{0};
 };
 
-class AtomicCampath final {
+class AtomicCameraFrame final {
 public:
-    void Store(const LinearCampathPayload& path, const std::uint64_t sequence) noexcept {
+    void Store(const CameraSample& sample, const std::int64_t tick, const std::uint64_t sequence) noexcept {
         generation_.fetch_add(1, std::memory_order_acq_rel);
-        from_tick_.store(path.from.demo_tick, std::memory_order_relaxed);
-        to_tick_.store(path.to.demo_tick, std::memory_order_relaxed);
-        from_.Store(path.from.camera, sequence);
-        to_.Store(path.to.camera, sequence);
-        sequence_.store(sequence, std::memory_order_relaxed);
+        sample_.Store(sample, sequence);
+        tick_.store(tick, std::memory_order_relaxed);
         generation_.fetch_add(1, std::memory_order_release);
     }
 
-    [[nodiscard]] bool Load(LinearCampathPayload& path, std::uint64_t& sequence) const noexcept {
+    [[nodiscard]] bool Load(CameraSample& sample, std::int64_t& tick, std::uint64_t& sequence) const noexcept {
         for (int attempt = 0; attempt < 4; ++attempt) {
             const auto before = generation_.load(std::memory_order_acquire);
             if ((before & 1u) != 0)
                 continue;
-            std::uint64_t ignored_from = 0;
-            std::uint64_t ignored_to = 0;
-            LinearCampathPayload candidate{};
-            candidate.from.demo_tick = from_tick_.load(std::memory_order_relaxed);
-            candidate.to.demo_tick = to_tick_.load(std::memory_order_relaxed);
-            if (!from_.Load(candidate.from.camera, ignored_from) || !to_.Load(candidate.to.camera, ignored_to))
+            CameraSample candidate{};
+            std::uint64_t candidate_sequence = 0;
+            if (!sample_.Load(candidate, candidate_sequence))
                 continue;
-            const auto candidate_sequence = sequence_.load(std::memory_order_relaxed);
+            const auto candidate_tick = tick_.load(std::memory_order_relaxed);
             const auto after = generation_.load(std::memory_order_acquire);
             if (before == after && (after & 1u) == 0) {
-                path = candidate;
+                sample = candidate;
+                tick = candidate_tick;
                 sequence = candidate_sequence;
                 return true;
             }
@@ -164,11 +160,126 @@ public:
 
 private:
     std::atomic<std::uint64_t> generation_{0};
-    std::atomic<std::int64_t> from_tick_{0};
-    std::atomic<std::int64_t> to_tick_{0};
+    std::atomic<std::int64_t> tick_{-1};
+    AtomicSample sample_{};
+};
+
+class AtomicPathKeyframe final {
+public:
+    void Store(const CampathKeyframe& keyframe, const std::uint64_t sequence) noexcept {
+        tick_.store(keyframe.demo_tick, std::memory_order_relaxed);
+        sample_.Store(keyframe.camera, sequence);
+    }
+
+    [[nodiscard]] bool Load(CampathKeyframe& keyframe) const noexcept {
+        std::uint64_t ignored_sequence = 0;
+        keyframe.demo_tick = tick_.load(std::memory_order_relaxed);
+        return sample_.Load(keyframe.camera, ignored_sequence);
+    }
+
+    [[nodiscard]] std::int64_t Tick() const noexcept {
+        return tick_.load(std::memory_order_relaxed);
+    }
+
+private:
+    std::atomic<std::int64_t> tick_{0};
+    AtomicSample sample_{};
+};
+
+class AtomicCampath final {
+public:
+    void Store(
+        const CampathPayloadHeader& header, const CampathKeyframe* keyframes,
+        const std::uint64_t sequence) noexcept {
+        generation_.fetch_add(1, std::memory_order_acq_rel);
+        for (std::uint32_t index = 0; index < header.keyframe_count; ++index)
+            keyframes_[index].Store(keyframes[index], sequence);
+        count_.store(header.keyframe_count, std::memory_order_relaxed);
+        interpolation_.store(header.interpolation, std::memory_order_relaxed);
+        easing_.store(header.easing, std::memory_order_relaxed);
+        sequence_.store(sequence, std::memory_order_relaxed);
+        generation_.fetch_add(1, std::memory_order_release);
+    }
+
+    [[nodiscard]] bool Evaluate(
+        const std::int64_t demo_tick, CameraSample& sample, std::uint64_t& sequence) const noexcept {
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            const auto before = generation_.load(std::memory_order_acquire);
+            if ((before & 1u) != 0)
+                continue;
+            const auto count = count_.load(std::memory_order_relaxed);
+            const auto interpolation = interpolation_.load(std::memory_order_relaxed);
+            const auto easing = easing_.load(std::memory_order_relaxed);
+            if (count < 2 || count > kMaxCampathKeyframes)
+                return false;
+
+            std::uint32_t right = 1;
+            if (demo_tick >= keyframes_[count - 1].Tick()) {
+                right = count - 1;
+            } else if (demo_tick > keyframes_[0].Tick()) {
+                std::uint32_t low = 1;
+                std::uint32_t high = count - 1;
+                while (low < high) {
+                    const auto middle = low + ((high - low) / 2);
+                    if (keyframes_[middle].Tick() < demo_tick)
+                        low = middle + 1;
+                    else
+                        high = middle;
+                }
+                right = low;
+            }
+            const auto left = right - 1;
+            CampathKeyframe p1{};
+            CampathKeyframe p2{};
+            if (!keyframes_[left].Load(p1) || !keyframes_[right].Load(p2))
+                continue;
+
+            if (demo_tick <= p1.demo_tick) {
+                sample = p1.camera;
+            } else if (demo_tick >= p2.demo_tick && right == count - 1) {
+                sample = p2.camera;
+            } else {
+                auto amount = static_cast<double>(demo_tick - p1.demo_tick) /
+                              static_cast<double>(p2.demo_tick - p1.demo_tick);
+                amount = ApplyCampathEasing(amount, easing);
+                if (interpolation == CampathInterpolation::smooth) {
+                    CampathKeyframe p0{};
+                    CampathKeyframe p3{};
+                    if (left > 0) {
+                        if (!keyframes_[left - 1].Load(p0))
+                            continue;
+                    } else {
+                        p0 = CampathKeyframe{p1.demo_tick, ReflectCamera(p1.camera, p2.camera)};
+                    }
+                    if (right + 1 < count) {
+                        if (!keyframes_[right + 1].Load(p3))
+                            continue;
+                    } else {
+                        p3 = CampathKeyframe{p2.demo_tick, ReflectCamera(p2.camera, p1.camera)};
+                    }
+                    sample = EvaluateSmoothCamera(p0.camera, p1.camera, p2.camera, p3.camera, amount);
+                } else {
+                    sample = EvaluateLinearCamera(p1.camera, p2.camera, amount);
+                }
+            }
+
+            const auto candidate_sequence = sequence_.load(std::memory_order_relaxed);
+            const auto after = generation_.load(std::memory_order_acquire);
+            if (before == after && (after & 1u) == 0) {
+                sequence = candidate_sequence;
+                return ValidateSample(sample);
+            }
+        }
+        return false;
+    }
+
+private:
+    std::atomic<std::uint64_t> generation_{0};
+    std::atomic<std::uint32_t> count_{0};
+    std::atomic<CampathInterpolation> interpolation_{CampathInterpolation::linear};
+    std::atomic<CampathEasing> easing_{CampathEasing::linear};
     std::atomic<std::uint64_t> sequence_{0};
-    AtomicSample from_{};
-    AtomicSample to_{};
+    std::array<AtomicPathKeyframe, kMaxCampathKeyframes> keyframes_{};
 };
 
 struct Backend final {
@@ -194,6 +305,8 @@ struct Backend final {
     std::atomic<bool> has_sample{false};
     std::atomic<bool> campath_active{false};
     std::atomic<bool> command_line_replay{false};
+    std::atomic<bool> observation_requested{false};
+    std::atomic<bool> camera_observed{false};
     std::atomic<bool> shutdown{false};
     std::atomic<std::uint64_t> heartbeat_milliseconds{0};
     std::atomic<std::int64_t> replay_tick{0};
@@ -205,6 +318,7 @@ struct Backend final {
     std::atomic<std::uint32_t> active_hooks{0};
     AtomicSample desired_sample{};
     AtomicSample applied_sample{};
+    AtomicCameraFrame observed_frame{};
     AtomicCampath campath{};
 };
 
@@ -416,39 +530,6 @@ void WriteVector(const std::uintptr_t address, const float x, const float y, con
     values[2] = z;
 }
 
-[[nodiscard]] double Lerp(const double from, const double to, const double amount) noexcept {
-    return from + (to - from) * amount;
-}
-
-[[nodiscard]] double ShortestAngleDelta(const double from, const double to) noexcept {
-    auto delta = std::fmod(to - from, 360.0);
-    if (delta > 180.0) delta -= 360.0;
-    if (delta < -180.0) delta += 360.0;
-    return delta;
-}
-
-[[nodiscard]] double NormalizeAngle(double value) noexcept {
-    value = std::fmod(value, 360.0);
-    if (value > 180.0) value -= 360.0;
-    if (value < -180.0) value += 360.0;
-    return value;
-}
-
-[[nodiscard]] CameraSample EvaluateLinearCampath(
-    const LinearCampathPayload& path, const std::int64_t demo_tick) noexcept {
-    const auto span = static_cast<double>(path.to.demo_tick - path.from.demo_tick);
-    const auto amount = std::clamp(static_cast<double>(demo_tick - path.from.demo_tick) / span, 0.0, 1.0);
-    return CameraSample{
-        Lerp(path.from.camera.x, path.to.camera.x, amount),
-        Lerp(path.from.camera.y, path.to.camera.y, amount),
-        Lerp(path.from.camera.z, path.to.camera.z, amount),
-        Lerp(path.from.camera.pitch, path.to.camera.pitch, amount),
-        NormalizeAngle(path.from.camera.yaw + ShortestAngleDelta(path.from.camera.yaw, path.to.camera.yaw) * amount),
-        NormalizeAngle(path.from.camera.roll + ShortestAngleDelta(path.from.camera.roll, path.to.camera.roll) * amount),
-        Lerp(path.from.camera.fov, path.to.camera.fov, amount),
-    };
-}
-
 [[nodiscard]] bool CanApply(Backend& backend, void* camera) noexcept {
     if (!backend.override_requested.load(std::memory_order_acquire) ||
         !backend.has_sample.load(std::memory_order_acquire) ||
@@ -479,6 +560,24 @@ void WriteVector(const std::uintptr_t address, const float x, const float y, con
     return true;
 }
 
+[[nodiscard]] bool CanObserve(Backend& backend, void* camera) noexcept {
+    if (!backend.observation_requested.load(std::memory_order_acquire) ||
+        !backend.pipe_connected.load(std::memory_order_acquire) ||
+        !backend.replay_active.load(std::memory_order_acquire) ||
+        !backend.free_roam.load(std::memory_order_acquire) ||
+        !backend.command_line_replay.load(std::memory_order_acquire))
+        return false;
+
+    const auto heartbeat = backend.heartbeat_milliseconds.load(std::memory_order_acquire);
+    if (heartbeat == 0 || GetTickCount64() - heartbeat > kHeartbeatTimeoutMilliseconds)
+        return false;
+
+    void* current_camera = nullptr;
+    void** current_vtable = nullptr;
+    return ResolveCamera(backend, current_camera, current_vtable) && current_camera == camera &&
+           current_vtable == backend.hooked_vtable && IsObserverRoaming(backend);
+}
+
 void* __fastcall CameraUpdateHook(void* camera) noexcept {
     auto* backend = g_backend;
     if (backend == nullptr)
@@ -487,7 +586,7 @@ void* __fastcall CameraUpdateHook(void* camera) noexcept {
     backend->active_hooks.fetch_add(1, std::memory_order_acq_rel);
     const auto original = backend->original_update;
     void* result = original != nullptr ? original(camera) : nullptr;
-    backend->hook_calls.fetch_add(1, std::memory_order_relaxed);
+    const auto hook_call = backend->hook_calls.fetch_add(1, std::memory_order_relaxed) + 1;
 
     std::uintptr_t global_vars = 0;
     if (ReadPointer(backend->global_vars_slot, global_vars)) {
@@ -502,22 +601,17 @@ void* __fastcall CameraUpdateHook(void* camera) noexcept {
         }
     }
 
-    if (CanApply(*backend, camera)) {
+    if (backend->override_requested.load(std::memory_order_acquire) && CanApply(*backend, camera)) {
         CameraSample sample{};
         std::uint64_t sequence = 0;
         auto loaded = false;
         if (backend->campath_active.load(std::memory_order_acquire)) {
-            LinearCampathPayload path{};
-            loaded = backend->campath.Load(path, sequence) && ValidateCampath(path);
-            if (loaded) {
-                const auto demo_tick = backend->replay_tick.load(std::memory_order_acquire);
-                if (demo_tick < 0) {
-                    loaded = false;
-                    backend->override_active.store(false, std::memory_order_release);
-                    backend->error.store(ErrorCode::replay_clock_unavailable, std::memory_order_release);
-                } else {
-                    sample = EvaluateLinearCampath(path, demo_tick);
-                }
+            const auto demo_tick = backend->replay_tick.load(std::memory_order_acquire);
+            if (demo_tick < 0) {
+                backend->override_active.store(false, std::memory_order_release);
+                backend->error.store(ErrorCode::replay_clock_unavailable, std::memory_order_release);
+            } else {
+                loaded = backend->campath.Evaluate(demo_tick, sample, sequence);
             }
         } else {
             loaded = backend->desired_sample.Load(sample, sequence);
@@ -548,6 +642,30 @@ void* __fastcall CameraUpdateHook(void* camera) noexcept {
                 backend->error.store(ErrorCode::hook_runtime_invalid, std::memory_order_release);
             }
         }
+    }
+
+    if (CanObserve(*backend, camera)) {
+        __try {
+            const auto address = reinterpret_cast<std::uintptr_t>(camera);
+            const auto* origin = reinterpret_cast<const float*>(address + kCameraOrigin);
+            const auto* angles = reinterpret_cast<const float*>(address + kCameraAngles);
+            const auto fov = *reinterpret_cast<const float*>(address + kCameraFov);
+            const CameraSample observed{
+                origin[0], origin[1], origin[2],
+                angles[0], angles[1], angles[2], fov,
+            };
+            const auto tick = backend->replay_tick.load(std::memory_order_acquire);
+            if (tick >= 0 && ValidateSample(observed)) {
+                backend->observed_frame.Store(observed, tick, hook_call);
+                backend->camera_observed.store(true, std::memory_order_release);
+            } else {
+                backend->camera_observed.store(false, std::memory_order_release);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            backend->camera_observed.store(false, std::memory_order_release);
+        }
+    } else {
+        backend->camera_observed.store(false, std::memory_order_release);
     }
 
     backend->active_hooks.fetch_sub(1, std::memory_order_acq_rel);
@@ -662,8 +780,14 @@ void UninstallHook(Backend& backend) noexcept {
     status.hook_calls = backend.hook_calls.load(std::memory_order_acquire);
     status.replay_tick = backend.replay_tick.load(std::memory_order_acquire);
     std::uint64_t ignored_sequence = 0;
-    const auto has_applied_sample = backend.applied_sample.Load(status.camera, ignored_sequence);
-    static_cast<void>(has_applied_sample);
+    std::int64_t observed_tick = -1;
+    if (backend.camera_observed.load(std::memory_order_acquire) &&
+        backend.observed_frame.Load(status.camera, observed_tick, ignored_sequence)) {
+        status.replay_tick = observed_tick;
+        status.flags |= status_camera_observed;
+    } else {
+        static_cast<void>(backend.applied_sample.Load(status.camera, ignored_sequence));
+    }
     if (backend.resolved.load(std::memory_order_acquire)) status.flags |= status_resolved;
     if (backend.hook_installed.load(std::memory_order_acquire)) status.flags |= status_hook_installed;
     if (backend.pipe_connected.load(std::memory_order_acquire)) status.flags |= status_pipe_connected;
@@ -692,6 +816,8 @@ void ResetConnectionGate(Backend& backend) noexcept {
     backend.override_active.store(false, std::memory_order_release);
     backend.heartbeat_milliseconds.store(0, std::memory_order_release);
     backend.campath_active.store(false, std::memory_order_release);
+    backend.observation_requested.store(false, std::memory_order_release);
+    backend.camera_observed.store(false, std::memory_order_release);
 }
 
 void ServePipe(Backend& backend) noexcept {
@@ -725,7 +851,7 @@ void ServePipe(Backend& backend) noexcept {
         MessageHeader header{};
         if (!ReadExact(pipe, &header, static_cast<DWORD>(sizeof(header))))
             break;
-        if (!ValidateHeader(header) || header.payload_size != ExpectedPayloadSize(header.type)) {
+        if (!ValidateHeader(header) || !ValidatePayloadSize(header.type, header.payload_size)) {
             backend.error.store(ErrorCode::protocol_error, std::memory_order_release);
             break;
         }
@@ -758,6 +884,7 @@ void ServePipe(Backend& backend) noexcept {
                     backend.override_requested.store(false, std::memory_order_release);
                     backend.override_active.store(false, std::memory_order_release);
                     backend.campath_active.store(false, std::memory_order_release);
+                    backend.camera_observed.store(false, std::memory_order_release);
                 }
                 break;
             }
@@ -773,9 +900,14 @@ void ServePipe(Backend& backend) noexcept {
                 backend.campath_active.store(false, std::memory_order_release);
                 break;
             }
-            case MessageType::set_linear_campath: {
-                const auto request = *reinterpret_cast<const LinearCampathPayload*>(payload.data());
-                if (!hello_received || !ValidateCampath(request)) {
+            case MessageType::set_campath: {
+                const auto request = *reinterpret_cast<const CampathPayloadHeader*>(payload.data());
+                const auto* keyframes = reinterpret_cast<const CampathKeyframe*>(
+                    payload.data() + sizeof(CampathPayloadHeader));
+                const auto expected_size = sizeof(CampathPayloadHeader) +
+                    (static_cast<std::size_t>(request.keyframe_count) * sizeof(CampathKeyframe));
+                if (!hello_received || expected_size != header.payload_size ||
+                    !ValidateCampath(request, keyframes)) {
                     backend.error.store(ErrorCode::invalid_sample, std::memory_order_release);
                     break;
                 }
@@ -783,8 +915,8 @@ void ServePipe(Backend& backend) noexcept {
                     backend.error.store(ErrorCode::replay_clock_unavailable, std::memory_order_release);
                     break;
                 }
-                backend.campath.Store(request, header.sequence);
-                backend.desired_sample.Store(request.from.camera, header.sequence);
+                backend.campath.Store(request, keyframes, header.sequence);
+                backend.desired_sample.Store(keyframes[0].camera, header.sequence);
                 backend.accepted_sequence.store(header.sequence, std::memory_order_release);
                 backend.has_sample.store(true, std::memory_order_release);
                 backend.campath_active.store(true, std::memory_order_release);
@@ -806,6 +938,18 @@ void ServePipe(Backend& backend) noexcept {
                 break;
             case MessageType::clear_campath:
                 backend.campath_active.store(false, std::memory_order_release);
+                break;
+            case MessageType::prepare_camera_observation:
+                if (hello_received && backend.replay_active.load(std::memory_order_acquire) &&
+                    backend.free_roam.load(std::memory_order_acquire) &&
+                    backend.game_tick_offset.load(std::memory_order_acquire) >= 0 && InstallHook(backend)) {
+                    backend.observation_requested.store(true, std::memory_order_release);
+                    backend.error.store(ErrorCode::none, std::memory_order_release);
+                } else {
+                    backend.observation_requested.store(false, std::memory_order_release);
+                    backend.camera_observed.store(false, std::memory_order_release);
+                    backend.error.store(ErrorCode::replay_gate_closed, std::memory_order_release);
+                }
                 break;
             case MessageType::get_status:
                 break;

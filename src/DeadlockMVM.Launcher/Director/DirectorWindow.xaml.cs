@@ -12,6 +12,7 @@ public partial class DirectorWindow : Window
 {
     private readonly DirectorViewModel _vm;
     private readonly GlobalHotkey _hotkey;
+    private readonly CampathHotkeyService _campathHotkeys;
     private readonly WindowTracker _tracker;
     private readonly System.Windows.Threading.DispatcherTimer _connectTimer;
     private readonly System.Windows.Threading.DispatcherTimer? _hotkeyRetry;
@@ -27,10 +28,16 @@ public partial class DirectorWindow : Window
     {
         InitializeComponent();
 
-        _vm = new DirectorViewModel(camera, controller, nativeCamera, settings, log);
+        _campathHotkeys = new CampathHotkeyService(settings.DirectorHotkey, Dispatcher);
+        _vm = new DirectorViewModel(camera, controller, nativeCamera, settings, _campathHotkeys, log);
         DataContext = _vm;
         _vconPort = settings.VConsolePort;
         _log = log;
+
+        if (_campathHotkeys.IsAvailable)
+            log.Info("Director: foreground Campath keyboard/mouse observer ready.");
+        else
+            log.Warn($"Director: Campath input observer unavailable (error {_campathHotkeys.LastError}).");
 
         _hotkey = new GlobalHotkey(this, settings.DirectorHotkey, ToggleVisibility);
         if (_hotkey.IsRegistered)
@@ -73,6 +80,7 @@ public partial class DirectorWindow : Window
             _connectTimer.Stop();
             _hotkeyRetry?.Stop();
             _hotkey.Dispose();
+            _campathHotkeys.Dispose();
             _tracker.Dispose();
         };
 

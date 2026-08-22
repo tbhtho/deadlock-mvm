@@ -12,8 +12,9 @@ internal enum InProcessMessageType : ushort
     SetCameraSample = 5,
     GetStatus = 6,
     Shutdown = 7,
-    SetLinearCampath = 8,
+    SetCampath = 8,
     ClearCampath = 9,
+    PrepareCameraObservation = 10,
     Status = 100,
 }
 
@@ -59,6 +60,7 @@ public enum InProcessStatusFlags : uint
     HasSample = 1 << 6,
     CommandLineReplay = 1 << 7,
     CampathActive = 1 << 8,
+    CameraObserved = 1 << 9,
 }
 
 public sealed record InProcessCameraStatus(
@@ -75,18 +77,19 @@ public sealed record InProcessCameraStatus(
     public bool Ready => State == InProcessBackendState.Ready &&
                          Flags.HasFlag(InProcessStatusFlags.HookInstalled);
     public bool OverrideActive => Flags.HasFlag(InProcessStatusFlags.OverrideActive);
+    public bool CameraObserved => Flags.HasFlag(InProcessStatusFlags.CameraObserved) && Camera.IsValid && ReplayTick >= 0;
 }
 
 internal static class InProcessProtocol
 {
     public const uint Magic = 0x4D564D43;
-    public const ushort Version = 2;
+    public const ushort Version = 3;
     public const int HeaderSize = 20;
     public const int StatusSize = 104;
     public const int CameraSampleSize = 56;
     public const int CampathKeyframeSize = 64;
-    public const int LinearCampathSize = CampathKeyframeSize * 2;
-    public const int MaxPayloadSize = 512;
+    public const int CampathHeaderSize = 16;
+    public const int MaxPayloadSize = CampathHeaderSize + (CampathKeyframeSize * CampathPath.MaxKeyframes);
 
     public static byte[] CreateMessage(InProcessMessageType type, ulong sequence, ReadOnlySpan<byte> payload)
     {
@@ -144,10 +147,21 @@ internal static class InProcessProtocol
         ArgumentNullException.ThrowIfNull(path);
         if (!path.IsValid)
             throw new ArgumentOutOfRangeException(nameof(path));
+        return SerializeCampath(new CampathPath(new[] { path.From, path.To }));
+    }
 
-        var payload = new byte[LinearCampathSize];
-        WriteKeyframe(payload, 0, path.From);
-        WriteKeyframe(payload, CampathKeyframeSize, path.To);
+    public static byte[] SerializeCampath(CampathPath path)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        if (!path.IsValid)
+            throw new ArgumentOutOfRangeException(nameof(path));
+
+        var payload = new byte[CampathHeaderSize + (CampathKeyframeSize * path.Keyframes.Count)];
+        BinaryPrimitives.WriteUInt32LittleEndian(payload, checked((uint)path.Keyframes.Count));
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(4), (uint)path.Interpolation);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(8), (uint)path.Easing);
+        for (var index = 0; index < path.Keyframes.Count; index++)
+            WriteKeyframe(payload, CampathHeaderSize + (index * CampathKeyframeSize), path.Keyframes[index]);
         return payload;
     }
 

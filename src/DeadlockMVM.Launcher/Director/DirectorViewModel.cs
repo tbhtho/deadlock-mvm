@@ -38,6 +38,7 @@ public sealed class DirectorViewModel : INotifyPropertyChanged
         ReplayController controller,
         NativeReplayCameraSession nativeCamera,
         IAppSettings settings,
+        IHotkeyService hotkeys,
         ILogService log)
     {
         _camera = camera;
@@ -54,7 +55,7 @@ public sealed class DirectorViewModel : INotifyPropertyChanged
         NavItems.Add(new NavItem("CAPTURE", false, new RelayCommand(() => SelectedNav = NavItems[4])));
         _selectedNav = NavItems[0];
         Camera = new CameraViewModel(_camera, _controller, _log);
-        Campath = new CampathViewModel(_camera, _controller, nativeCamera, _log);
+        Campath = new CampathViewModel(_camera, _controller, nativeCamera, settings, hotkeys, _log);
 
         _controller.StateChanged += OnStateChanged;
 

@@ -58,13 +58,16 @@ public sealed class NativeReplayCameraClient : IAsyncDisposable
             InProcessProtocol.SerializeHeartbeat(replayActive, freeRoam, replayTick, gameTickOffset),
             cancellationToken);
 
-    public Task<InProcessCameraStatus> SetLinearCampathAsync(
-        LinearCampath path,
+    public Task<InProcessCameraStatus> SetCampathAsync(
+        CampathPath path,
         CancellationToken cancellationToken = default) =>
         RequestAsync(
-            InProcessMessageType.SetLinearCampath,
-            InProcessProtocol.SerializeLinearCampath(path),
+            InProcessMessageType.SetCampath,
+            InProcessProtocol.SerializeCampath(path),
             cancellationToken);
+
+    public Task<InProcessCameraStatus> PrepareCameraObservationAsync(CancellationToken cancellationToken = default) =>
+        RequestAsync(InProcessMessageType.PrepareCameraObservation, Array.Empty<byte>(), cancellationToken);
 
     public Task<InProcessCameraStatus> ClearCampathAsync(CancellationToken cancellationToken = default) =>
         RequestAsync(InProcessMessageType.ClearCampath, Array.Empty<byte>(), cancellationToken);

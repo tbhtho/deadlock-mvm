@@ -16,4 +16,6 @@ public static class AppPaths
     public static string LogFile => Path.Combine(LogsDirectory, "launcher.log");
 
     public static string SettingsFile => Path.Combine(DataDirectory, "settings.json");
+
+    public static string CampathsDirectory => Path.Combine(DataDirectory, "campaths");
 }

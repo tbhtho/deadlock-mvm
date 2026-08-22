@@ -47,9 +47,51 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
     public bool Connected => _client?.Connected == true;
     public bool Available => Connected && _status?.Flags.HasFlag(InProcessStatusFlags.Resolved) == true;
     public bool CampathPlaying => _campathPlaying;
+    public bool CameraOwned => _status?.OverrideActive == true;
 
-    public async Task<InProcessCameraStatus> PlayLinearCampathAsync(
-        LinearCampath path,
+    /// <summary>
+    /// Captures one renderer-facing camera frame without pausing, seeking, changing POV,
+    /// or acquiring override ownership.
+    /// </summary>
+    public async Task<CampathKeyframe> CaptureCurrentCameraAsync(CancellationToken cancellationToken = default)
+    {
+        await _operationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var client = _client ?? throw new InvalidOperationException(_message);
+            if (_campathPlaying)
+                throw new InvalidOperationException("Stop Campath playback before adding a keyframe.");
+            if (!IsConfirmedReplay(_controller.State) || _controller.GameTickOffset is null)
+                throw new InvalidOperationException("Replay playback and its tick calibration must be confirmed.");
+            if (_camera.Selection.Mode != SpecCameraMode.FreeRoam)
+                throw new InvalidOperationException("Camera capture is available in Free Roam.");
+
+            var before = await SendHeartbeatAsync(client, cancellationToken).ConfigureAwait(false);
+            var status = await client.PrepareCameraObservationAsync(cancellationToken).ConfigureAwait(false);
+            UpdateStatus(status);
+            if (!status.Ready)
+                throw new InvalidOperationException($"Native camera observation is unavailable: {status.Error}.");
+
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
+            while ((!status.CameraObserved || status.HookCalls <= before.HookCalls) && DateTime.UtcNow < deadline)
+            {
+                await Task.Delay(10, cancellationToken).ConfigureAwait(false);
+                status = await client.GetStatusAsync(cancellationToken).ConfigureAwait(false);
+                UpdateStatus(status);
+            }
+            if (!status.CameraObserved || status.HookCalls <= before.HookCalls)
+                throw new InvalidOperationException($"A fresh renderer camera frame was not observed: {status.Error}.");
+
+            return new CampathKeyframe(status.ReplayTick, status.Camera);
+        }
+        finally
+        {
+            _operationGate.Release();
+        }
+    }
+
+    public async Task<InProcessCameraStatus> PlayCampathAsync(
+        CampathPath path,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(path);
@@ -65,13 +107,13 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
 
             await _camera.EnterFreeRoamAsync(cancellationToken).ConfigureAwait(false);
             await SendHeartbeatAsync(client, cancellationToken).ConfigureAwait(false);
-            UpdateStatus(await client.SetLinearCampathAsync(path, cancellationToken).ConfigureAwait(false));
+            UpdateStatus(await client.SetCampathAsync(path, cancellationToken).ConfigureAwait(false));
             var status = await client.EnableOverrideAsync(cancellationToken).ConfigureAwait(false);
             UpdateStatus(status);
             if (!status.OverrideActive || !status.Flags.HasFlag(InProcessStatusFlags.CampathActive))
                 throw new InvalidOperationException($"Native Campath did not acquire the camera: {status.Error}.");
 
-            await SeekToPathStartAsync(checked((int)path.From.DemoTick), cancellationToken).ConfigureAwait(false);
+            await SeekToPathStartAsync(checked((int)path.Keyframes[0].DemoTick), cancellationToken).ConfigureAwait(false);
             await _camera.EnterFreeRoamAsync(cancellationToken).ConfigureAwait(false);
             status = await SendHeartbeatAsync(client, cancellationToken).ConfigureAwait(false);
             var readyDeadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
@@ -86,7 +128,7 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
 
             _campathPlaying = true;
             _controller.Play();
-            _message = $"Linear Campath active: tick {path.From.DemoTick} to {path.To.DemoTick}.";
+            _message = $"{path.Interpolation} Campath active: tick {path.Keyframes[0].DemoTick} to {path.Keyframes[^1].DemoTick}.";
             _log.Info($"Native camera: {_message}");
             OnStatusChanged();
             return status;
@@ -107,6 +149,49 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                 }
             }
             throw;
+        }
+        finally
+        {
+            _operationGate.Release();
+        }
+    }
+
+    public Task<InProcessCameraStatus> PlayLinearCampathAsync(
+        LinearCampath path,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        return PlayCampathAsync(new CampathPath(new[] { path.From, path.To }), cancellationToken);
+    }
+
+    public async Task<InProcessCameraStatus> GoToKeyframeAsync(
+        CampathKeyframe keyframe,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(keyframe);
+        if (!keyframe.IsValid)
+            throw new ArgumentOutOfRangeException(nameof(keyframe));
+
+        await _operationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var client = _client ?? throw new InvalidOperationException(_message);
+            if (!IsConfirmedReplay(_controller.State) || _controller.GameTickOffset is null)
+                throw new InvalidOperationException("Replay playback and its tick calibration must be confirmed.");
+
+            _controller.Pause();
+            await SeekToPathStartAsync(checked((int)keyframe.DemoTick), cancellationToken).ConfigureAwait(false);
+            await _camera.EnterFreeRoamAsync(cancellationToken).ConfigureAwait(false);
+            await SendHeartbeatAsync(client, cancellationToken).ConfigureAwait(false);
+            UpdateStatus(await client.SetCameraSampleAsync(keyframe.Camera, cancellationToken).ConfigureAwait(false));
+            var status = await client.EnableOverrideAsync(cancellationToken).ConfigureAwait(false);
+            UpdateStatus(status);
+            if (!status.OverrideActive)
+                throw new InvalidOperationException($"Native camera did not acquire the selected shot: {status.Error}.");
+            _campathPlaying = false;
+            _message = $"Holding keyframe at tick {keyframe.DemoTick}; Stop releases camera control.";
+            OnStatusChanged();
+            return status;
         }
         finally
         {

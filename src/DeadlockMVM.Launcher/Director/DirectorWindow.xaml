@@ -282,8 +282,21 @@
                 <!-- ============ DOLLY / CAMPATH ============ -->
                 <Border Grid.Column="1" Background="{StaticResource SurfaceBrush}" CornerRadius="2"
                         Visibility="{Binding IsDollyPage, Converter={StaticResource BoolToVisibility}}">
-                    <StackPanel Margin="14,9,14,8" DataContext="{Binding Campath}">
-                        <Grid>
+                    <Grid Margin="12,7,12,7" DataContext="{Binding Campath}">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="*" MinHeight="88" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+
+                        <Grid Grid.Row="0">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*" />
                                 <ColumnDefinition Width="Auto" />
@@ -291,60 +304,91 @@
                             <TextBlock Text="DOLLY / CAMPATH" Style="{StaticResource SectionLabel}" />
                             <TextBlock Grid.Column="1" Text="{Binding NativeState}" Style="{StaticResource MutedText}" />
                         </Grid>
-                        <TextBlock Text="{Binding NativeMessage}" Style="{StaticResource MutedText}" TextWrapping="Wrap" Margin="0,4,0,0" />
+                        <TextBlock Grid.Row="1" Text="{Binding NativeMessage}" Style="{StaticResource MutedText}"
+                                   TextTrimming="CharacterEllipsis" Margin="0,2,0,4" />
 
-                        <Border Height="1" Background="{StaticResource BorderBrush}" Margin="0,7,0,7" />
-
-                        <Grid>
+                        <Grid Grid.Row="2" Margin="0,0,0,5">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="58" />
+                                <ColumnDefinition Width="58" />
                             </Grid.ColumnDefinitions>
-                            <TextBlock Text="LINEAR PATH" Style="{StaticResource SectionLabel}" />
-                            <TextBlock Grid.Column="1" Text="{Binding KeyframeCount}" Style="{StaticResource MutedText}" />
+                            <TextBox Grid.Column="0" Style="{StaticResource DarkTextBox}" Height="25" Padding="5,2"
+                                     Text="{Binding PathName}" ToolTip="Campath name" />
+                            <Button Grid.Column="1" Content="SAVE" Style="{StaticResource SmallButton}" Command="{Binding SaveCommand}" Margin="5,0,0,0" />
+                            <Button Grid.Column="2" Content="LOAD" Style="{StaticResource SmallButton}" Command="{Binding LoadCommand}" Margin="5,0,0,0" />
                         </Grid>
 
-                        <ListBox ItemsSource="{Binding Keyframes}" SelectedItem="{Binding SelectedKeyframe}"
-                                 Height="174" Margin="0,6,0,0" Background="{StaticResource SurfaceAltBrush}"
+                        <ListBox Grid.Row="3" ItemsSource="{Binding Keyframes}" SelectedItem="{Binding SelectedKeyframe}"
+                                 Background="{StaticResource SurfaceAltBrush}"
                                  BorderBrush="{StaticResource BorderBrush}" Foreground="{StaticResource TextPrimaryBrush}">
                             <ListBox.ItemTemplate>
                                 <DataTemplate>
-                                    <Border Padding="7,5" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,0,1">
-                                        <StackPanel>
+                                    <Border Padding="6,3" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,0,1">
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*" />
+                                                <ColumnDefinition Width="Auto" />
+                                            </Grid.ColumnDefinitions>
                                             <TextBlock Text="{Binding DemoTick, StringFormat=TICK {0}}" FontFamily="Consolas"
                                                        Foreground="{StaticResource AccentBrush}" FontWeight="SemiBold" />
-                                            <TextBlock FontFamily="Consolas" Style="{StaticResource MutedText}">
-                                                <Run Text="XYZ " /><Run Text="{Binding Camera.X, StringFormat={}{0:0.000}}" />
-                                                <Run Text="  " /><Run Text="{Binding Camera.Y, StringFormat={}{0:0.000}}" />
-                                                <Run Text="  " /><Run Text="{Binding Camera.Z, StringFormat={}{0:0.000}}" />
+                                            <TextBlock Grid.Column="1" FontFamily="Consolas" Style="{StaticResource MutedText}">
+                                                <Run Text="FOV " /><Run Text="{Binding Camera.Fov, StringFormat={}{0:0.0}°}" />
                                             </TextBlock>
-                                            <TextBlock FontFamily="Consolas" Style="{StaticResource MutedText}">
-                                                <Run Text="P/Y/R " /><Run Text="{Binding Camera.Pitch, StringFormat={}{0:0.000}}" />
-                                                <Run Text="  " /><Run Text="{Binding Camera.Yaw, StringFormat={}{0:0.000}}" />
-                                                <Run Text="  " /><Run Text="{Binding Camera.Roll, StringFormat={}{0:0.000}}" />
-                                                <Run Text="   FOV " /><Run Text="{Binding Camera.Fov, StringFormat={}{0:0.00}}" />
-                                            </TextBlock>
-                                        </StackPanel>
+                                        </Grid>
                                     </Border>
                                 </DataTemplate>
                             </ListBox.ItemTemplate>
                         </ListBox>
 
-                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,7,0,0">
-                            <Button Content="ADD" Style="{StaticResource SmallButton}" Command="{Binding AddCommand}" />
-                            <Button Content="UPDATE" Style="{StaticResource SmallButton}" Command="{Binding UpdateCommand}" Margin="5,0,0,0" />
-                            <Button Content="DELETE" Style="{StaticResource SmallButton}" Command="{Binding DeleteCommand}" Margin="5,0,0,0" />
-                            <Button Content="CLEAR" Style="{StaticResource SmallButton}" Command="{Binding ClearCommand}" Margin="5,0,0,0" />
+                        <Grid Grid.Row="4" Margin="0,5,0,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <Button Content="+ ADD KEYFRAME" Style="{StaticResource SmallButton}" Command="{Binding AddCommand}" HorizontalAlignment="Left" />
+                            <TextBlock Grid.Column="1" Text="{Binding KeyframeCount}" Style="{StaticResource MutedText}" VerticalAlignment="Center" />
+                        </Grid>
+
+                        <StackPanel Grid.Row="5" Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,4,0,0">
+                            <Button Content="GO TO" Style="{StaticResource SmallButton}" Command="{Binding GoToCommand}" />
+                            <Button Content="UPDATE" Style="{StaticResource SmallButton}" Command="{Binding UpdateCommand}" Margin="4,0,0,0" />
+                            <Button Content="DELETE" Style="{StaticResource SmallButton}" Command="{Binding DeleteCommand}" Margin="4,0,0,0" />
+                            <Button Content="CLEAR" Style="{StaticResource SmallButton}" Command="{Binding ClearCommand}" Margin="4,0,0,0" />
                         </StackPanel>
 
-                        <Border Height="1" Background="{StaticResource BorderBrush}" Margin="0,8,0,7" />
-                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
-                            <Button Content="PLAY PATH" Style="{StaticResource SmallButton}" Command="{Binding PlayCommand}" MinWidth="92" />
-                            <Button Content="STOP" Style="{StaticResource SmallButton}" Command="{Binding StopCommand}" Margin="7,0,0,0" MinWidth="68" />
+                        <Grid Grid.Row="6" Margin="0,5,0,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <ComboBox Grid.Column="0" Style="{StaticResource DarkComboBox}" ItemsSource="{Binding InterpolationModes}"
+                                      SelectedItem="{Binding InterpolationMode}" ToolTip="Position interpolation" />
+                            <ComboBox Grid.Column="1" Style="{StaticResource DarkComboBox}" ItemsSource="{Binding EasingModes}"
+                                      SelectedItem="{Binding EasingMode}" Margin="5,0,0,0" ToolTip="Per-segment easing" />
+                        </Grid>
+
+                        <Grid Grid.Row="7" Margin="0,5,0,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="ADD HOTKEY" Style="{StaticResource SectionLabel}" VerticalAlignment="Center" />
+                            <Button Grid.Column="1" Content="{Binding AddHotkeyDisplay}" Style="{StaticResource SmallButton}"
+                                    Command="{Binding CaptureHotkeyCommand}" Margin="7,0,0,0" HorizontalAlignment="Stretch" />
+                            <Button Grid.Column="2" Content="×" Style="{StaticResource SmallButton}" Command="{Binding ClearHotkeyCommand}" Margin="4,0,0,0" />
+                        </Grid>
+
+                        <StackPanel Grid.Row="8" Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,5,0,0">
+                            <ComboBox Width="112" Style="{StaticResource DarkComboBox}" ItemsSource="{Binding SavedCampaths}"
+                                      SelectedItem="{Binding SelectedDocument}" DisplayMemberPath="Name" ToolTip="Saved Campaths" />
+                            <Button Content="PLAY PATH" Style="{StaticResource SmallButton}" Command="{Binding PlayCommand}" Margin="5,0,0,0" MinWidth="76" />
+                            <Button Content="STOP" Style="{StaticResource SmallButton}" Command="{Binding StopCommand}" Margin="4,0,0,0" MinWidth="48" />
                         </StackPanel>
-                        <TextBlock Text="{Binding Status}" Style="{StaticResource StatusText}" TextWrapping="Wrap"
-                                   HorizontalAlignment="Center" TextAlignment="Center" Margin="0,7,0,0" />
-                    </StackPanel>
+                        <TextBlock Grid.Row="9" Text="{Binding Status}" Style="{StaticResource StatusText}" TextWrapping="Wrap"
+                                   HorizontalAlignment="Center" TextAlignment="Center" Margin="0,4,0,0" MaxHeight="34" />
+                    </Grid>
                 </Border>
 
                 <!-- Placeholder for later pages -->
