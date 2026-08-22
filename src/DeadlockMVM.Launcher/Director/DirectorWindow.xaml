@@ -279,6 +279,74 @@
                     </StackPanel>
                 </Border>
 
+                <!-- ============ DOLLY / CAMPATH ============ -->
+                <Border Grid.Column="1" Background="{StaticResource SurfaceBrush}" CornerRadius="2"
+                        Visibility="{Binding IsDollyPage, Converter={StaticResource BoolToVisibility}}">
+                    <StackPanel Margin="14,9,14,8" DataContext="{Binding Campath}">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="DOLLY / CAMPATH" Style="{StaticResource SectionLabel}" />
+                            <TextBlock Grid.Column="1" Text="{Binding NativeState}" Style="{StaticResource MutedText}" />
+                        </Grid>
+                        <TextBlock Text="{Binding NativeMessage}" Style="{StaticResource MutedText}" TextWrapping="Wrap" Margin="0,4,0,0" />
+
+                        <Border Height="1" Background="{StaticResource BorderBrush}" Margin="0,7,0,7" />
+
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="LINEAR PATH" Style="{StaticResource SectionLabel}" />
+                            <TextBlock Grid.Column="1" Text="{Binding KeyframeCount}" Style="{StaticResource MutedText}" />
+                        </Grid>
+
+                        <ListBox ItemsSource="{Binding Keyframes}" SelectedItem="{Binding SelectedKeyframe}"
+                                 Height="174" Margin="0,6,0,0" Background="{StaticResource SurfaceAltBrush}"
+                                 BorderBrush="{StaticResource BorderBrush}" Foreground="{StaticResource TextPrimaryBrush}">
+                            <ListBox.ItemTemplate>
+                                <DataTemplate>
+                                    <Border Padding="7,5" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,0,1">
+                                        <StackPanel>
+                                            <TextBlock Text="{Binding DemoTick, StringFormat=TICK {0}}" FontFamily="Consolas"
+                                                       Foreground="{StaticResource AccentBrush}" FontWeight="SemiBold" />
+                                            <TextBlock FontFamily="Consolas" Style="{StaticResource MutedText}">
+                                                <Run Text="XYZ " /><Run Text="{Binding Camera.X, StringFormat={}{0:0.000}}" />
+                                                <Run Text="  " /><Run Text="{Binding Camera.Y, StringFormat={}{0:0.000}}" />
+                                                <Run Text="  " /><Run Text="{Binding Camera.Z, StringFormat={}{0:0.000}}" />
+                                            </TextBlock>
+                                            <TextBlock FontFamily="Consolas" Style="{StaticResource MutedText}">
+                                                <Run Text="P/Y/R " /><Run Text="{Binding Camera.Pitch, StringFormat={}{0:0.000}}" />
+                                                <Run Text="  " /><Run Text="{Binding Camera.Yaw, StringFormat={}{0:0.000}}" />
+                                                <Run Text="  " /><Run Text="{Binding Camera.Roll, StringFormat={}{0:0.000}}" />
+                                                <Run Text="   FOV " /><Run Text="{Binding Camera.Fov, StringFormat={}{0:0.00}}" />
+                                            </TextBlock>
+                                        </StackPanel>
+                                    </Border>
+                                </DataTemplate>
+                            </ListBox.ItemTemplate>
+                        </ListBox>
+
+                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,7,0,0">
+                            <Button Content="ADD" Style="{StaticResource SmallButton}" Command="{Binding AddCommand}" />
+                            <Button Content="UPDATE" Style="{StaticResource SmallButton}" Command="{Binding UpdateCommand}" Margin="5,0,0,0" />
+                            <Button Content="DELETE" Style="{StaticResource SmallButton}" Command="{Binding DeleteCommand}" Margin="5,0,0,0" />
+                            <Button Content="CLEAR" Style="{StaticResource SmallButton}" Command="{Binding ClearCommand}" Margin="5,0,0,0" />
+                        </StackPanel>
+
+                        <Border Height="1" Background="{StaticResource BorderBrush}" Margin="0,8,0,7" />
+                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                            <Button Content="PLAY PATH" Style="{StaticResource SmallButton}" Command="{Binding PlayCommand}" MinWidth="92" />
+                            <Button Content="STOP" Style="{StaticResource SmallButton}" Command="{Binding StopCommand}" Margin="7,0,0,0" MinWidth="68" />
+                        </StackPanel>
+                        <TextBlock Text="{Binding Status}" Style="{StaticResource StatusText}" TextWrapping="Wrap"
+                                   HorizontalAlignment="Center" TextAlignment="Center" Margin="0,7,0,0" />
+                    </StackPanel>
+                </Border>
+
                 <!-- Placeholder for later pages -->
                 <Border Grid.Column="1" Background="{StaticResource SurfaceBrush}" CornerRadius="2" Visibility="{Binding IsOtherPage, Converter={StaticResource BoolToVisibility}}">
                     <TextBlock Text="{Binding SelectedNav.Name, StringFormat={}{0} — coming in a later milestone}" Style="{StaticResource MutedText}" HorizontalAlignment="Center" VerticalAlignment="Center" TextWrapping="Wrap" Margin="20" />

@@ -4,6 +4,7 @@ obj/
 [Dd]ebug/
 [Rr]elease/
 publish/
+native/build/
 
 ## Published launcher output
 /release/

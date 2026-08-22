@@ -1,5 +1,6 @@
 using DeadlockMVM.Core.Models;
 using DeadlockMVM.Core.Native;
+using DeadlockMVM.Core.Native.InProcess;
 using DeadlockMVM.Core.Services;
 using System.Diagnostics;
 
@@ -31,6 +32,9 @@ if (args.Length >= 1 && args[0].Equals("ROTHOLD", StringComparison.OrdinalIgnore
 
 if (args.Length >= 2 && args[0].Equals("SHOT", StringComparison.OrdinalIgnoreCase))
     return await RunShotAsync(args[1]);
+
+if (args.Length >= 2 && args[0].Equals("INPROCESS", StringComparison.OrdinalIgnoreCase))
+    return await RunInProcessAsync(args[1]);
 
 
 using var transport = new VConsoleTransport();
@@ -476,6 +480,385 @@ static async Task<int> RunRotHoldAsync(string? outDir)
     return 0;
 }
 
+static async Task<int> RunInProcessAsync(string dllPath)
+{
+    var process = Process.GetProcessesByName("deadlock").FirstOrDefault()
+                  ?? Process.GetProcessesByName("project8").FirstOrDefault();
+    if (process is null)
+    {
+        Console.WriteLine("FAIL: Deadlock is not running");
+        return 1;
+    }
+
+    var load = NativeReplayModuleLoader.LoadForReplay(process.Id, dllPath);
+    Console.WriteLine($"loader: success={load.Success} already={load.AlreadyLoaded} {load.Message}");
+    if (!load.Success)
+        return 1;
+
+    await using var native = new NativeReplayCameraClient();
+    InProcessCameraStatus hello;
+    try
+    {
+        hello = await native.ConnectAsync(process.Id, TimeSpan.FromSeconds(15));
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"FAIL: native IPC connection: {ex.Message}");
+        return 1;
+    }
+    PrintNative("hello", hello);
+    if (hello.State == InProcessBackendState.Failed)
+    {
+        Console.WriteLine($"FAIL: native backend initialization error {hello.Error}");
+        await native.ShutdownAsync();
+        return 1;
+    }
+
+    using var transport = new VConsoleTransport();
+    var controller = new ReplayController(transport) { PollInterval = TimeSpan.FromMilliseconds(250) };
+    var camera = new ReplayCameraService(transport);
+    using var externalReadback = new NativeCameraBackend(new ConsoleLog());
+    controller.Connect("127.0.0.1", 29000);
+
+    var replayDeadline = DateTime.UtcNow + TimeSpan.FromSeconds(20);
+    while (controller.State.ReplayName is null && DateTime.UtcNow < replayDeadline)
+        await Task.Delay(100);
+    if (controller.State.ReplayName is null)
+    {
+        Console.WriteLine("FAIL: replay playback was not confirmed");
+        await native.ShutdownAsync();
+        controller.Dispose();
+        return 1;
+    }
+
+    await camera.EnterFreeRoamAsync();
+    var stable = await WaitForStableTransformAsync(camera, TimeSpan.FromSeconds(8));
+    if (stable is not { } start)
+    {
+        Console.WriteLine("FAIL: Free Roam did not stabilize");
+        await native.ShutdownAsync();
+        controller.Dispose();
+        return 1;
+    }
+    Console.WriteLine($"free-roam baseline: {Fmt(start)} tick={controller.State.CurrentTick}");
+
+    externalReadback.Refresh(replayActive: true);
+    if (!externalReadback.Attached)
+    {
+        Console.WriteLine("FAIL: external authoritative FOV readback unavailable");
+        await native.ShutdownAsync();
+        controller.Dispose();
+        return 1;
+    }
+
+    using var heartbeatStop = new CancellationTokenSource();
+    var heartbeatTask = Task.Run(async () =>
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(200));
+        try
+        {
+            do
+            {
+                await native.HeartbeatAsync(
+                    true,
+                    true,
+                    controller.State.CurrentTick ?? -1,
+                    controller.GameTickOffset ?? -1,
+                    heartbeatStop.Token);
+            } while (await timer.WaitForNextTickAsync(heartbeatStop.Token));
+        }
+        catch (OperationCanceledException) when (heartbeatStop.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"heartbeat stopped: {ex.Message}");
+        }
+    });
+
+    var a = new CameraSample(start.X, start.Y, start.Z + 120, 5, 30, 0, 35);
+    var b = new CameraSample(start.X + 200, start.Y - 120, start.Z + 200, -15, 120, 0, 70);
+    var failures = 0;
+
+    try
+    {
+        // Foundation 1: exact paused A/B/A.
+        controller.Pause();
+        await WaitForPauseStateAsync(controller, true, TimeSpan.FromSeconds(5));
+        await ApplyAndVerify("paused A", a, enable: true);
+        await ApplyAndVerify("paused B", b);
+        await ApplyAndVerify("paused A return", a);
+
+        // Foundation 2: world advances for >=10 s while A stays exact.
+        controller.Play();
+        await WaitForPauseStateAsync(controller, false, TimeSpan.FromSeconds(5));
+        await ApplyAndVerify("hold start A", a);
+        var holdStartTick = controller.State.CurrentTick;
+        var holdDeadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (DateTime.UtcNow < holdDeadline)
+        {
+            await Task.Delay(500);
+            if (!await VerifyCurrentAsync(a, 0.075, print: false))
+                failures++;
+        }
+        var holdEndTick = controller.State.CurrentTick;
+        var holdOk = holdStartTick is { } hs && holdEndTick is { } he && he > hs;
+        Console.WriteLine($"10-second hold: tick {holdStartTick}->{holdEndTick}, camera={(failures == 0 ? "fixed" : "mismatch")}, worldAdvanced={holdOk}");
+        if (!holdOk) failures++;
+
+        // Foundation 3: explicit XYZ samples.
+        foreach (var percent in new[] { 0, 25, 50, 75, 100 })
+        {
+            var sample = CameraSample.Linear(a, b, percent / 100.0) with
+            {
+                Pitch = a.Pitch,
+                Yaw = a.Yaw,
+                Roll = a.Roll,
+                Fov = a.Fov,
+            };
+            await ApplyAndVerify($"XYZ {percent}%", sample);
+        }
+
+        // Foundation 4: full position/rotation/FOV sampling.
+        foreach (var percent in new[] { 25, 50, 75 })
+            await ApplyAndVerify($"FULL {percent}%", CameraSample.Linear(a, b, percent / 100.0));
+
+        // Two-keyframe Campath: the hook evaluates from the calibrated demo tick.
+        controller.Pause();
+        await WaitForPauseStateAsync(controller, true, TimeSpan.FromSeconds(5));
+        var clock = await native.GetStatusAsync();
+        var pathStart = clock.ReplayTick + 128;
+        var path = new LinearCampath(
+            new CampathKeyframe(pathStart, a),
+            new CampathKeyframe(pathStart + 256, b));
+        var configured = await native.SetLinearCampathAsync(path);
+        var enabledPath = await native.EnableOverrideAsync();
+        PrintNative("Campath configured", enabledPath);
+        if (!configured.Flags.HasFlag(InProcessStatusFlags.CampathActive) ||
+            !enabledPath.Flags.HasFlag(InProcessStatusFlags.CampathActive))
+        {
+            Console.WriteLine("  FAIL: native Campath did not become active");
+            failures++;
+        }
+
+        foreach (var percent in new[] { 0, 25, 50, 75, 100 })
+        {
+            var requestedTick = pathStart + (long)(256 * (percent / 100.0));
+            controller.SeekToTick(checked((int)requestedTick));
+            await WaitForNativeTickAsync(requestedTick, TimeSpan.FromSeconds(12));
+            controller.Pause();
+            await Task.Delay(250);
+            await camera.EnterFreeRoamAsync();
+            var status = await WaitForNativeTickStableAsync(TimeSpan.FromSeconds(4));
+            var expected = path.Evaluate(status.ReplayTick);
+            PrintNative($"CAMPATH {percent}% requestedTick={requestedTick}", status);
+            if (Math.Abs(status.ReplayTick - requestedTick) > 2)
+            {
+                Console.WriteLine($"  FAIL: seek landed at native demo tick {status.ReplayTick}");
+                failures++;
+            }
+            if (!await VerifyCurrentAsync(expected, 0.075, print: true))
+                failures++;
+        }
+
+        // Pausing freezes both the replay clock and the evaluated camera at mid-path.
+        var freezeTick = pathStart + 128;
+        controller.SeekToTick(checked((int)freezeTick));
+        await WaitForNativeTickAsync(freezeTick, TimeSpan.FromSeconds(12));
+        controller.Pause();
+        await Task.Delay(500);
+        await camera.EnterFreeRoamAsync();
+        await WaitForNativeTickStableAsync(TimeSpan.FromSeconds(4));
+        await Task.Delay(1000);
+        var freezeStart = await WaitForNativeTickStableAsync(TimeSpan.FromSeconds(4));
+        await Task.Delay(1000);
+        var freezeEnd = await native.GetStatusAsync();
+        var freezeOk = freezeEnd.ReplayTick == freezeStart.ReplayTick &&
+                       SampleEquals(freezeStart.Camera, freezeEnd.Camera, 0.0001) &&
+                       await VerifyCurrentAsync(path.Evaluate(freezeEnd.ReplayTick), 0.075, print: false);
+        Console.WriteLine($"Campath pause freeze: tick {freezeStart.ReplayTick}->{freezeEnd.ReplayTick} exact={freezeOk}");
+        if (!freezeOk) failures++;
+
+        // At quarter speed the same demo-tick function remains authoritative.
+        controller.SeekToTick(checked((int)(pathStart + 64)));
+        await WaitForNativeTickAsync(pathStart + 64, TimeSpan.FromSeconds(12));
+        controller.Pause();
+        await Task.Delay(250);
+        await camera.EnterFreeRoamAsync();
+        await WaitForNativeTickStableAsync(TimeSpan.FromSeconds(4));
+        controller.SetSpeed(0.25);
+        controller.Play();
+        await WaitForPauseStateAsync(controller, false, TimeSpan.FromSeconds(4));
+        var slowStart = await native.GetStatusAsync();
+        await Task.Delay(1000);
+        controller.Pause();
+        var slowEnd = await WaitForNativeTickStableAsync(TimeSpan.FromSeconds(4));
+        var slowExpected = path.Evaluate(slowEnd.ReplayTick);
+        var slowOk = slowEnd.ReplayTick > slowStart.ReplayTick && SampleEquals(slowExpected, slowEnd.Camera, 0.0001);
+        PrintNative("Campath 0.25x end", slowEnd);
+        Console.WriteLine($"  expected authoritative {FmtSample(slowExpected)} fov={slowExpected.Fov:0.000}");
+        Console.WriteLine($"  native authoritative   {FmtSample(slowEnd.Camera)} fov={slowEnd.Camera.Fov:0.000}");
+        Console.WriteLine($"Campath 0.25x: tick {slowStart.ReplayTick}->{slowEnd.ReplayTick} exact={slowOk}");
+        if (!slowOk) failures++;
+        controller.SetSpeed(1);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"FAIL: live foundation threw: {ex}");
+        failures++;
+    }
+    finally
+    {
+        try { await native.DisableOverrideAsync(); } catch { }
+        heartbeatStop.Cancel();
+        await heartbeatTask;
+        try { await native.ShutdownAsync(); } catch { }
+        controller.Play();
+        controller.Dispose();
+    }
+
+    Console.WriteLine(failures == 0 ? "INPROCESS FOUNDATION PASS" : $"INPROCESS FOUNDATION FAIL ({failures})");
+    return failures == 0 ? 0 : 1;
+
+    async Task ApplyAndVerify(string label, CameraSample sample, bool enable = false)
+    {
+        var accepted = await native.SetCameraSampleAsync(sample);
+        if (enable)
+            accepted = await native.EnableOverrideAsync();
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
+        InProcessCameraStatus status;
+        do
+        {
+            await Task.Delay(10);
+            status = await native.GetStatusAsync();
+        } while ((!status.OverrideActive || status.AppliedSequence < accepted.AcceptedSequence) && DateTime.UtcNow < deadline);
+
+        PrintNative(label, status);
+        if (!status.OverrideActive || status.Error != InProcessErrorCode.None)
+        {
+            Console.WriteLine($"  FAIL: override not active ({status.Error})");
+            failures++;
+            return;
+        }
+        if (!await VerifyCurrentAsync(sample, 0.075, print: true))
+            failures++;
+    }
+
+    async Task<bool> VerifyCurrentAsync(CameraSample expected, double tolerance, bool print)
+    {
+        await Task.Delay(35);
+        var transform = (await camera.ReadTransformAsync())?.ActiveTransform;
+        var fov = externalReadback.ReadActiveFov();
+        var ok = transform is { } actual && fov is { } actualFov &&
+                 Math.Abs(actual.X - expected.X) <= tolerance &&
+                 Math.Abs(actual.Y - expected.Y) <= tolerance &&
+                 Math.Abs(actual.Z - expected.Z) <= tolerance &&
+                 Math.Abs(actual.Pitch - expected.Pitch) <= tolerance &&
+                 Math.Abs(NormalizeYawDelta(actual.Yaw, expected.Yaw)) <= tolerance &&
+                 Math.Abs(actualFov - expected.Fov) <= tolerance;
+        if (print || !ok)
+        {
+            Console.WriteLine($"  expected pos=({expected.X:0.000},{expected.Y:0.000},{expected.Z:0.000}) " +
+                              $"ang=({expected.Pitch:0.000},{expected.Yaw:0.000},{expected.Roll:0.000}) fov={expected.Fov:0.000}");
+            Console.WriteLine($"  actual   {(transform is { } value ? Fmt(value) : "null")} fov={fov:0.000} -> {(ok ? "EXACT" : "FAIL")}");
+        }
+        return ok;
+    }
+
+    async Task<InProcessCameraStatus> WaitForNativeTickAsync(long target, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        InProcessCameraStatus status;
+        do
+        {
+            await Task.Delay(15);
+            status = await native.GetStatusAsync();
+            if (Math.Abs(status.ReplayTick - target) <= 2)
+                return status;
+        } while (DateTime.UtcNow < deadline);
+        return status;
+    }
+
+    async Task<InProcessCameraStatus> WaitForNativeTickStableAsync(TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        var previous = await native.GetStatusAsync();
+        var stable = 0;
+        while (DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(100);
+            var current = await native.GetStatusAsync();
+            if (current.ReplayTick == previous.ReplayTick && current.OverrideActive)
+            {
+                if (++stable >= 3)
+                    return current;
+            }
+            else
+            {
+                stable = 0;
+            }
+            previous = current;
+        }
+        return previous;
+    }
+
+    static bool SampleEquals(CameraSample expected, CameraSample actual, double tolerance) =>
+        Math.Abs(actual.X - expected.X) <= tolerance &&
+        Math.Abs(actual.Y - expected.Y) <= tolerance &&
+        Math.Abs(actual.Z - expected.Z) <= tolerance &&
+        Math.Abs(actual.Pitch - expected.Pitch) <= tolerance &&
+        Math.Abs(NormalizeYawDelta(actual.Yaw, expected.Yaw)) <= tolerance &&
+        Math.Abs(actual.Roll - expected.Roll) <= tolerance &&
+        Math.Abs(actual.Fov - expected.Fov) <= tolerance;
+
+    static string FmtSample(CameraSample sample) =>
+        $"pos=({sample.X:0.000}, {sample.Y:0.000}, {sample.Z:0.000}) " +
+        $"ang=({sample.Pitch:0.000}, {sample.Yaw:0.000}, {sample.Roll:0.000})";
+}
+
+static void PrintNative(string label, InProcessCameraStatus status) =>
+    Console.WriteLine($"{label}: state={status.State} error={status.Error} flags={status.Flags} " +
+                      $"accepted={status.AcceptedSequence} applied={status.AppliedSequence} hooks={status.HookCalls} " +
+                      $"nativeTick={status.ReplayTick}");
+
+static async Task<CameraTransform?> WaitForStableTransformAsync(ReplayCameraService camera, TimeSpan timeout)
+{
+    CameraTransform? previous = null;
+    var stable = 0;
+    var deadline = DateTime.UtcNow + timeout;
+    while (DateTime.UtcNow < deadline)
+    {
+        await Task.Delay(150);
+        var current = (await camera.ReadTransformAsync())?.ActiveTransform;
+        if (current is null)
+            continue;
+        if (previous is { } prior && Math.Abs(prior.X - current.X) < 0.01 &&
+            Math.Abs(prior.Y - current.Y) < 0.01 && Math.Abs(prior.Z - current.Z) < 0.01)
+        {
+            if (++stable >= 4)
+                return current;
+        }
+        else
+        {
+            stable = 0;
+        }
+        previous = current;
+    }
+    return previous;
+}
+
+static async Task<bool> WaitForPauseStateAsync(ReplayController controller, bool paused, TimeSpan timeout)
+{
+    var deadline = DateTime.UtcNow + timeout;
+    while (DateTime.UtcNow < deadline)
+    {
+        if (controller.State.IsPaused == paused)
+            return true;
+        await Task.Delay(100);
+    }
+    return false;
+}
+
 
 sealed class ConsoleLog : DeadlockMVM.Core.Contracts.ILogService
 {
@@ -484,4 +867,3 @@ sealed class ConsoleLog : DeadlockMVM.Core.Contracts.ILogService
     public void Warn(string message) => Console.WriteLine($"  log(W): {message}");
     public void Error(string message) => Console.WriteLine($"  log(E): {message}");
 }
-

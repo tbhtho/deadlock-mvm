@@ -48,9 +48,15 @@ public sealed class ReplayController : IReplayPlaybackState, IDisposable
     /// <summary>Raised whenever the known replay state changes.</summary>
     public event EventHandler<ReplayState>? StateChanged;
 
+    /// <summary>Raised from authoritative engine output after a demo seek finishes.</summary>
+    public event EventHandler<int>? SeekCompleted;
+
     public ReplayState State { get { lock (_gate) return _state; } }
 
     public bool IsConnected => _transport.IsConnected;
+
+    /// <summary>Calibration required to convert the in-process game tick to a demo tick.</summary>
+    public int? GameTickOffset => _parser.GameTickOffset;
 
     /// <summary>Interval between live position polls.</summary>
     public TimeSpan PollInterval { get; set; } = TimeSpan.FromSeconds(1);
@@ -227,6 +233,8 @@ public sealed class ReplayController : IReplayPlaybackState, IDisposable
         var parsed = _parser.ParseLine(line);
         if (parsed is not null)
             MergeEngineState(parsed);
+        if (_parser.TryParseSeekCompletedTick(line, out var seekTick))
+            SeekCompleted?.Invoke(this, seekTick);
     }
 
     private void OnDisconnected(object? sender, EventArgs e)

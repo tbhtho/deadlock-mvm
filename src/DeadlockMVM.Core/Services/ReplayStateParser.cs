@@ -21,6 +21,16 @@ public sealed partial class ReplayStateParser
 {
     private int? _gameTickOffset;
 
+    /// <summary>Engine game tick minus demo-timeline tick, learned from demo_info/output.</summary>
+    public int? GameTickOffset => _gameTickOffset;
+
+    public bool TryParseSeekCompletedTick(string line, out int tick)
+    {
+        var match = SkippingFinishedLine().Match(line ?? string.Empty);
+        tick = match.Success ? int.Parse(match.Groups[1].Value) : 0;
+        return match.Success;
+    }
+
     [GeneratedRegex(@"Currently playing (\d+) of (\d+) ticks\. Minutes:[\d.]+ File:(\S+)")]
     private static partial Regex PositionLine();
 

@@ -13,4 +13,25 @@
     <ProjectReference Include="..\DeadlockMVM.Core\DeadlockMVM.Core.csproj" />
   </ItemGroup>
 
+  <PropertyGroup>
+    <NativeReplayProject>$(MSBuildProjectDirectory)\..\..\native</NativeReplayProject>
+    <NativeReplayDll>$(NativeReplayProject)\build\artifacts\$(Configuration)\DeadlockMVM.Native.dll</NativeReplayDll>
+  </PropertyGroup>
+
+  <Target Name="BuildNativeReplayCamera"
+          BeforeTargets="Build"
+          Condition="'$(OS)' == 'Windows_NT' and '$(DesignTimeBuild)' != 'true'">
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(NativeReplayProject)\build-native.ps1&quot; -Configuration &quot;$(Configuration)&quot;" />
+  </Target>
+
+  <Target Name="CopyNativeReplayCamera" AfterTargets="Build"
+          Condition="'$(OS)' == 'Windows_NT' and Exists('$(NativeReplayDll)')">
+    <Copy SourceFiles="$(NativeReplayDll)" DestinationFiles="$(OutDir)DeadlockMVM.Native.dll" SkipUnchangedFiles="true" />
+  </Target>
+
+  <Target Name="PublishNativeReplayCamera" AfterTargets="Publish"
+          Condition="'$(OS)' == 'Windows_NT' and Exists('$(NativeReplayDll)')">
+    <Copy SourceFiles="$(NativeReplayDll)" DestinationFiles="$(PublishDir)DeadlockMVM.Native.dll" SkipUnchangedFiles="true" />
+  </Target>
+
 </Project>

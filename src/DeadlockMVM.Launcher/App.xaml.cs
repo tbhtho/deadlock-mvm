@@ -1,8 +1,10 @@
 using System.Windows;
+using System.IO;
 using DeadlockMVM.Core;
 using DeadlockMVM.Core.Contracts;
 using DeadlockMVM.Core.Models;
 using DeadlockMVM.Core.Native;
+using DeadlockMVM.Core.Native.InProcess;
 using DeadlockMVM.Core.Services;
 using DeadlockMVM.Launcher.Director;
 using DeadlockMVM.Launcher.ViewModels;
@@ -16,6 +18,7 @@ public partial class App : System.Windows.Application
     protected override void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
+        ShutdownMode = ShutdownMode.OnExplicitShutdown;
 
         // Deadlock's VConsole serves a single client; two MVM instances would
         // fight over the console connection. Only one instance may run.
@@ -52,20 +55,27 @@ public partial class App : System.Windows.Application
             var nativeCamera = new NativeCameraBackend(log);
             ICameraService camera = new CompositeCameraService(
                 new ReplayCameraService(transport), nativeCamera, controller, log);
+            var nativeSession = new NativeReplayCameraSession(
+                controller,
+                camera,
+                log,
+                Path.Combine(AppContext.BaseDirectory, "DeadlockMVM.Native.dll"));
 
             var viewModel = new MainViewModel(steam, process, launcher, log, settings, replayService);
 
             // Director window (hidden initially; shown on playback confirm or hotkey)
-            var director = new DirectorWindow(camera, controller, settings, log);
+            var director = new DirectorWindow(camera, controller, nativeSession, settings, log);
             viewModel.SetDirector(director);
 
             var window = new MainWindow { DataContext = viewModel };
-            window.Closed += (_, _) =>
+            window.Closed += async (_, _) =>
             {
                 director.Close();
+                await nativeSession.DisposeAsync();
                 controller.Dispose();
                 settings.Save();
                 log.Info("=== Launcher closed ===");
+                Shutdown();
             };
 
             MainWindow = window;
@@ -77,6 +87,7 @@ public partial class App : System.Windows.Application
         {
             log.Error($"Fatal startup error: {ex}");
             System.Windows.MessageBox.Show(ex.Message, "Deadlock MVM Launcher", MessageBoxButton.OK, MessageBoxImage.Error);
+            Shutdown();
         }
     }
 

@@ -1,0 +1,22 @@
+add_library(DeadlockMVM.Native SHARED
+    dllmain.cpp
+    pattern_scan.cpp
+    replay_camera.cpp
+)
+
+target_include_directories(DeadlockMVM.Native PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(DeadlockMVM.Native PRIVATE
+    UNICODE
+    _UNICODE
+    WIN32_LEAN_AND_MEAN
+    NOMINMAX
+)
+target_compile_options(DeadlockMVM.Native PRIVATE /W4 /WX /permissive- /EHsc /guard:cf)
+target_link_options(DeadlockMVM.Native PRIVATE /DYNAMICBASE /NXCOMPAT /GUARD:CF)
+target_link_libraries(DeadlockMVM.Native PRIVATE Advapi32)
+
+set_target_properties(DeadlockMVM.Native PROPERTIES
+    OUTPUT_NAME "DeadlockMVM.Native"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/artifacts/$<CONFIG>"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/artifacts/$<CONFIG>"
+)

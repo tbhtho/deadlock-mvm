@@ -7,6 +7,7 @@ using DeadlockMVM.Core;
 using DeadlockMVM.Core.Contracts;
 using DeadlockMVM.Core.Models;
 using DeadlockMVM.Core.Services;
+using DeadlockMVM.Core.Native.InProcess;
 using DeadlockMVM.Launcher.ViewModels;
 
 namespace DeadlockMVM.Launcher.Director;
@@ -32,7 +33,12 @@ public sealed class DirectorViewModel : INotifyPropertyChanged
     private double _gotoTickValue;
     private NavItem _selectedNav;
 
-    public DirectorViewModel(ICameraService camera, ReplayController controller, IAppSettings settings, ILogService log)
+    public DirectorViewModel(
+        ICameraService camera,
+        ReplayController controller,
+        NativeReplayCameraSession nativeCamera,
+        IAppSettings settings,
+        ILogService log)
     {
         _camera = camera;
         _controller = controller;
@@ -43,11 +49,12 @@ public sealed class DirectorViewModel : INotifyPropertyChanged
         NavItems = new ObservableCollection<NavItem>();
         NavItems.Add(new NavItem("REPLAY", true, new RelayCommand(() => SelectedNav = NavItems[0])));
         NavItems.Add(new NavItem("CAMERA", true, new RelayCommand(() => SelectedNav = NavItems[1])));
-        NavItems.Add(new NavItem("DOLLY", false, new RelayCommand(() => SelectedNav = NavItems[2])));
+        NavItems.Add(new NavItem("DOLLY", true, new RelayCommand(() => SelectedNav = NavItems[2])));
         NavItems.Add(new NavItem("VISUALS", false, new RelayCommand(() => SelectedNav = NavItems[3])));
         NavItems.Add(new NavItem("CAPTURE", false, new RelayCommand(() => SelectedNav = NavItems[4])));
         _selectedNav = NavItems[0];
         Camera = new CameraViewModel(_camera, _controller, _log);
+        Campath = new CampathViewModel(_camera, _controller, nativeCamera, _log);
 
         _controller.StateChanged += OnStateChanged;
 
@@ -74,6 +81,8 @@ public sealed class DirectorViewModel : INotifyPropertyChanged
 
     public CameraViewModel Camera { get; }
 
+    public CampathViewModel Campath { get; }
+
     public NavItem SelectedNav
     {
         get => _selectedNav;
@@ -84,6 +93,7 @@ public sealed class DirectorViewModel : INotifyPropertyChanged
 
             OnPropertyChanged(nameof(IsReplayPage));
             OnPropertyChanged(nameof(IsCameraPage));
+            OnPropertyChanged(nameof(IsDollyPage));
             OnPropertyChanged(nameof(IsOtherPage));
             Camera.SetPageActive(IsCameraPage);
         }
@@ -93,7 +103,9 @@ public sealed class DirectorViewModel : INotifyPropertyChanged
 
     public bool IsCameraPage => _selectedNav?.Name == "CAMERA";
 
-    public bool IsOtherPage => !IsReplayPage && !IsCameraPage;
+    public bool IsDollyPage => _selectedNav?.Name == "DOLLY";
+
+    public bool IsOtherPage => !IsReplayPage && !IsCameraPage && !IsDollyPage;
 
     public string ConnectionStatus
     {
