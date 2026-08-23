@@ -55,6 +55,7 @@ constexpr std::size_t kUpdateVtableIndex = 3;
 constexpr std::uint64_t kHeartbeatTimeoutMilliseconds = 1000;
 constexpr std::uint64_t kCameraObservationFreshMilliseconds = 500;
 constexpr std::uint64_t kSmvmSnapshotFreshMilliseconds = 500;
+constexpr auto kClientModuleWaitTimeout = std::chrono::seconds(30);
 
 using CameraUpdate = void*(__fastcall*)(void* camera);
 
@@ -452,7 +453,6 @@ Backend* g_backend = nullptr;
 }
 
 void RevokeCameraOwnership(Backend& backend, const ErrorCode error) noexcept {
-    backend.smvm_actions.Invalidate();
     backend.override_requested.store(false, std::memory_order_release);
     backend.override_active.store(false, std::memory_order_release);
     backend.has_sample.store(false, std::memory_order_release);
@@ -684,6 +684,19 @@ void OverlayPublishStatus(
     backend.state.store(BackendState::connected, std::memory_order_release);
     backend.error.store(ErrorCode::none, std::memory_order_release);
     return true;
+}
+
+[[nodiscard]] bool WaitForClientModule(Backend& backend) noexcept {
+    const auto deadline = std::chrono::steady_clock::now() + kClientModuleWaitTimeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (GetModuleHandleW(L"client.dll") != nullptr)
+            return true;
+        if (backend.shutdown.load(std::memory_order_acquire))
+            break;
+        Sleep(10);
+    }
+    backend.error.store(ErrorCode::client_module_missing, std::memory_order_release);
+    return false;
 }
 
 [[nodiscard]] bool ResolveCamera(Backend& backend, void*& camera, void**& vtable) noexcept {
@@ -1386,6 +1399,9 @@ void* __fastcall CameraUpdateHook(void* camera) noexcept {
 
 void ResetConnectionGate(Backend& backend) noexcept {
     backend.pipe_connected.store(false, std::memory_order_release);
+    // Editor actions are scoped to an IPC connection, not to camera ownership.
+    // Camera-gate revocation is expected outside Free Roam and must not discard
+    // actions such as FREE ROAM or PAUSE before the host can consume them.
     backend.smvm_actions.Invalidate();
     backend.replay_active.store(false, std::memory_order_release);
     backend.free_roam.store(false, std::memory_order_release);
@@ -1678,9 +1694,13 @@ void ServePipe(Backend& backend) noexcept {
         backend.performance_frequency = performance_frequency.QuadPart;
     g_backend = &backend;
 
-    if (!ValidateHostProcess(backend) || !ResolveStaticTargets(backend)) {
+    if (!ValidateHostProcess(backend)) {
         backend.state.store(BackendState::failed, std::memory_order_release);
     } else {
+        // The launcher loads this component immediately after process creation
+        // so the renderer hook can be installed before Deadlock publishes its
+        // real swapchain. Camera signatures depend on client.dll, which appears
+        // later; keep the two readiness chains independent and bounded.
         const SmvmOverlayCallbacks callbacks{
             &backend,
             &OverlayReadSnapshot,
@@ -1693,6 +1713,8 @@ void ServePipe(Backend& backend) noexcept {
             backend.renderer_backend.store(SmvmRendererBackend::none, std::memory_order_release);
             backend.renderer_error.store(SmvmRendererError::hook_install_failed, std::memory_order_release);
         }
+        if (!WaitForClientModule(backend) || !ResolveStaticTargets(backend))
+            backend.state.store(BackendState::failed, std::memory_order_release);
     }
 
     ServePipe(backend);

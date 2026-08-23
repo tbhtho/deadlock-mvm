@@ -1,6 +1,9 @@
 #include "smvm_overlay.hpp"
+#include "smvm_input_route.hpp"
 
 #include "campath_math.hpp"
+#include "pattern_scan.hpp"
+#include "smvm_input_gate.hpp"
 
 #include <Windows.h>
 #include <windowsx.h>
@@ -19,6 +22,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <string_view>
 
 namespace deadlock_mvm {
@@ -26,6 +30,16 @@ namespace {
 
 constexpr std::size_t kPresentVtableIndex = 8;
 constexpr std::size_t kResizeBuffersVtableIndex = 13;
+constexpr std::size_t kCreateSwapchainVtableIndex = 10;
+constexpr std::size_t kFactoryVtableEntryCount = 14;
+constexpr std::size_t kSwapchainVtableEntryCount = 18;
+constexpr std::size_t kInputSystemEnableVtableIndex = 13;
+constexpr std::size_t kInputSystemRequiredVtableEntries = kInputSystemEnableVtableIndex + 1;
+constexpr auto kInputSystemInterfaceName = "InputSystemVersion001";
+constexpr std::ptrdiff_t kRenderFactoryOffset = 0xA8;
+constexpr std::string_view kRenderFactoryPattern =
+    "4C 8B 81 A8 ED 01 00 49 8B C9 48 8B 05 ?? ?? ?? ?? "
+    "48 8B 90 A8 00 00 00 41 0F 11 41 18";
 constexpr std::size_t kMaxVertices = 65520;
 constexpr std::uint32_t kAtlasWidth = 256;
 constexpr std::uint32_t kAtlasHeight = 144;
@@ -34,7 +48,10 @@ constexpr std::uint32_t kSmoothVisualizationSamplesPerSegment = 24;
 constexpr std::size_t kMaxCachedPathLines =
     (kMaxCampathKeyframes - 1) * kSmoothVisualizationSamplesPerSegment;
 constexpr std::size_t kCameraMarkerLineCount = 9;
-constexpr auto kInstallTimeout = std::chrono::seconds(30);
+// Cold replay launches can load the Direct3D render module well after the
+// native backend connects. Keep polling without blocking shutdown.
+constexpr auto kInstallTimeout = std::chrono::seconds(120);
+constexpr auto kInstallRetryInterval = std::chrono::milliseconds(1);
 constexpr std::uint8_t kManualRawKeyRoute = 1u << 0;
 constexpr std::uint8_t kManualWindowKeyRoute = 1u << 1;
 constexpr std::uint8_t kMenuRawKeyRoute = 1u << 0;
@@ -46,7 +63,25 @@ constexpr auto kBindingResponseTimeoutMs = 1500ULL;
 constexpr auto kBindingFeedbackDurationMs = 2200ULL;
 constexpr UINT kSmvmCursorTransitionMessage = WM_APP + 0x4D0;
 constexpr UINT kSmvmRestoreWindowProcedureMessage = WM_APP + 0x4D1;
+constexpr UINT kSmvmPointerActionMessage = WM_APP + 0x4D2;
+constexpr UINT_PTR kSmvmModalInputTimerId = 0x4D564D01;
+constexpr UINT kSmvmModalInputTimerIntervalMs = 16;
 constexpr auto kCallbackDrainTimeout = std::chrono::milliseconds(1000);
+constexpr std::size_t kMaxRegisteredRawInputDevices = 32;
+constexpr std::size_t kMaxSuspendedRawMouseRegistrations = 4;
+constexpr USHORT kGenericDesktopUsagePage = 0x01;
+constexpr USHORT kMouseUsage = 0x02;
+
+enum class SmvmPointerAction : std::uint16_t {
+    none = 0,
+    left_click = 1,
+    right_click = 2,
+    middle_click = 3,
+    x1_click = 4,
+    x2_click = 5,
+    wheel = 6,
+    validate = 7,
+};
 
 [[nodiscard]] constexpr std::uint32_t RequiredInputModifiers(const std::uint32_t binding) noexcept {
     return (binding & kSmvmInputModifierMask) >> 16;
@@ -87,6 +122,21 @@ static_assert(!MenuMayClaimKeyDown(false, false));
 
 using PresentFunction = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
 using ResizeBuffersFunction = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
+using CreateSwapchainFunction = HRESULT(STDMETHODCALLTYPE*)(
+    IDXGIFactory*,
+    IUnknown*,
+    DXGI_SWAP_CHAIN_DESC*,
+    IDXGISwapChain**);
+using SdlWindow = void;
+using SdlPropertiesId = std::uint32_t;
+using SdlGetWindowsFunction = SdlWindow**(__cdecl*)(int*);
+using SdlGetWindowPropertiesFunction = SdlPropertiesId(__cdecl*)(SdlWindow*);
+using SdlGetPointerPropertyFunction = void*(__cdecl*)(SdlPropertiesId, const char*, void*);
+using SdlFreeFunction = void(__cdecl*)(void*);
+using SdlGetWindowRelativeMouseModeFunction = bool(__cdecl*)(SdlWindow*);
+using SdlSetWindowRelativeMouseModeFunction = bool(__cdecl*)(SdlWindow*, bool);
+using CreateInterfaceFunction = void*(__cdecl*)(const char*, int*);
+using InputSystemEnableFunction = void(__fastcall*)(void*, bool);
 
 template <typename T>
 void SafeRelease(T*& value) noexcept {
@@ -166,6 +216,7 @@ struct OverlayState final {
     std::atomic<bool> clean_view{false};
     std::atomic<std::uint32_t> active_hooks{0};
     std::atomic<std::uint32_t> active_window_procedures{0};
+    std::atomic<bool> factory_hook_reachable{false};
     std::atomic<bool> present_hook_reachable{false};
     std::atomic<bool> resize_hook_reachable{false};
     std::atomic<std::uint32_t> mouse_buttons{0};
@@ -179,8 +230,9 @@ struct OverlayState final {
     std::array<std::atomic<std::uint8_t>, 256> manual_key_routes{};
     std::array<std::atomic<std::uint8_t>, 256> menu_key_routes{};
     std::array<std::atomic<std::uint8_t>, 256> menu_preheld_keys{};
-    std::array<std::atomic<std::uint8_t>, 5> menu_mouse_routes{};
+    std::array<SmvmInputRoute, 5> menu_mouse_routes{};
     std::atomic<std::uint64_t> last_wheel_action_ms{0};
+    std::atomic<std::uint64_t> raw_wheel_consumed_ms{0};
     std::atomic<std::uint32_t> frame_microseconds{0};
     std::atomic<std::uint32_t> text_edit_mode{0};
     std::atomic<std::uint32_t> text_edit_length{0};
@@ -197,9 +249,15 @@ struct OverlayState final {
     std::atomic<std::int32_t> binding_conflict_action{-1};
     std::atomic<std::uint32_t> binding_modifier_chord_used{0};
     std::atomic_flag render_lock = ATOMIC_FLAG_INIT;
+    SRWLOCK hook_lifecycle_lock = SRWLOCK_INIT;
 
-    void** present_slot{};
-    void** resize_slot{};
+    IDXGIFactory* target_factory{};
+    void** factory_original_vtable{};
+    void** factory_hook_vtable{};
+    CreateSwapchainFunction original_create_swapchain{};
+    IDXGISwapChain* hooked_swapchain{};
+    void** swapchain_original_vtable{};
+    void** swapchain_hook_vtable{};
     PresentFunction original_present{};
     ResizeBuffersFunction original_resize{};
     IDXGISwapChain* target_swapchain{};
@@ -209,6 +267,16 @@ struct OverlayState final {
     bool previous_clip_valid{};
     bool cursor_shown{};
     int cursor_show_adjustments{};
+    bool sdl_relative_mouse_restore_pending{};
+    void* input_system{};
+    InputSystemEnableFunction input_system_enable{};
+    std::uint8_t input_enabled_state_offset{};
+    bool input_was_enabled{};
+    std::atomic<bool> input_restore_pending{false};
+    std::array<RAWINPUTDEVICE, kMaxSuspendedRawMouseRegistrations>
+        suspended_raw_mouse_registrations{};
+    UINT suspended_raw_mouse_registration_count{};
+    std::atomic<bool> raw_mouse_restore_pending{false};
 
     ID3D11Device* device{};
     ID3D11DeviceContext* context{};
@@ -1100,7 +1168,7 @@ void DrawStatusBadge(
     switch (ownership) {
         case CameraOwnership::deadlock_spectator: return "DEADLOCK";
         case CameraOwnership::smvm_manual_camera: return "SMVM MANUAL";
-        case CameraOwnership::smvm_restore: return "SMVM RESTORE";
+        case CameraOwnership::smvm_restore: return "SMVM SHOT";
         case CameraOwnership::smvm_campath: return "SMVM CAMPATH";
         default: return "NONE";
     }
@@ -2163,9 +2231,236 @@ void ReleaseRenderTarget() noexcept {
     SafeRelease(g_overlay.render_target);
 }
 
-void ApplyCursorStateOnWindowThread(const bool menu_open) noexcept {
+struct SdlMouseApi final {
+    SdlGetWindowsFunction get_windows{};
+    SdlGetWindowPropertiesFunction get_window_properties{};
+    SdlGetPointerPropertyFunction get_pointer_property{};
+    SdlFreeFunction free_memory{};
+    SdlGetWindowRelativeMouseModeFunction get_relative_mode{};
+    SdlSetWindowRelativeMouseModeFunction set_relative_mode{};
+};
+
+[[nodiscard]] bool ResolveSdlMouseApi(SdlMouseApi& api) noexcept {
+    const auto module = GetModuleHandleW(L"SDL3.dll");
+    if (module == nullptr)
+        return false;
+    api.get_windows = reinterpret_cast<SdlGetWindowsFunction>(
+        GetProcAddress(module, "SDL_GetWindows"));
+    api.get_window_properties = reinterpret_cast<SdlGetWindowPropertiesFunction>(
+        GetProcAddress(module, "SDL_GetWindowProperties"));
+    api.get_pointer_property = reinterpret_cast<SdlGetPointerPropertyFunction>(
+        GetProcAddress(module, "SDL_GetPointerProperty"));
+    api.free_memory = reinterpret_cast<SdlFreeFunction>(GetProcAddress(module, "SDL_free"));
+    api.get_relative_mode = reinterpret_cast<SdlGetWindowRelativeMouseModeFunction>(
+        GetProcAddress(module, "SDL_GetWindowRelativeMouseMode"));
+    api.set_relative_mode = reinterpret_cast<SdlSetWindowRelativeMouseModeFunction>(
+        GetProcAddress(module, "SDL_SetWindowRelativeMouseMode"));
+    return api.get_windows != nullptr && api.get_window_properties != nullptr &&
+           api.get_pointer_property != nullptr && api.free_memory != nullptr &&
+           api.get_relative_mode != nullptr && api.set_relative_mode != nullptr;
+}
+
+[[nodiscard]] SdlWindow* FindSdlWindowForHwnd(
+    const SdlMouseApi& api,
+    const HWND target_window) noexcept {
+    int count = 0;
+    auto** windows = api.get_windows(&count);
+    if (windows == nullptr || count <= 0 || count > 1024) {
+        if (windows != nullptr)
+            api.free_memory(windows);
+        return nullptr;
+    }
+    SdlWindow* match = nullptr;
+    for (int index = 0; index < count; ++index) {
+        auto* candidate = windows[index];
+        if (candidate == nullptr)
+            continue;
+        const auto properties = api.get_window_properties(candidate);
+        if (properties == 0)
+            continue;
+        const auto hwnd = static_cast<HWND>(api.get_pointer_property(
+            properties, "SDL.window.win32.hwnd", nullptr));
+        if (hwnd == target_window) {
+            match = candidate;
+            break;
+        }
+    }
+    api.free_memory(windows);
+    return match;
+}
+
+[[nodiscard]] bool SuspendSdlRelativeMouseMode(const HWND window) noexcept {
+    auto& state = g_overlay;
+    SdlMouseApi api{};
+    if (!ResolveSdlMouseApi(api))
+        return false;
+    auto* sdl_window = FindSdlWindowForHwnd(api, window);
+    if (sdl_window == nullptr || !api.get_relative_mode(sdl_window))
+        return sdl_window != nullptr;
+    if (!api.set_relative_mode(sdl_window, false))
+        return false;
+    // Deadlock can re-enable relative mode after a spectator-mode transition
+    // while the SMVM menu is still open. Preserve the original restore intent,
+    // but always re-check and withdraw any newly re-enabled mode.
+    state.sdl_relative_mouse_restore_pending = true;
+    return true;
+}
+
+[[nodiscard]] bool RestoreSdlRelativeMouseMode(const HWND window) noexcept {
+    auto& state = g_overlay;
+    if (!state.sdl_relative_mouse_restore_pending)
+        return true;
+    SdlMouseApi api{};
+    if (!ResolveSdlMouseApi(api))
+        return false;
+    auto* sdl_window = FindSdlWindowForHwnd(api, window);
+    if (sdl_window == nullptr || !api.set_relative_mode(sdl_window, true))
+        return false;
+    state.sdl_relative_mouse_restore_pending = false;
+    return true;
+}
+
+[[nodiscard]] constexpr bool IsRawMouseRegistration(
+    const RAWINPUTDEVICE& registration) noexcept {
+    return registration.usUsagePage == kGenericDesktopUsagePage &&
+           registration.usUsage == kMouseUsage;
+}
+
+[[nodiscard]] bool ReadRegisteredRawInputDevices(
+    std::array<RAWINPUTDEVICE, kMaxRegisteredRawInputDevices>& registrations,
+    UINT& count) noexcept {
+    count = 0;
+    if (GetRegisteredRawInputDevices(nullptr, &count, sizeof(RAWINPUTDEVICE)) ==
+        static_cast<UINT>(-1))
+        return false;
+    if (count == 0)
+        return true;
+    if (count > registrations.size())
+        return false;
+
+    auto capacity = static_cast<UINT>(registrations.size());
+    const auto copied = GetRegisteredRawInputDevices(
+        registrations.data(), &capacity, sizeof(RAWINPUTDEVICE));
+    if (copied == static_cast<UINT>(-1) || copied > registrations.size())
+        return false;
+    count = copied;
+    return true;
+}
+
+[[nodiscard]] bool SnapshotRawMouseRegistrationsOnWindowThread() noexcept {
+    auto& state = g_overlay;
+    if (state.raw_mouse_restore_pending.load(std::memory_order_acquire))
+        return true;
+
+    std::array<RAWINPUTDEVICE, kMaxRegisteredRawInputDevices> registrations{};
+    UINT count = 0;
+    if (!ReadRegisteredRawInputDevices(registrations, count))
+        return false;
+
+    UINT mouse_count = 0;
+    for (UINT index = 0; index < count; ++index) {
+        if (!IsRawMouseRegistration(registrations[index]))
+            continue;
+        if (mouse_count >= state.suspended_raw_mouse_registrations.size())
+            return false;
+        state.suspended_raw_mouse_registrations[mouse_count++] = registrations[index];
+    }
+    state.suspended_raw_mouse_registration_count = mouse_count;
+    if (mouse_count != 0)
+        state.raw_mouse_restore_pending.store(true, std::memory_order_release);
+    return true;
+}
+
+[[nodiscard]] bool RemoveCurrentRawMouseRegistrationsOnWindowThread() noexcept {
+    std::array<RAWINPUTDEVICE, kMaxRegisteredRawInputDevices> registrations{};
+    UINT count = 0;
+    if (!ReadRegisteredRawInputDevices(registrations, count))
+        return false;
+
+    std::array<RAWINPUTDEVICE, kMaxSuspendedRawMouseRegistrations> removals{};
+    UINT removal_count = 0;
+    for (UINT index = 0; index < count; ++index) {
+        if (!IsRawMouseRegistration(registrations[index]))
+            continue;
+        if (removal_count >= removals.size())
+            return false;
+        removals[removal_count++] = RAWINPUTDEVICE{
+            registrations[index].usUsagePage,
+            registrations[index].usUsage,
+            RIDEV_REMOVE,
+            nullptr};
+    }
+    return removal_count == 0 ||
+           RegisterRawInputDevices(removals.data(), removal_count, sizeof(RAWINPUTDEVICE)) != FALSE;
+}
+
+[[nodiscard]] bool RestoreRawMouseRegistrationsOnWindowThread() noexcept {
+    auto& state = g_overlay;
+    if (!state.raw_mouse_restore_pending.load(std::memory_order_acquire))
+        return true;
+
+    // SDL can rebuild the process' current mouse registration when relative
+    // mode is restored, especially after a spectator-mode transition while
+    // the editor was open. That registration reflects the new Deadlock mode
+    // and is more authoritative than the pre-menu snapshot. Preserve it; only
+    // replay the snapshot when SDL left no process mouse registration behind.
+    std::array<RAWINPUTDEVICE, kMaxRegisteredRawInputDevices> current{};
+    UINT current_count = 0;
+    if (!ReadRegisteredRawInputDevices(current, current_count))
+        return false;
+    for (UINT index = 0; index < current_count; ++index) {
+        if (!IsRawMouseRegistration(current[index]))
+            continue;
+        state.suspended_raw_mouse_registration_count = 0;
+        state.raw_mouse_restore_pending.store(false, std::memory_order_release);
+        return true;
+    }
+
+    const auto count = state.suspended_raw_mouse_registration_count;
+    if (count == 0 || count > state.suspended_raw_mouse_registrations.size())
+        return false;
+    if (RegisterRawInputDevices(
+            state.suspended_raw_mouse_registrations.data(),
+            count,
+            sizeof(RAWINPUTDEVICE)) == FALSE)
+        return false;
+    state.suspended_raw_mouse_registration_count = 0;
+    state.raw_mouse_restore_pending.store(false, std::memory_order_release);
+    return true;
+}
+
+[[nodiscard]] bool SuspendInputSystemOnWindowThread() noexcept;
+[[nodiscard]] bool RestoreInputSystemOnWindowThread() noexcept;
+
+[[nodiscard]] bool PointerStateRestorePending() noexcept {
+    const auto& state = g_overlay;
+    return state.previous_clip_valid || state.sdl_relative_mouse_restore_pending ||
+           state.raw_mouse_restore_pending.load(std::memory_order_acquire) ||
+           state.input_restore_pending.load(std::memory_order_acquire);
+}
+
+[[nodiscard]] bool ApplyCursorStateOnWindowThread(const bool menu_open) noexcept {
     auto& state = g_overlay;
     if (menu_open) {
+        // Deadlock uses SDL relative mode for its spectator mouse. Suspend that
+        // public per-window mode while the modal editor owns the pointer so the
+        // same physical click cannot also advance the spectator target. This
+        // runs on the game window thread, as required by SDL, and restores only
+        // a mode that was observed enabled when the menu opened.
+        // SDL's public relative-mode transition does not necessarily withdraw
+        // the process-wide Raw Input mouse registration before the next click.
+        // Snapshot it first, then remove only the generic-desktop mouse usage.
+        // Keyboard and every other HID registration remain untouched.
+        const auto input_ok = SuspendInputSystemOnWindowThread();
+        const auto snapshot_ok = input_ok && SnapshotRawMouseRegistrationsOnWindowThread();
+        const auto sdl_ok = snapshot_ok && SuspendSdlRelativeMouseMode(state.output_window);
+        const auto raw_ok = sdl_ok && RemoveCurrentRawMouseRegistrationsOnWindowThread();
+        if (!input_ok || !snapshot_ok || !sdl_ok || !raw_ok) {
+            static_cast<void>(RestoreSdlRelativeMouseMode(state.output_window));
+            static_cast<void>(RestoreRawMouseRegistrationsOnWindowThread());
+            static_cast<void>(RestoreInputSystemOnWindowThread());
+            return false;
+        }
         if (!state.previous_clip_valid)
             state.previous_clip_valid = GetClipCursor(&state.previous_clip) != FALSE;
         static_cast<void>(ClipCursor(nullptr));
@@ -2179,7 +2474,7 @@ void ApplyCursorStateOnWindowThread(const bool menu_open) noexcept {
             state.cursor_shown = true;
         }
         SetCursor(LoadCursorW(nullptr, IDC_ARROW));
-        return;
+        return true;
     }
 
     if (state.cursor_shown) {
@@ -2188,10 +2483,41 @@ void ApplyCursorStateOnWindowThread(const bool menu_open) noexcept {
         state.cursor_show_adjustments = 0;
         state.cursor_shown = false;
     }
+    auto clip_restored = true;
     if (state.previous_clip_valid) {
         if (ClipCursor(&state.previous_clip) != FALSE)
             state.previous_clip_valid = false;
+        else
+            clip_restored = false;
     }
+    // Let SDL rebuild any relative-mode bookkeeping first, then restore the
+    // exact process registration that was observed before the editor opened.
+    // RegisterRawInputDevices replaces the same usage, so the final flags and
+    // target window match Deadlock's original registration.
+    const auto sdl_restored = RestoreSdlRelativeMouseMode(state.output_window);
+    const auto raw_restored = RestoreRawMouseRegistrationsOnWindowThread();
+    // Re-enable the engine input system last so no restored mouse transport can
+    // deliver an editor-owned press while teardown is still in progress.
+    const auto input_restored = RestoreInputSystemOnWindowThread();
+    return clip_restored && sdl_restored && raw_restored && input_restored &&
+           !PointerStateRestorePending();
+}
+
+[[nodiscard]] bool SetModalInputMaintenanceOnWindowThread(
+    const HWND window,
+    const bool enabled) noexcept {
+    if (window == nullptr || !IsWindow(window) ||
+        GetWindowThreadProcessId(window, nullptr) != GetCurrentThreadId())
+        return false;
+    if (!enabled) {
+        static_cast<void>(KillTimer(window, kSmvmModalInputTimerId));
+        return true;
+    }
+    return SetTimer(
+        window,
+        kSmvmModalInputTimerId,
+        kSmvmModalInputTimerIntervalMs,
+        nullptr) != 0;
 }
 
 [[nodiscard]] bool WaitForCallbacksToDrain(
@@ -2487,15 +2813,27 @@ void SetMenuOpen(const bool open) noexcept {
     // menu can be toggled by Present or IPC-driven rendering, so marshal the
     // transition to the output window rather than touching it here.
     const auto window = state.output_window;
+    auto transition_ok = !open;
     if (window != nullptr && IsWindow(window)) {
         const auto window_thread = GetWindowThreadProcessId(window, nullptr);
-        if (window_thread == GetCurrentThreadId())
-            ApplyCursorStateOnWindowThread(open);
-        else
-            static_cast<void>(PostMessageW(
-                window, kSmvmCursorTransitionMessage, open ? TRUE : FALSE, 0));
+        if (window_thread == GetCurrentThreadId()) {
+            transition_ok = ApplyCursorStateOnWindowThread(open);
+            if (transition_ok)
+                transition_ok = SetModalInputMaintenanceOnWindowThread(window, open);
+        } else {
+            transition_ok = PostMessageW(
+                window, kSmvmCursorTransitionMessage, open ? TRUE : FALSE, 0) != FALSE;
+        }
     }
-    PublishStatus(SmvmRendererBackend::d3d11, SmvmRendererError::none);
+    if (!transition_ok && open) {
+        // A modal menu without exclusive pointer ownership is worse than no
+        // menu: fail closed and leave Deadlock's input registrations restored.
+        state.menu_open.store(false, std::memory_order_release);
+        ResetSmvmManualInput();
+    }
+    PublishStatus(
+        SmvmRendererBackend::d3d11,
+        transition_ok ? SmvmRendererError::none : SmvmRendererError::window_hook_failed);
 }
 
 [[nodiscard]] std::uint32_t CurrentModifiers(const std::uint32_t key = 0) noexcept {
@@ -2724,14 +3062,13 @@ void ClearPreMenuKeyRoute(const std::uint32_t key, const std::uint8_t route) noe
     return -1;
 }
 
-void TrackConsumedMouseDown(
+[[nodiscard]] bool TrackConsumedMouseDown(
     const UINT message,
     const WPARAM wparam,
     const std::uint8_t route) noexcept {
     const auto index = WindowMouseButtonIndex(message, wparam);
-    if (index >= 0)
-        g_overlay.menu_mouse_routes[static_cast<std::size_t>(index)].fetch_or(
-            route, std::memory_order_acq_rel);
+    return index >= 0 &&
+        g_overlay.menu_mouse_routes[static_cast<std::size_t>(index)].Claim(route);
 }
 
 [[nodiscard]] bool ConsumeTrackedMouseUp(
@@ -2741,14 +3078,14 @@ void TrackConsumedMouseDown(
     const auto index = WindowMouseButtonIndex(message, wparam);
     if (index < 0)
         return false;
-    const auto previous = g_overlay.menu_mouse_routes[static_cast<std::size_t>(index)].fetch_and(
-        static_cast<std::uint8_t>(~route), std::memory_order_acq_rel);
-    return (previous & route) != 0;
+    return g_overlay.menu_mouse_routes[static_cast<std::size_t>(index)].Release(route);
 }
 
-void TrackConsumedMouseIndex(const std::size_t index, const std::uint8_t route) noexcept {
-    if (index < g_overlay.menu_mouse_routes.size())
-        g_overlay.menu_mouse_routes[index].fetch_or(route, std::memory_order_acq_rel);
+[[nodiscard]] bool TrackConsumedMouseIndex(
+    const std::size_t index,
+    const std::uint8_t route) noexcept {
+    return index < g_overlay.menu_mouse_routes.size() &&
+        g_overlay.menu_mouse_routes[index].Claim(route);
 }
 
 [[nodiscard]] bool ConsumeTrackedMouseIndex(
@@ -2756,9 +3093,13 @@ void TrackConsumedMouseIndex(const std::size_t index, const std::uint8_t route) 
     const std::uint8_t route) noexcept {
     if (index >= g_overlay.menu_mouse_routes.size())
         return false;
-    const auto previous = g_overlay.menu_mouse_routes[index].fetch_and(
-        static_cast<std::uint8_t>(~route), std::memory_order_acq_rel);
-    return (previous & route) != 0;
+    return g_overlay.menu_mouse_routes[index].Release(route);
+}
+
+[[nodiscard]] bool HasTrackedMouseDown(const UINT message, const WPARAM wparam) noexcept {
+    const auto index = WindowMouseButtonIndex(message, wparam);
+    return index >= 0 &&
+        g_overlay.menu_mouse_routes[static_cast<std::size_t>(index)].HasAny();
 }
 
 [[nodiscard]] bool EditorBindingOwnsMouseCode(
@@ -2780,7 +3121,7 @@ void ResetConsumedReleaseRoutes() noexcept {
     for (auto& routes : g_overlay.menu_key_routes)
         routes.store(0, std::memory_order_release);
     for (auto& routes : g_overlay.menu_mouse_routes)
-        routes.store(0, std::memory_order_release);
+        routes.Reset();
     for (auto& routes : g_overlay.menu_preheld_keys)
         routes.store(0, std::memory_order_release);
 }
@@ -2806,7 +3147,21 @@ void ResetConsumedReleaseRoutes() noexcept {
     return true;
 }
 
+[[nodiscard]] bool HandleSmvmMouseBinding(
+    UINT message,
+    WPARAM wparam,
+    const SmvmSnapshotPayload& snapshot) noexcept;
+
+void RefreshMenuCursorPosition(const HWND window) noexcept {
+    POINT cursor{};
+    if (window == nullptr || !GetCursorPos(&cursor) || !ScreenToClient(window, &cursor))
+        return;
+    g_overlay.mouse_x.store(cursor.x, std::memory_order_relaxed);
+    g_overlay.mouse_y.store(cursor.y, std::memory_order_relaxed);
+}
+
 [[nodiscard]] bool HandleRawInput(
+    const HWND window,
     const LPARAM lparam,
     const SmvmSnapshotPayload& snapshot,
     const bool has_snapshot,
@@ -2820,6 +3175,12 @@ void ResetConsumedReleaseRoutes() noexcept {
     const auto manual = has_snapshot && !menu_open && CanUseManualCamera(snapshot);
     const auto takeover = manual && (snapshot.flags & smvm_snapshot_input_takeover) != 0;
     if (input->header.dwType == RIM_TYPEMOUSE) {
+        // Free Cam registers raw mouse input without the corresponding legacy
+        // WM_MOUSEMOVE stream. Sample the real client cursor for menu hit tests;
+        // otherwise a raw click is evaluated at the last pre-Free-Cam position
+        // and can activate the wrong control (or fall through to Deadlock).
+        if (menu_open)
+            RefreshMenuCursorPosition(window);
         const auto button_flags = input->data.mouse.usButtonFlags;
         constexpr std::array<USHORT, 5> down_flags{
             RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_RIGHT_BUTTON_DOWN,
@@ -2837,14 +3198,40 @@ void ResetConsumedReleaseRoutes() noexcept {
         for (std::size_t index = 0; index < down_flags.size(); ++index) {
             if ((button_flags & down_flags[index]) != 0) {
                 if (menu_open) {
-                    TrackConsumedMouseIndex(index, kMenuRawKeyRoute);
-                    owns_editor_button = true;
-                } else if (takeover && input_codes[index] != SmvmInputCode::none &&
-                           EditorBindingOwnsMouseCode(snapshot, input_codes[index])) {
-                    TrackConsumedMouseIndex(index, kMenuRawKeyRoute);
+                    const auto first_delivery = TrackConsumedMouseIndex(index, kMenuRawKeyRoute);
+                    if (first_delivery && index == 0)
+                        g_overlay.mouse_buttons.fetch_or(1u, std::memory_order_release);
+                    if (first_delivery && index == 1)
+                        g_overlay.mouse_buttons.fetch_or(2u, std::memory_order_release);
+                    if (first_delivery && has_snapshot && input_codes[index] != SmvmInputCode::none) {
+                        const auto message = input_codes[index] == SmvmInputCode::mouse_middle
+                            ? WM_MBUTTONDOWN
+                            : WM_XBUTTONDOWN;
+                        const auto wparam = input_codes[index] == SmvmInputCode::mouse_x2
+                            ? MAKEWPARAM(0, XBUTTON2)
+                            : MAKEWPARAM(0, XBUTTON1);
+                        static_cast<void>(CaptureMouseBinding(message, wparam));
+                    }
                     owns_editor_button = true;
                 } else {
-                    contains_unowned_button = true;
+                    auto handled = false;
+                    if (has_snapshot && input_codes[index] != SmvmInputCode::none &&
+                        !g_overlay.menu_mouse_routes[index].HasAny()) {
+                        const auto message = input_codes[index] == SmvmInputCode::mouse_middle
+                            ? WM_MBUTTONDOWN
+                            : WM_XBUTTONDOWN;
+                        const auto wparam = input_codes[index] == SmvmInputCode::mouse_x2
+                            ? MAKEWPARAM(0, XBUTTON2)
+                            : MAKEWPARAM(0, XBUTTON1);
+                        handled = HandleSmvmMouseBinding(message, wparam, snapshot);
+                    }
+                    if (handled || (takeover && input_codes[index] != SmvmInputCode::none &&
+                                    EditorBindingOwnsMouseCode(snapshot, input_codes[index]))) {
+                        static_cast<void>(TrackConsumedMouseIndex(index, kMenuRawKeyRoute));
+                        owns_editor_button = true;
+                    } else {
+                        contains_unowned_button = true;
+                    }
                 }
             }
             if ((button_flags & up_flags[index]) != 0) {
@@ -2854,8 +3241,18 @@ void ResetConsumedReleaseRoutes() noexcept {
                 contains_unowned_button = contains_unowned_button || !tracked;
             }
         }
-        if (menu_open)
+        const auto wheel_delta = (button_flags & RI_MOUSE_WHEEL) != 0
+            ? static_cast<SHORT>(input->data.mouse.usButtonData)
+            : 0;
+        if (menu_open) {
+            if (wheel_delta != 0) {
+                g_overlay.raw_wheel_consumed_ms.store(GetTickCount64(), std::memory_order_release);
+                const auto wheel_wparam = MAKEWPARAM(0, static_cast<WORD>(wheel_delta));
+                if (!has_snapshot || !CaptureMouseBinding(WM_MOUSEWHEEL, wheel_wparam))
+                    g_overlay.wheel_delta.fetch_add(wheel_delta, std::memory_order_release);
+            }
             return !contains_untracked_release;
+        }
 
         auto owns_packet = false;
         if (manual && (input->data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) == 0) {
@@ -2867,9 +3264,11 @@ void ResetConsumedReleaseRoutes() noexcept {
                 owns_packet = true;
             }
         }
-        const auto wheel_delta = (button_flags & RI_MOUSE_WHEEL) != 0
-            ? static_cast<SHORT>(input->data.mouse.usButtonData)
-            : 0;
+        if (manual && wheel_delta != 0) {
+            g_overlay.raw_wheel_consumed_ms.store(GetTickCount64(), std::memory_order_release);
+            g_overlay.manual_wheel_delta.fetch_add(wheel_delta, std::memory_order_release);
+            owns_packet = true;
+        }
         const auto editor_owns_wheel = takeover && wheel_delta != 0 && EditorBindingOwnsMouseCode(
             snapshot, wheel_delta > 0 ? SmvmInputCode::wheel_up : SmvmInputCode::wheel_down);
         const auto contains_owned_wheel = manual && (button_flags & RI_MOUSE_WHEEL) != 0;
@@ -3055,13 +3454,104 @@ LRESULT CALLBACK SmvmWindowProcedure(
         return DefWindowProcW(window, message, wparam, lparam);
 
     if (message == kSmvmCursorTransitionMessage) {
-        ApplyCursorStateOnWindowThread(
-            !state.stop_requested.load(std::memory_order_acquire) && wparam != FALSE);
+        const auto should_open =
+            !state.stop_requested.load(std::memory_order_acquire) && wparam != FALSE;
+        auto transition_ok = ApplyCursorStateOnWindowThread(should_open);
+        if (transition_ok)
+            transition_ok = SetModalInputMaintenanceOnWindowThread(window, should_open);
+        if (!transition_ok && should_open) {
+            state.menu_open.store(false, std::memory_order_release);
+            ResetSmvmManualInput();
+            static_cast<void>(SetModalInputMaintenanceOnWindowThread(window, false));
+            static_cast<void>(ApplyCursorStateOnWindowThread(false));
+        }
+        PublishStatus(
+            SmvmRendererBackend::d3d11,
+            transition_ok ? SmvmRendererError::none : SmvmRendererError::window_hook_failed);
+        return transition_ok ? TRUE : FALSE;
+    }
+    if (message == WM_TIMER && wparam == kSmvmModalInputTimerId) {
+        if (!state.menu_open.load(std::memory_order_acquire)) {
+            static_cast<void>(SetModalInputMaintenanceOnWindowThread(window, false));
+            return 0;
+        }
+
+        // Spectator-mode transitions can re-enable SDL relative mode, Raw
+        // Input, and IInputSystem while the modal editor remains open. Keep
+        // the already-snapshotted state withdrawn before the next physical
+        // event instead of racing that event from the external low-level hook.
+        if (!ApplyCursorStateOnWindowThread(true)) {
+            state.menu_open.store(false, std::memory_order_release);
+            ResetSmvmManualInput();
+            static_cast<void>(SetModalInputMaintenanceOnWindowThread(window, false));
+            static_cast<void>(ApplyCursorStateOnWindowThread(false));
+            PublishStatus(SmvmRendererBackend::d3d11, SmvmRendererError::window_hook_failed);
+        }
+        return 0;
+    }
+    if (message == kSmvmPointerActionMessage) {
+        if (state.stop_requested.load(std::memory_order_acquire) ||
+            !state.menu_open.load(std::memory_order_acquire))
+            return FALSE;
+
+        POINT client_point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+        RECT client_rect{};
+        if (!ScreenToClient(window, &client_point) || !GetClientRect(window, &client_rect) ||
+            client_point.x < client_rect.left || client_point.x >= client_rect.right ||
+            client_point.y < client_rect.top || client_point.y >= client_rect.bottom)
+            return FALSE;
+
+        state.mouse_x.store(client_point.x, std::memory_order_relaxed);
+        state.mouse_y.store(client_point.y, std::memory_order_relaxed);
+        const auto action = static_cast<SmvmPointerAction>(LOWORD(wparam));
+        if (action == SmvmPointerAction::validate)
+            return TRUE;
+
+        SmvmSnapshotPayload pointer_snapshot{};
+        const auto has_pointer_snapshot = ReadSnapshot(pointer_snapshot) &&
+            (pointer_snapshot.flags & smvm_snapshot_internal_enabled) != 0;
+        if (action == SmvmPointerAction::left_click) {
+            state.mouse_buttons.fetch_or(1u, std::memory_order_release);
+            return TRUE;
+        }
+        if (action == SmvmPointerAction::right_click) {
+            state.mouse_buttons.fetch_or(2u, std::memory_order_release);
+            return TRUE;
+        }
+
+        UINT synthetic_message = 0;
+        WPARAM synthetic_wparam = 0;
+        if (action == SmvmPointerAction::middle_click) {
+            synthetic_message = WM_MBUTTONDOWN;
+        } else if (action == SmvmPointerAction::x1_click) {
+            synthetic_message = WM_XBUTTONDOWN;
+            synthetic_wparam = MAKEWPARAM(0, XBUTTON1);
+        } else if (action == SmvmPointerAction::x2_click) {
+            synthetic_message = WM_XBUTTONDOWN;
+            synthetic_wparam = MAKEWPARAM(0, XBUTTON2);
+        } else if (action == SmvmPointerAction::wheel) {
+            const auto delta = static_cast<SHORT>(HIWORD(wparam));
+            if (delta == 0)
+                return FALSE;
+            synthetic_message = WM_MOUSEWHEEL;
+            synthetic_wparam = MAKEWPARAM(0, static_cast<WORD>(delta));
+        } else {
+            return FALSE;
+        }
+
+        if (has_pointer_snapshot && CaptureMouseBinding(synthetic_message, synthetic_wparam))
+            return TRUE;
+        if (has_pointer_snapshot &&
+            HandleSmvmMouseBinding(synthetic_message, synthetic_wparam, pointer_snapshot))
+            return TRUE;
+        if (action == SmvmPointerAction::wheel) {
+            state.wheel_delta.fetch_add(
+                static_cast<SHORT>(HIWORD(wparam)), std::memory_order_release);
+        }
         return TRUE;
     }
     if (message == kSmvmRestoreWindowProcedureMessage) {
-        ApplyCursorStateOnWindowThread(false);
-        if (state.previous_clip_valid)
+        if (!ApplyCursorStateOnWindowThread(false) || PointerStateRestorePending())
             return FALSE;
         if (window != state.output_window)
             return FALSE;
@@ -3085,10 +3575,16 @@ LRESULT CALLBACK SmvmWindowProcedure(
 
     if (message == WM_NCDESTROY) {
         state.menu_open.store(false, std::memory_order_release);
-        ApplyCursorStateOnWindowThread(false);
+        static_cast<void>(SetModalInputMaintenanceOnWindowThread(window, false));
+        static_cast<void>(ApplyCursorStateOnWindowThread(false));
     }
     if (state.stop_requested.load(std::memory_order_acquire))
         return CallWindowProcW(original, window, message, wparam, lparam);
+    if (!state.menu_open.load(std::memory_order_acquire) && PointerStateRestorePending()) {
+        const auto restored = ApplyCursorStateOnWindowThread(false);
+        if (!restored)
+            PublishStatus(SmvmRendererBackend::d3d11, SmvmRendererError::window_hook_failed);
+    }
 
     if (message == WM_KILLFOCUS ||
         (message == WM_ACTIVATE && LOWORD(wparam) == WA_INACTIVE) ||
@@ -3124,7 +3620,7 @@ LRESULT CALLBACK SmvmWindowProcedure(
         (GetKeyState(VK_MENU) & 0x8000) != 0)
         return CallWindowProcW(original, window, message, wparam, lparam);
 
-    if (message == WM_INPUT && HandleRawInput(lparam, snapshot, has_snapshot, menu_open)) {
+    if (message == WM_INPUT && HandleRawInput(window, lparam, snapshot, has_snapshot, menu_open)) {
         // Consumed foreground raw input must still reach DefWindowProc so
         // Windows can release its per-message raw-input resources. Do not call
         // Deadlock's predecessor: takeover intentionally owns this packet.
@@ -3149,8 +3645,11 @@ LRESULT CALLBACK SmvmWindowProcedure(
         message == WM_MBUTTONUP || message == WM_XBUTTONUP;
     if (window_key_down && MenuMayClaimKeyDown(menu_open, preheld_window_key_down))
         TrackConsumedKeyDown(static_cast<std::uint32_t>(wparam), kMenuWindowKeyRoute);
-    if (window_mouse_down && menu_open)
+    const auto mouse_down_already_tracked = window_mouse_down && HasTrackedMouseDown(message, wparam);
+    const auto first_window_mouse_down = window_mouse_down && menu_open &&
         TrackConsumedMouseDown(message, wparam, kMenuWindowKeyRoute);
+    const auto legacy_wheel_duplicate = message == WM_MOUSEWHEEL &&
+        GetTickCount64() - state.raw_wheel_consumed_ms.load(std::memory_order_acquire) <= 8;
     if (preheld_window_key_down)
         return CallWindowProcW(original, window, message, wparam, lparam);
 
@@ -3160,26 +3659,35 @@ LRESULT CALLBACK SmvmWindowProcedure(
         if (menu_open)
             return 0;
     }
+    if ((window_mouse_down || window_mouse_up) && menu_open) {
+        state.mouse_x.store(GET_X_LPARAM(lparam), std::memory_order_relaxed);
+        state.mouse_y.store(GET_Y_LPARAM(lparam), std::memory_order_relaxed);
+    }
 
     if (has_snapshot && menu_open &&
         (message == WM_MBUTTONDOWN || message == WM_XBUTTONDOWN || message == WM_MOUSEWHEEL) &&
+        !legacy_wheel_duplicate && (!window_mouse_down || first_window_mouse_down) &&
         CaptureMouseBinding(message, wparam))
         return message == WM_XBUTTONDOWN ? TRUE : 0;
 
     if (has_snapshot &&
         (message == WM_MBUTTONDOWN || message == WM_XBUTTONDOWN || message == WM_MOUSEWHEEL) &&
+        !legacy_wheel_duplicate &&
+        (!window_mouse_down || (menu_open ? first_window_mouse_down : !mouse_down_already_tracked)) &&
         HandleSmvmMouseBinding(message, wparam, snapshot)) {
         if (window_mouse_down)
-            TrackConsumedMouseDown(message, wparam, kMenuWindowKeyRoute);
+            static_cast<void>(TrackConsumedMouseDown(message, wparam, kMenuWindowKeyRoute));
         return message == WM_XBUTTONDOWN ? TRUE : 0;
     }
 
     if (message == WM_LBUTTONDOWN && menu_open) {
-        state.mouse_buttons.fetch_or(1u, std::memory_order_release);
+        if (first_window_mouse_down)
+            state.mouse_buttons.fetch_or(1u, std::memory_order_release);
         return 0;
     }
     if (message == WM_RBUTTONDOWN && menu_open) {
-        state.mouse_buttons.fetch_or(2u, std::memory_order_release);
+        if (first_window_mouse_down)
+            state.mouse_buttons.fetch_or(2u, std::memory_order_release);
         return 0;
     }
     if ((message == WM_MBUTTONDOWN || message == WM_XBUTTONDOWN) && menu_open)
@@ -3188,6 +3696,8 @@ LRESULT CALLBACK SmvmWindowProcedure(
         return 0;
 
     if (message == WM_MOUSEWHEEL && has_snapshot) {
+        if (legacy_wheel_duplicate && (menu_open || CanUseManualCamera(snapshot)))
+            return 0;
         const auto delta = GET_WHEEL_DELTA_WPARAM(wparam);
         if (menu_open) {
             state.wheel_delta.fetch_add(delta, std::memory_order_release);
@@ -3350,12 +3860,11 @@ LRESULT CALLBACK SmvmWindowProcedure(
     if (!IsWindow(window)) {
         // Destruction makes the procedure unreachable. Cursor state is restored
         // from WM_NCDESTROY; if that callback was bypassed, residency is safer.
-        return !state.cursor_shown && !state.previous_clip_valid;
+        return !state.cursor_shown && !PointerStateRestorePending();
     }
 
     if (GetWindowThreadProcessId(window, nullptr) == GetCurrentThreadId()) {
-        ApplyCursorStateOnWindowThread(false);
-        if (state.previous_clip_valid)
+        if (!ApplyCursorStateOnWindowThread(false) || PointerStateRestorePending())
             return false;
         const auto current = reinterpret_cast<WNDPROC>(GetWindowLongPtrW(window, GWLP_WNDPROC));
         if (current == original)
@@ -3385,8 +3894,23 @@ LRESULT CALLBACK SmvmWindowProcedure(
     auto& state = g_overlay;
     if (window == nullptr || !IsWindow(window))
         return false;
-    if (state.output_window == window && state.original_window_proc != nullptr)
-        return true;
+    if (state.output_window == window && state.original_window_proc != nullptr) {
+        const auto current = reinterpret_cast<WNDPROC>(GetWindowLongPtrW(window, GWLP_WNDPROC));
+        if (current == &SmvmWindowProcedure)
+            return true;
+        // Deadlock can restore its own predecessor when spectator input modes
+        // change. Re-publish only when the exact predecessor we recorded is
+        // current; an unknown later subclass is not safe to bypass or wrap.
+        if (current != state.original_window_proc)
+            return false;
+        SetLastError(ERROR_SUCCESS);
+        const auto previous = SetWindowLongPtrW(
+            window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&SmvmWindowProcedure));
+        return !(previous == 0 && GetLastError() != ERROR_SUCCESS) &&
+               reinterpret_cast<WNDPROC>(previous) == state.original_window_proc &&
+               reinterpret_cast<WNDPROC>(GetWindowLongPtrW(window, GWLP_WNDPROC)) ==
+                   &SmvmWindowProcedure;
+    }
     if (!RestorePublishedWindowProcedure() ||
         !WaitForCallbacksToDrain(state.active_window_procedures))
         return false;
@@ -3575,242 +4099,542 @@ HRESULT STDMETHODCALLTYPE ResizeBuffersHook(
     UINT height,
     DXGI_FORMAT format,
     UINT flags) noexcept;
+HRESULT STDMETHODCALLTYPE FactoryCreateSwapchainHook(
+    IDXGIFactory* factory,
+    IUnknown* device,
+    DXGI_SWAP_CHAIN_DESC* description,
+    IDXGISwapChain** swapchain) noexcept;
 
-[[nodiscard]] bool IsExecutableFunction(const void* function, const HMODULE expected_module) noexcept {
-    if (function == nullptr || expected_module == nullptr)
+[[nodiscard]] bool IsReadableRange(const void* address, const std::size_t size) noexcept {
+    if (address == nullptr || size == 0)
+        return false;
+    MEMORY_BASIC_INFORMATION memory{};
+    if (VirtualQuery(address, &memory, sizeof(memory)) != sizeof(memory) ||
+        memory.State != MEM_COMMIT || (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0)
+        return false;
+    const auto start = reinterpret_cast<std::uintptr_t>(address);
+    const auto region = reinterpret_cast<std::uintptr_t>(memory.BaseAddress);
+    return start >= region && start - region <= memory.RegionSize &&
+           size <= memory.RegionSize - (start - region);
+}
+
+[[nodiscard]] bool IsExecutableFunction(const void* function) noexcept {
+    if (function == nullptr)
         return false;
     MEMORY_BASIC_INFORMATION memory{};
     if (VirtualQuery(function, &memory, sizeof(memory)) != sizeof(memory) ||
-        memory.State != MEM_COMMIT || memory.AllocationBase != expected_module)
+        memory.State != MEM_COMMIT || (memory.Protect & PAGE_GUARD) != 0)
         return false;
     const auto protection = memory.Protect & 0xFF;
     return protection == PAGE_EXECUTE || protection == PAGE_EXECUTE_READ ||
            protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
 }
 
-struct HookPatchResult final {
-    bool replacement_published{};
-    bool complete{};
+struct ModuleTextView final {
+    std::uint8_t* base{};
+    std::size_t size{};
+    std::uint8_t* text{};
+    std::size_t text_size{};
+
+    [[nodiscard]] bool Contains(
+        const std::uintptr_t address,
+        const std::size_t length = 1) const noexcept {
+        if (base == nullptr || length > size)
+            return false;
+        const auto start = reinterpret_cast<std::uintptr_t>(base);
+        return address >= start && address - start <= size - length;
+    }
 };
 
-[[nodiscard]] HookPatchResult PatchHookSlot(
-    void** slot,
-    void* expected,
-    void* replacement) noexcept {
-    if (slot == nullptr || expected == nullptr || replacement == nullptr)
-        return {};
-    DWORD old_protection = 0;
-    if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old_protection))
-        return {};
-    const auto prior = InterlockedCompareExchangePointer(slot, replacement, expected);
-    DWORD ignored = 0;
-    const auto protected_again = VirtualProtect(slot, sizeof(void*), old_protection, &ignored) != FALSE;
-    FlushProcessWriteBuffers();
-    const auto published = prior == expected;
-    return HookPatchResult{published, published && protected_again};
-}
-
-[[nodiscard]] bool RestoreHookSlot(void** slot, void* original, void* replacement) noexcept {
-    if (slot == nullptr || original == nullptr || replacement == nullptr)
+[[nodiscard]] bool InspectModuleText(const HMODULE module, ModuleTextView& view) noexcept {
+    view = {};
+    if (module == nullptr)
         return false;
-    DWORD old_protection = 0;
-    if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old_protection))
+    auto* base = reinterpret_cast<std::uint8_t*>(module);
+    __try {
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0)
+            return false;
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE ||
+            nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+            return false;
+        view.base = base;
+        view.size = nt->OptionalHeader.SizeOfImage;
+        const auto* sections = IMAGE_FIRST_SECTION(nt);
+        for (std::uint16_t index = 0; index < nt->FileHeader.NumberOfSections; ++index) {
+            const auto& section = sections[index];
+            if (std::memcmp(section.Name, ".text", 5) != 0)
+                continue;
+            view.text = base + section.VirtualAddress;
+            view.text_size = std::max<std::size_t>(
+                section.Misc.VirtualSize, section.SizeOfRawData);
+            break;
+        }
+        return view.text != nullptr &&
+               view.Contains(reinterpret_cast<std::uintptr_t>(view.text), view.text_size);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        view = {};
         return false;
-    const auto prior = InterlockedCompareExchangePointer(slot, original, replacement);
-    DWORD ignored = 0;
-    const auto protected_again = VirtualProtect(slot, sizeof(void*), old_protection, &ignored) != FALSE;
-    FlushProcessWriteBuffers();
-    return (prior == replacement || prior == original) && protected_again;
+    }
 }
 
-LRESULT CALLBACK ProbeWindowProcedure(
-    const HWND window,
-    const UINT message,
-    const WPARAM wparam,
-    const LPARAM lparam) noexcept {
-    return DefWindowProcW(window, message, wparam, lparam);
+[[nodiscard]] std::optional<std::uintptr_t> ResolveRenderFactoryGlobal(
+    const HMODULE render_module) noexcept {
+    ModuleTextView view{};
+    if (!InspectModuleText(render_module, view))
+        return std::nullopt;
+    const auto pattern = ParsePattern(kRenderFactoryPattern);
+    if (!pattern)
+        return std::nullopt;
+    const auto hits = FindPattern(view.text, view.text_size, *pattern, 2);
+    if (hits.size() != 1)
+        return std::nullopt;
+    constexpr std::size_t kFactoryGlobalInstructionOffset = 10;
+    const auto instruction = reinterpret_cast<std::uintptr_t>(
+        view.text + hits.front() + kFactoryGlobalInstructionOffset);
+    const auto target = ResolveRipRelative(instruction, 3, 7);
+    if (!target || !view.Contains(*target, sizeof(void*)))
+        return std::nullopt;
+    return target;
 }
 
-[[nodiscard]] HWND CreateProbeWindow(HMODULE module, ATOM& registered_class) noexcept {
-    constexpr auto class_name = L"DeadlockMVM.Smvm.D3D11Probe";
-    WNDCLASSEXW window_class{};
-    window_class.cbSize = sizeof(window_class);
-    window_class.style = CS_OWNDC;
-    window_class.lpfnWndProc = ProbeWindowProcedure;
-    window_class.hInstance = module;
-    window_class.lpszClassName = class_name;
-    registered_class = RegisterClassExW(&window_class);
-    if (registered_class == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+[[nodiscard]] IDXGIFactory* ReadRenderFactory(const std::uintptr_t renderer_global) noexcept {
+    if (renderer_global == 0)
         return nullptr;
-    return CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-        class_name,
-        L"",
-        WS_POPUP,
-        -32000,
-        -32000,
-        1,
-        1,
-        nullptr,
-        nullptr,
-        module,
-        nullptr);
+    __try {
+        auto* renderer = *reinterpret_cast<std::uint8_t**>(renderer_global);
+        if (renderer == nullptr ||
+            !IsReadableRange(renderer + kRenderFactoryOffset, sizeof(void*)))
+            return nullptr;
+        return *reinterpret_cast<IDXGIFactory**>(renderer + kRenderFactoryOffset);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
 }
 
-[[nodiscard]] bool InstallSwapchainHooks() noexcept {
+[[nodiscard]] void** ReadObjectVtable(void* object, const std::size_t entry_count) noexcept {
+    if (object == nullptr || !IsReadableRange(object, sizeof(void*)))
+        return nullptr;
+    __try {
+        auto** vtable = *reinterpret_cast<void***>(object);
+        return IsReadableRange(vtable, entry_count * sizeof(void*)) ? vtable : nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+[[nodiscard]] bool ResolveInputSystemGate() noexcept {
     auto& state = g_overlay;
-    ATOM window_class = 0;
-    const auto window = CreateProbeWindow(state.self, window_class);
-    if (window == nullptr)
+    if (state.input_system != nullptr && state.input_system_enable != nullptr &&
+        state.input_enabled_state_offset != 0)
+        return true;
+
+    const auto module = GetModuleHandleW(L"inputsystem.dll");
+    ModuleTextView view{};
+    if (module == nullptr || !InspectModuleText(module, view))
+        return false;
+    const auto create_interface = reinterpret_cast<CreateInterfaceFunction>(
+        GetProcAddress(module, "CreateInterface"));
+    if (create_interface == nullptr ||
+        !view.Contains(reinterpret_cast<std::uintptr_t>(create_interface)))
         return false;
 
-    DXGI_SWAP_CHAIN_DESC description{};
-    description.BufferDesc.Width = 1;
-    description.BufferDesc.Height = 1;
-    description.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    description.SampleDesc.Count = 1;
-    description.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    description.BufferCount = 2;
-    description.OutputWindow = window;
-    description.Windowed = TRUE;
-    description.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+    int result = -1;
+    void* input_system = nullptr;
+    __try {
+        input_system = create_interface(kInputSystemInterfaceName, &result);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    if (input_system == nullptr || result != 0 ||
+        !view.Contains(reinterpret_cast<std::uintptr_t>(input_system), sizeof(void*)))
+        return false;
 
-    IDXGISwapChain* swapchain = nullptr;
-    ID3D11Device* device = nullptr;
-    ID3D11DeviceContext* context = nullptr;
-    const auto result = D3D11CreateDeviceAndSwapChain(
-        nullptr,
-        D3D_DRIVER_TYPE_HARDWARE,
-        nullptr,
-        0,
-        nullptr,
-        0,
-        D3D11_SDK_VERSION,
-        &description,
-        &swapchain,
-        &device,
-        nullptr,
-        &context);
-    if (FAILED(result) || swapchain == nullptr) {
-        SafeRelease(context);
-        SafeRelease(device);
-        SafeRelease(swapchain);
-        DestroyWindow(window);
-        if (window_class != 0)
-            UnregisterClassW(L"DeadlockMVM.Smvm.D3D11Probe", state.self);
+    auto** vtable = ReadObjectVtable(input_system, kInputSystemRequiredVtableEntries);
+    if (vtable == nullptr ||
+        !view.Contains(reinterpret_cast<std::uintptr_t>(vtable),
+                       kInputSystemRequiredVtableEntries * sizeof(void*)))
+        return false;
+    auto* enable_function = vtable[kInputSystemEnableVtableIndex];
+    constexpr std::size_t kEnableInputInstructionSize = 4;
+    if (!view.Contains(reinterpret_cast<std::uintptr_t>(enable_function),
+                       kEnableInputInstructionSize) ||
+        !IsExecutableFunction(enable_function))
+        return false;
+
+    std::uint8_t state_offset = 0;
+    if (!TryDecodeInputEnabledStateOffset(
+            static_cast<const std::uint8_t*>(enable_function),
+            kEnableInputInstructionSize,
+            state_offset) ||
+        !IsReadableRange(static_cast<std::uint8_t*>(input_system) + state_offset, 1))
+        return false;
+    __try {
+        if (*(static_cast<std::uint8_t*>(input_system) + state_offset) > 1)
+            return false;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
 
-    auto** vtable = *reinterpret_cast<void***>(swapchain);
-    auto* present_slot = &vtable[kPresentVtableIndex];
-    auto* resize_slot = &vtable[kResizeBuffersVtableIndex];
-    const auto original_present = reinterpret_cast<PresentFunction>(*present_slot);
-    const auto original_resize = reinterpret_cast<ResizeBuffersFunction>(*resize_slot);
-    const auto dxgi_module = GetModuleHandleW(L"dxgi.dll");
-    auto installed = IsExecutableFunction(reinterpret_cast<void*>(original_present), dxgi_module) &&
-                     IsExecutableFunction(reinterpret_cast<void*>(original_resize), dxgi_module);
-    if (installed) {
-        // Publish every value a callback needs before either shared vtable slot
-        // can point at SMVM. Those fields are not cleared until restoration and
-        // callback drain have both been proven.
-        state.present_slot = present_slot;
-        state.resize_slot = resize_slot;
-        state.original_present = original_present;
-        state.original_resize = original_resize;
-        const auto present_patch = PatchHookSlot(
-            present_slot,
-            reinterpret_cast<void*>(original_present),
-            reinterpret_cast<void*>(&PresentHook));
-        state.present_hook_reachable.store(
-            present_patch.replacement_published, std::memory_order_release);
-        installed = present_patch.complete;
-        if (!installed && present_patch.replacement_published) {
-            const auto restored = RestoreHookSlot(
-                present_slot,
-                reinterpret_cast<void*>(original_present),
-                reinterpret_cast<void*>(&PresentHook));
-            if (restored)
-                state.present_hook_reachable.store(false, std::memory_order_release);
+    state.input_system = input_system;
+    state.input_system_enable = reinterpret_cast<InputSystemEnableFunction>(enable_function);
+    state.input_enabled_state_offset = state_offset;
+    return true;
+}
+
+[[nodiscard]] bool SuspendInputSystemOnWindowThread() noexcept {
+    auto& state = g_overlay;
+    if (!ResolveInputSystemGate() || state.input_system == nullptr ||
+        state.input_system_enable == nullptr || state.input_enabled_state_offset == 0)
+        return false;
+    auto* enabled = static_cast<std::uint8_t*>(state.input_system) +
+        state.input_enabled_state_offset;
+    if (!IsReadableRange(enabled, 1) || !IsExecutableFunction(
+            reinterpret_cast<void*>(state.input_system_enable)))
+        return false;
+
+    __try {
+        if (!state.input_restore_pending.load(std::memory_order_acquire)) {
+            if (*enabled > 1)
+                return false;
+            state.input_was_enabled = *enabled != 0;
+            state.input_restore_pending.store(true, std::memory_order_release);
         }
+        state.input_system_enable(state.input_system, false);
+        return *enabled == 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
     }
-    if (installed) {
-        const auto resize_patch = PatchHookSlot(
-            resize_slot,
-            reinterpret_cast<void*>(original_resize),
-            reinterpret_cast<void*>(&ResizeBuffersHook));
-        state.resize_hook_reachable.store(
-            resize_patch.replacement_published, std::memory_order_release);
-        if (!resize_patch.complete) {
-            if (resize_patch.replacement_published) {
-                const auto resize_restored = RestoreHookSlot(
-                    resize_slot,
-                    reinterpret_cast<void*>(original_resize),
-                    reinterpret_cast<void*>(&ResizeBuffersHook));
-                if (resize_restored)
-                    state.resize_hook_reachable.store(false, std::memory_order_release);
-            }
-            const auto present_restored = RestoreHookSlot(
-                present_slot,
-                reinterpret_cast<void*>(original_present),
-                reinterpret_cast<void*>(&PresentHook));
-            if (present_restored)
-                state.present_hook_reachable.store(false, std::memory_order_release);
-            if (present_restored &&
-                !state.resize_hook_reachable.load(std::memory_order_acquire) &&
-                WaitForCallbacksToDrain(state.active_hooks)) {
-                state.present_slot = nullptr;
-                state.resize_slot = nullptr;
-                state.original_present = nullptr;
-                state.original_resize = nullptr;
-            }
-            installed = false;
-        }
+}
+
+[[nodiscard]] bool RestoreInputSystemOnWindowThread() noexcept {
+    auto& state = g_overlay;
+    if (!state.input_restore_pending.load(std::memory_order_acquire))
+        return true;
+    if (state.input_system == nullptr || state.input_system_enable == nullptr ||
+        state.input_enabled_state_offset == 0)
+        return false;
+    auto* enabled = static_cast<std::uint8_t*>(state.input_system) +
+        state.input_enabled_state_offset;
+    if (!IsReadableRange(enabled, 1) || !IsExecutableFunction(
+            reinterpret_cast<void*>(state.input_system_enable)))
+        return false;
+
+    __try {
+        state.input_system_enable(state.input_system, state.input_was_enabled);
+        if ((*enabled != 0) != state.input_was_enabled)
+            return false;
+        state.input_restore_pending.store(false, std::memory_order_release);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
     }
-    if (installed) {
-        state.hooks_installed.store(true, std::memory_order_release);
-    } else if (!state.present_hook_reachable.load(std::memory_order_acquire) &&
-               !state.resize_hook_reachable.load(std::memory_order_acquire) &&
-               state.active_hooks.load(std::memory_order_acquire) == 0) {
-        // No callback can reach SMVM. It is safe to withdraw a publication made
-        // for a validation/first-patch failure.
-        state.present_slot = nullptr;
-        state.resize_slot = nullptr;
+}
+
+[[nodiscard]] void** CloneVtable(
+    void** original,
+    const std::size_t entry_count,
+    const std::size_t replacement_index,
+    void* replacement) noexcept {
+    if (original == nullptr || replacement == nullptr || replacement_index >= entry_count ||
+        !IsReadableRange(original, entry_count * sizeof(void*)))
+        return nullptr;
+    auto** clone = static_cast<void**>(VirtualAlloc(
+        nullptr,
+        entry_count * sizeof(void*),
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE));
+    if (clone == nullptr)
+        return nullptr;
+    __try {
+        std::memcpy(clone, original, entry_count * sizeof(void*));
+        clone[replacement_index] = replacement;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        VirtualFree(clone, 0, MEM_RELEASE);
+        return nullptr;
+    }
+    DWORD ignored = 0;
+    if (!VirtualProtect(clone, entry_count * sizeof(void*), PAGE_READONLY, &ignored)) {
+        VirtualFree(clone, 0, MEM_RELEASE);
+        return nullptr;
+    }
+    return clone;
+}
+
+[[nodiscard]] bool PublishObjectVtable(
+    void* object,
+    void** expected,
+    void** replacement) noexcept {
+    if (object == nullptr || expected == nullptr || replacement == nullptr)
+        return false;
+    const auto prior = InterlockedCompareExchangePointer(
+        reinterpret_cast<void* volatile*>(object), replacement, expected);
+    FlushProcessWriteBuffers();
+    return prior == expected;
+}
+
+[[nodiscard]] bool RestoreObjectVtable(
+    void* object,
+    void** original,
+    void** replacement) noexcept {
+    if (object == nullptr || original == nullptr || replacement == nullptr)
+        return false;
+    const auto prior = InterlockedCompareExchangePointer(
+        reinterpret_cast<void* volatile*>(object), original, replacement);
+    FlushProcessWriteBuffers();
+    return prior == replacement || prior == original;
+}
+
+[[nodiscard]] bool AddRefObject(IUnknown* object) noexcept {
+    if (object == nullptr)
+        return false;
+    __try {
+        object->AddRef();
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void ReleaseObject(IUnknown*& object) noexcept {
+    if (object == nullptr)
+        return;
+    __try {
+        object->Release();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // The module stays resident whenever restoration is uncertain. This is
+        // cleanup after a proven restore, so a foreign COM failure must not be
+        // allowed to escape the native shutdown path.
+    }
+    object = nullptr;
+}
+
+[[nodiscard]] bool InstallSwapchainInstanceHookLocked(IDXGISwapChain* swapchain) noexcept {
+    auto& state = g_overlay;
+    if (swapchain == nullptr || state.stop_requested.load(std::memory_order_acquire))
+        return false;
+    if (state.hooked_swapchain != nullptr)
+        return state.hooked_swapchain == swapchain &&
+               state.present_hook_reachable.load(std::memory_order_acquire) &&
+               state.resize_hook_reachable.load(std::memory_order_acquire);
+
+    auto** original_vtable = ReadObjectVtable(swapchain, kSwapchainVtableEntryCount);
+    if (original_vtable == nullptr)
+        return false;
+    const auto original_present = reinterpret_cast<PresentFunction>(
+        original_vtable[kPresentVtableIndex]);
+    const auto original_resize = reinterpret_cast<ResizeBuffersFunction>(
+        original_vtable[kResizeBuffersVtableIndex]);
+    if (!IsExecutableFunction(reinterpret_cast<void*>(original_present)) ||
+        !IsExecutableFunction(reinterpret_cast<void*>(original_resize)) ||
+        original_present == &PresentHook || original_resize == &ResizeBuffersHook)
+        return false;
+
+    auto** clone = CloneVtable(
+        original_vtable,
+        kSwapchainVtableEntryCount,
+        kPresentVtableIndex,
+        reinterpret_cast<void*>(&PresentHook));
+    if (clone == nullptr)
+        return false;
+    DWORD old_protection = 0;
+    if (!VirtualProtect(
+            clone,
+            kSwapchainVtableEntryCount * sizeof(void*),
+            PAGE_READWRITE,
+            &old_protection)) {
+        VirtualFree(clone, 0, MEM_RELEASE);
+        return false;
+    }
+    clone[kResizeBuffersVtableIndex] = reinterpret_cast<void*>(&ResizeBuffersHook);
+    DWORD ignored = 0;
+    if (!VirtualProtect(
+            clone,
+            kSwapchainVtableEntryCount * sizeof(void*),
+            PAGE_READONLY,
+            &ignored)) {
+        VirtualFree(clone, 0, MEM_RELEASE);
+        return false;
+    }
+    if (!AddRefObject(swapchain)) {
+        VirtualFree(clone, 0, MEM_RELEASE);
+        return false;
+    }
+
+    state.hooked_swapchain = swapchain;
+    state.swapchain_original_vtable = original_vtable;
+    state.swapchain_hook_vtable = clone;
+    state.original_present = original_present;
+    state.original_resize = original_resize;
+    if (!PublishObjectVtable(swapchain, original_vtable, clone)) {
+        IUnknown* held = state.hooked_swapchain;
+        state.hooked_swapchain = nullptr;
+        state.swapchain_original_vtable = nullptr;
+        state.swapchain_hook_vtable = nullptr;
         state.original_present = nullptr;
         state.original_resize = nullptr;
+        ReleaseObject(held);
+        VirtualFree(clone, 0, MEM_RELEASE);
+        return false;
     }
-
-    SafeRelease(context);
-    SafeRelease(device);
-    SafeRelease(swapchain);
-    DestroyWindow(window);
-    if (window_class != 0)
-        UnregisterClassW(L"DeadlockMVM.Smvm.D3D11Probe", state.self);
-    return installed;
+    state.present_hook_reachable.store(true, std::memory_order_release);
+    state.resize_hook_reachable.store(true, std::memory_order_release);
+    state.hooks_installed.store(true, std::memory_order_release);
+    return true;
 }
 
-DWORD WINAPI InstallerThread(void*) noexcept {
+[[nodiscard]] bool InstallFactoryCaptureHook(
+    const std::uintptr_t renderer_global) noexcept {
+    auto& state = g_overlay;
+    auto* factory = ReadRenderFactory(renderer_global);
+    if (factory == nullptr)
+        return false;
+
+    AcquireSRWLockExclusive(&state.hook_lifecycle_lock);
+    if (state.stop_requested.load(std::memory_order_acquire)) {
+        ReleaseSRWLockExclusive(&state.hook_lifecycle_lock);
+        return false;
+    }
+    if (state.factory_hook_reachable.load(std::memory_order_acquire)) {
+        const auto same_factory = state.target_factory == factory;
+        ReleaseSRWLockExclusive(&state.hook_lifecycle_lock);
+        return same_factory;
+    }
+
+    auto** original_vtable = ReadObjectVtable(factory, kFactoryVtableEntryCount);
+    const auto original_create = original_vtable != nullptr
+        ? reinterpret_cast<CreateSwapchainFunction>(
+              original_vtable[kCreateSwapchainVtableIndex])
+        : nullptr;
+    if (!IsExecutableFunction(reinterpret_cast<void*>(original_create)) ||
+        original_create == &FactoryCreateSwapchainHook) {
+        ReleaseSRWLockExclusive(&state.hook_lifecycle_lock);
+        return false;
+    }
+    auto** clone = CloneVtable(
+        original_vtable,
+        kFactoryVtableEntryCount,
+        kCreateSwapchainVtableIndex,
+        reinterpret_cast<void*>(&FactoryCreateSwapchainHook));
+    if (clone == nullptr || !AddRefObject(factory)) {
+        if (clone != nullptr)
+            VirtualFree(clone, 0, MEM_RELEASE);
+        ReleaseSRWLockExclusive(&state.hook_lifecycle_lock);
+        return false;
+    }
+
+    state.target_factory = factory;
+    state.factory_original_vtable = original_vtable;
+    state.factory_hook_vtable = clone;
+    state.original_create_swapchain = original_create;
+    if (!PublishObjectVtable(factory, original_vtable, clone)) {
+        IUnknown* held = state.target_factory;
+        state.target_factory = nullptr;
+        state.factory_original_vtable = nullptr;
+        state.factory_hook_vtable = nullptr;
+        state.original_create_swapchain = nullptr;
+        ReleaseObject(held);
+        VirtualFree(clone, 0, MEM_RELEASE);
+        ReleaseSRWLockExclusive(&state.hook_lifecycle_lock);
+        return false;
+    }
+    state.factory_hook_reachable.store(true, std::memory_order_release);
+    state.hooks_installed.store(true, std::memory_order_release);
+    ReleaseSRWLockExclusive(&state.hook_lifecycle_lock);
+    return true;
+}
+
+DWORD InstallerThreadBody() noexcept {
     const auto started = std::chrono::steady_clock::now();
+    auto capture_attempted = false;
+    std::optional<std::uintptr_t> renderer_global;
     while (!g_overlay.stop_requested.load(std::memory_order_acquire)) {
         if (GetModuleHandleW(L"rendersystemvulkan.dll") != nullptr) {
             PublishStatus(SmvmRendererBackend::unsupported, SmvmRendererError::unsupported_renderer);
             return 0;
         }
-        if (GetModuleHandleW(L"rendersystemdx11.dll") != nullptr)
-            break;
+        const auto render_module = GetModuleHandleW(L"rendersystemdx11.dll");
+        if (render_module != nullptr) {
+            capture_attempted = true;
+            if (!renderer_global)
+                renderer_global = ResolveRenderFactoryGlobal(render_module);
+            if (renderer_global && InstallFactoryCaptureHook(*renderer_global)) {
+                PublishStatus(SmvmRendererBackend::d3d11, SmvmRendererError::present_not_observed);
+                return 0;
+            }
+        }
         if (std::chrono::steady_clock::now() - started >= kInstallTimeout) {
-            PublishStatus(SmvmRendererBackend::none, SmvmRendererError::renderer_not_loaded);
+            PublishStatus(
+                capture_attempted ? SmvmRendererBackend::d3d11 : SmvmRendererBackend::none,
+                capture_attempted ? SmvmRendererError::swapchain_probe_failed
+                                  : SmvmRendererError::renderer_not_loaded);
             return 0;
         }
-        Sleep(100);
+        Sleep(static_cast<DWORD>(kInstallRetryInterval.count()));
     }
     if (g_overlay.stop_requested.load(std::memory_order_acquire))
         return 0;
-    if (!InstallSwapchainHooks()) {
-        PublishStatus(SmvmRendererBackend::d3d11, SmvmRendererError::swapchain_probe_failed);
+    return 0;
+}
+
+DWORD WINAPI InstallerThread(void*) noexcept {
+    __try {
+        return InstallerThreadBody();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        PublishStatus(SmvmRendererBackend::d3d11, SmvmRendererError::hook_install_failed);
         return 0;
     }
-    PublishStatus(SmvmRendererBackend::d3d11, SmvmRendererError::present_not_observed);
-    return 0;
+}
+
+[[nodiscard]] HRESULT CallOriginalCreateSwapchain(
+    const CreateSwapchainFunction original,
+    IDXGIFactory* factory,
+    IUnknown* device,
+    DXGI_SWAP_CHAIN_DESC* description,
+    IDXGISwapChain** swapchain) noexcept {
+    if (original == nullptr)
+        return DXGI_ERROR_INVALID_CALL;
+    __try {
+        return original(factory, device, description, swapchain);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return E_FAIL;
+    }
+}
+
+[[nodiscard]] IDXGISwapChain* ReadCreatedSwapchain(IDXGISwapChain** slot) noexcept {
+    if (slot == nullptr)
+        return nullptr;
+    __try {
+        return *slot;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+HRESULT STDMETHODCALLTYPE FactoryCreateSwapchainHook(
+    IDXGIFactory* factory,
+    IUnknown* device,
+    DXGI_SWAP_CHAIN_DESC* description,
+    IDXGISwapChain** swapchain) noexcept {
+    auto& state = g_overlay;
+    ActiveCallbackGuard callback_guard(state.active_hooks);
+    const auto original = state.original_create_swapchain;
+    const auto result = CallOriginalCreateSwapchain(
+        original, factory, device, description, swapchain);
+    auto* created_swapchain = ReadCreatedSwapchain(swapchain);
+    if (FAILED(result) || created_swapchain == nullptr ||
+        state.stop_requested.load(std::memory_order_acquire))
+        return result;
+
+    AcquireSRWLockExclusive(&state.hook_lifecycle_lock);
+    const auto installed = InstallSwapchainInstanceHookLocked(created_swapchain);
+    ReleaseSRWLockExclusive(&state.hook_lifecycle_lock);
+    PublishStatus(
+        SmvmRendererBackend::d3d11,
+        installed ? SmvmRendererError::present_not_observed
+                  : SmvmRendererError::hook_install_failed);
+    return result;
 }
 
 [[nodiscard]] SmvmRendererError RenderFrameProtected(IDXGISwapChain* swapchain) noexcept {
@@ -3836,7 +4660,11 @@ HRESULT STDMETHODCALLTYPE PresentHook(
     if (!state.stop_requested.load(std::memory_order_acquire) &&
         state.hooks_installed.load(std::memory_order_acquire)) {
         state.present_observed.store(true, std::memory_order_release);
+        const auto window_hook_healthy = state.output_window == nullptr ||
+            SubclassOutputWindow(state.output_window);
         error = RenderFrameProtected(swapchain);
+        if (error == SmvmRendererError::none && !window_hook_healthy)
+            error = SmvmRendererError::window_hook_failed;
     }
     const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - started).count();
@@ -3952,12 +4780,18 @@ bool StartSmvmOverlay(const HMODULE self_module, const SmvmOverlayCallbacks& cal
     state.callbacks = callbacks;
     state.stop_requested.store(false, std::memory_order_release);
     state.hooks_installed.store(false, std::memory_order_release);
+    state.factory_hook_reachable.store(false, std::memory_order_release);
     state.present_hook_reachable.store(false, std::memory_order_release);
     state.resize_hook_reachable.store(false, std::memory_order_release);
     state.present_observed.store(false, std::memory_order_release);
     state.ready.store(false, std::memory_order_release);
     state.menu_open.store(false, std::memory_order_release);
     state.clean_view.store(false, std::memory_order_release);
+    state.input_system = nullptr;
+    state.input_system_enable = nullptr;
+    state.input_enabled_state_offset = 0;
+    state.input_was_enabled = false;
+    state.input_restore_pending.store(false, std::memory_order_release);
     g_campath_geometry_cache.valid = false;
     ResetSmvmManualInput();
     ResetConsumedReleaseRoutes();
@@ -3990,30 +4824,37 @@ bool StopSmvmOverlay() noexcept {
     // as non-restorable: its stored predecessor may still be this DLL.
     const auto window_restored = RestorePublishedWindowProcedure();
 
-    auto resize_restored = !state.resize_hook_reachable.load(std::memory_order_acquire);
-    if (!resize_restored) {
-        resize_restored = RestoreHookSlot(
-            state.resize_slot,
-            reinterpret_cast<void*>(state.original_resize),
-            reinterpret_cast<void*>(&ResizeBuffersHook));
-        if (resize_restored)
-            state.resize_hook_reachable.store(false, std::memory_order_release);
+    AcquireSRWLockExclusive(&state.hook_lifecycle_lock);
+    auto factory_restored = !state.factory_hook_reachable.load(std::memory_order_acquire);
+    if (!factory_restored) {
+        factory_restored = RestoreObjectVtable(
+            state.target_factory,
+            state.factory_original_vtable,
+            state.factory_hook_vtable);
+        if (factory_restored)
+            state.factory_hook_reachable.store(false, std::memory_order_release);
     }
-    auto present_restored = !state.present_hook_reachable.load(std::memory_order_acquire);
-    if (!present_restored) {
-        present_restored = RestoreHookSlot(
-            state.present_slot,
-            reinterpret_cast<void*>(state.original_present),
-            reinterpret_cast<void*>(&PresentHook));
-        if (present_restored)
+    const auto swapchain_reachable =
+        state.present_hook_reachable.load(std::memory_order_acquire) ||
+        state.resize_hook_reachable.load(std::memory_order_acquire);
+    auto swapchain_restored = !swapchain_reachable;
+    if (!swapchain_restored) {
+        swapchain_restored = RestoreObjectVtable(
+            state.hooked_swapchain,
+            state.swapchain_original_vtable,
+            state.swapchain_hook_vtable);
+        if (swapchain_restored) {
             state.present_hook_reachable.store(false, std::memory_order_release);
+            state.resize_hook_reachable.store(false, std::memory_order_release);
+        }
     }
-    if (resize_restored && present_restored)
+    ReleaseSRWLockExclusive(&state.hook_lifecycle_lock);
+    if (factory_restored && swapchain_restored)
         state.hooks_installed.store(false, std::memory_order_release);
 
     const auto window_drained = window_restored &&
         WaitForCallbacksToDrain(state.active_window_procedures);
-    const auto hooks_drained = resize_restored && present_restored &&
+    const auto hooks_drained = factory_restored && swapchain_restored &&
         WaitForCallbacksToDrain(state.active_hooks);
     if (!window_drained || !hooks_drained)
         return false;
@@ -4033,10 +4874,30 @@ bool StopSmvmOverlay() noexcept {
     ClearWindowProcedurePublication();
     ReleaseGraphicsResources();
     state.render_lock.clear(std::memory_order_release);
-    state.present_slot = nullptr;
-    state.resize_slot = nullptr;
+
+    IUnknown* held_swapchain = state.hooked_swapchain;
+    IUnknown* held_factory = state.target_factory;
+    auto** swapchain_clone = state.swapchain_hook_vtable;
+    auto** factory_clone = state.factory_hook_vtable;
+    state.hooked_swapchain = nullptr;
+    state.target_factory = nullptr;
+    state.swapchain_original_vtable = nullptr;
+    state.swapchain_hook_vtable = nullptr;
+    state.factory_original_vtable = nullptr;
+    state.factory_hook_vtable = nullptr;
+    state.original_create_swapchain = nullptr;
     state.original_present = nullptr;
     state.original_resize = nullptr;
+    state.input_system = nullptr;
+    state.input_system_enable = nullptr;
+    state.input_enabled_state_offset = 0;
+    state.input_was_enabled = false;
+    ReleaseObject(held_swapchain);
+    ReleaseObject(held_factory);
+    if (swapchain_clone != nullptr)
+        VirtualFree(swapchain_clone, 0, MEM_RELEASE);
+    if (factory_clone != nullptr)
+        VirtualFree(factory_clone, 0, MEM_RELEASE);
     state.callbacks = {};
     state.self = nullptr;
     state.started.store(false, std::memory_order_release);

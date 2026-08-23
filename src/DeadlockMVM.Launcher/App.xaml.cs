@@ -19,6 +19,8 @@ public partial class App : System.Windows.Application
     {
         base.OnStartup(e);
         ShutdownMode = ShutdownMode.OnExplicitShutdown;
+        var launchSelectedReplay = e.Args.Any(argument =>
+            string.Equals(argument, "--launch-selected", StringComparison.OrdinalIgnoreCase));
 
         // Deadlock's VConsole serves a single client; two MVM instances would
         // fight over the console connection. Only one instance may run.
@@ -91,6 +93,21 @@ public partial class App : System.Windows.Application
             window.Show();
 
             viewModel.Start();
+            if (launchSelectedReplay)
+            {
+                Dispatcher.BeginInvoke(() =>
+                {
+                    if (viewModel.LaunchCommand.CanExecute(null))
+                    {
+                        log.Info("Development launch switch requested the selected replay.");
+                        viewModel.LaunchCommand.Execute(null);
+                    }
+                    else
+                    {
+                        log.Warn("Development launch switch could not run because the selected replay is unavailable.");
+                    }
+                });
+            }
         }
         catch (Exception ex)
         {

@@ -139,7 +139,11 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         var availability = ResolveCameraAvailability(
             internalEnabled, replayActive, replay, native, playback, ownership);
         var capabilities = ResolveCapabilities(internalEnabled, native);
-        var cameraReadable = replayActive && _native.Connected && native?.CameraObserved == true;
+        var cameraReadable = replayActive && _native.Connected &&
+            (native?.CameraObserved == true ||
+             (native?.Camera.IsValid == true &&
+              ownership is CameraOwnership.SmvmManualCamera or
+                  CameraOwnership.SmvmRestore or CameraOwnership.SmvmCampath));
         var spectatorCameraWritable = availability == CameraAvailability.Ready &&
                                       ownership == CameraOwnership.DeadlockSpectator;
 
@@ -286,7 +290,9 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         if (_native.ManualCameraDesired && !native.ManualCameraActive)
             return CameraAvailability.Initializing;
         if (ownership == CameraOwnership.SmvmRestore)
-            return CameraAvailability.OwnershipRejected;
+            return native?.OverrideActive == true
+                ? CameraAvailability.Ready
+                : CameraAvailability.OwnershipRejected;
         if (!native.CameraObserved)
             return CameraAvailability.CameraReadbackUnavailable;
         return CameraAvailability.Ready;
@@ -632,7 +638,11 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                 }
                 else
                 {
-                    await _camera.EnterFreeRoamAsync(_stop.Token).ConfigureAwait(true);
+                    // The START control is only enabled after the snapshot and
+                    // native replay gate both prove Free Roam. Re-entering roam
+                    // here was not idempotent: spec_goto reconfigured SDL input
+                    // while the activating mouse button was still physically
+                    // down, allowing the same click to select a player.
                     await _native.EnableManualCameraAsync(_stop.Token).ConfigureAwait(true);
                 }
                 break;

@@ -4,6 +4,8 @@
 #include "pattern_scan.hpp"
 #include "protocol.hpp"
 #include "smvm_action_queue.hpp"
+#include "smvm_input_gate.hpp"
+#include "smvm_input_route.hpp"
 
 #include <array>
 #include <cmath>
@@ -71,6 +73,27 @@ void ProtocolTests() {
     Check(action_queue.TryPush(queued_action, second_generation) && action_queue.TryPop(popped_action) &&
               popped_action.type == deadlock_mvm::SmvmActionType::toggle_replay_pause,
           "current connection epoch still transfers editor actions");
+
+    deadlock_mvm::SmvmInputRoute mouse_route;
+    Check(mouse_route.Claim(1u), "first raw mouse route owns the physical press");
+    Check(!mouse_route.Claim(2u), "legacy duplicate does not create a second mouse press");
+    Check(mouse_route.Release(1u), "raw mouse release is consumed by its owning route");
+    Check(mouse_route.HasAny(), "legacy route remains owned until its matching release");
+    Check(mouse_route.Release(2u) && !mouse_route.HasAny(),
+          "both delivery routes drain without a stuck mouse button");
+
+    constexpr std::array<std::uint8_t, 4> enable_input_code{0x88, 0x51, 0x48, 0xC3};
+    std::uint8_t input_state_offset = 0;
+    Check(deadlock_mvm::TryDecodeInputEnabledStateOffset(
+              enable_input_code.data(), enable_input_code.size(), input_state_offset) &&
+              input_state_offset == 0x48,
+          "typed input gate decodes the validated InputSystem enable-state offset");
+    auto invalid_enable_input_code = enable_input_code;
+    invalid_enable_input_code[3] = 0x90;
+    Check(!deadlock_mvm::TryDecodeInputEnabledStateOffset(
+              invalid_enable_input_code.data(), invalid_enable_input_code.size(),
+              input_state_offset),
+          "input gate fails closed when the EnableInput implementation changes");
 
     using namespace deadlock_mvm;
     const MessageHeader valid{kProtocolMagic, kProtocolVersion, MessageType::get_status, 0, 7};

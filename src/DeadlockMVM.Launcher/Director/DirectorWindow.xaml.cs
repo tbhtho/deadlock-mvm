@@ -30,15 +30,17 @@ public partial class DirectorWindow : Window
     {
         InitializeComponent();
 
-        _campathHotkeys = new CampathHotkeyService(settings.DirectorHotkey, Dispatcher);
+        _campathHotkeys = new CampathHotkeyService(
+            settings.DirectorHotkey,
+            Dispatcher,
+            () => settings.InterfaceMode != SmvmInterfaceMode.ExternalDirector &&
+                  nativeCamera.Status?.OverlayFlags.HasFlag(SmvmOverlayFlags.MenuOpen) == true);
         _vm = new DirectorViewModel(camera, controller, nativeCamera, settings, _campathHotkeys, log);
         DataContext = _vm;
         _vconPort = settings.VConsolePort;
         _log = log;
 
-        if (_campathHotkeys.IsAvailable)
-            log.Info("Director: foreground Campath keyboard/mouse observer ready.");
-        else
+        if (!_campathHotkeys.IsAvailable)
             log.Warn($"Director: Campath input observer unavailable (error {_campathHotkeys.LastError}).");
 
         _hotkey = new GlobalHotkey(this, settings.DirectorHotkey, ToggleVisibility);

@@ -538,15 +538,22 @@ public sealed class MainViewModel : ViewModelBase
         _settings.ExtraLaunchArguments = ExtraArguments;
         _settings.Save();
 
+        var gameArguments = CommandLine
+            .Tokenize(ExtraArguments)
+            .Concat(new[] { "+playdemo", replay.GamePath })
+            .ToArray();
+        var steamExecutable = ResolveSteamExecutable();
+        var launchThroughSteam = steamExecutable is not null;
         var request = new LaunchRequest
         {
-            ExecutablePath = _gameExecutablePath,
-            WorkingDirectory = Path.GetDirectoryName(_gameExecutablePath) ?? string.Empty,
-            BaseArguments = Array.Empty<string>(),
-            ExtraArguments = CommandLine
-                .Tokenize(ExtraArguments)
-                .Concat(new[] { "+playdemo", replay.GamePath })
-                .ToArray(),
+            ExecutablePath = steamExecutable ?? _gameExecutablePath,
+            WorkingDirectory = steamExecutable is not null
+                ? Path.GetDirectoryName(steamExecutable) ?? string.Empty
+                : Path.GetDirectoryName(_gameExecutablePath) ?? string.Empty,
+            BaseArguments = launchThroughSteam
+                ? new[] { "-applaunch", DeadlockConstants.AppIdString }
+                : Array.Empty<string>(),
+            ExtraArguments = gameArguments,
         };
 
         var fullCommandLine = CommandLine.Join(
@@ -563,6 +570,23 @@ public sealed class MainViewModel : ViewModelBase
         if (result.Success)
         {
             _log.Info($"Launch OK — PID {result.ProcessId}, command: {result.FullCommandLine}");
+            if (launchThroughSteam)
+            {
+                BeginEarlyNativeLoadForSteamLaunch();
+            }
+            else if (result.ProcessId is int processId)
+            {
+                // Load the narrow replay-only component immediately, before
+                // Deadlock creates its real DXGI swapchain. The session monitor
+                // remains the retry/reconnect path if this earliest attempt
+                // loses a startup race or the process rejects the load.
+                var nativePath = Path.Combine(AppContext.BaseDirectory, "DeadlockMVM.Native.dll");
+                var nativeLoad = NativeReplayModuleLoader.LoadForReplay(processId, nativePath);
+                if (nativeLoad.Success)
+                    _log.Info($"Early native load: {nativeLoad.Message}");
+                else
+                    _log.Warn($"Early native load unavailable; monitor will retry: {nativeLoad.Message}");
+            }
             StatusMessage = $"Playing {replay.FileName}...";
             BeginVerifyPlayback(replay.GamePath);
         }
@@ -573,6 +597,68 @@ public sealed class MainViewModel : ViewModelBase
         }
 
         IsLaunching = false;
+    }
+
+    private string? ResolveSteamExecutable()
+    {
+        if (string.IsNullOrWhiteSpace(SteamPath))
+            return null;
+        var executable = Path.Combine(SteamPath, "steam.exe");
+        return File.Exists(executable) ? executable : null;
+    }
+
+    private void BeginEarlyNativeLoadForSteamLaunch()
+    {
+        var nativePath = Path.Combine(AppContext.BaseDirectory, "DeadlockMVM.Native.dll");
+        var expectedGamePath = Path.GetFullPath(_gameExecutablePath);
+        _ = Task.Run(async () =>
+        {
+            var deadline = DateTime.UtcNow.AddSeconds(30);
+            string? lastFailure = null;
+            while (DateTime.UtcNow < deadline)
+            {
+                foreach (var processName in new[]
+                         {
+                             DeadlockConstants.GameProcessName,
+                             DeadlockConstants.GameProcessNameAlt,
+                         })
+                {
+                    foreach (var process in Process.GetProcessesByName(processName))
+                    {
+                        using (process)
+                        {
+                            try
+                            {
+                                if (process.HasExited || process.MainModule?.FileName is not { } processPath ||
+                                    !string.Equals(Path.GetFullPath(processPath), expectedGamePath,
+                                        StringComparison.OrdinalIgnoreCase))
+                                    continue;
+
+                                var nativeLoad = NativeReplayModuleLoader.LoadForReplay(process.Id, nativePath);
+                                if (nativeLoad.Success)
+                                {
+                                    _log.Info($"Early Steam native load: {nativeLoad.Message}");
+                                    return;
+                                }
+                                lastFailure = nativeLoad.Message;
+                            }
+                            catch (InvalidOperationException)
+                            {
+                                // The short-lived process disappeared between discovery and inspection.
+                            }
+                            catch (System.ComponentModel.Win32Exception ex)
+                            {
+                                lastFailure = ex.Message;
+                            }
+                        }
+                    }
+                }
+
+                await Task.Delay(20).ConfigureAwait(false);
+            }
+
+            _log.Warn($"Early Steam native load timed out; monitor will retry: {lastFailure ?? "Deadlock process was not observed."}");
+        });
     }
 
     /// <summary>
@@ -795,6 +881,14 @@ public sealed class MainViewModel : ViewModelBase
         }
 
         var arguments = CommandLine.Tokenize(ExtraArguments);
+        var steamExecutable = ResolveSteamExecutable();
+        if (steamExecutable is not null)
+        {
+            var steamArguments = new[] { "-applaunch", DeadlockConstants.AppIdString }
+                .Concat(arguments);
+            CommandPreview = $"\"{steamExecutable}\" {CommandLine.Join(steamArguments)}";
+            return;
+        }
 
         CommandPreview = $"\"{_gameExecutablePath}\" {CommandLine.Join(arguments)}";
     }

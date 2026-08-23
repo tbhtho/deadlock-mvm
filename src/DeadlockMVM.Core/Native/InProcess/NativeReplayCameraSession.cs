@@ -742,7 +742,25 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             _controller.Pause();
             await SeekToPathStartAsync(checked((int)keyframe.DemoTick), cancellationToken).ConfigureAwait(false);
             await _camera.EnterFreeRoamAsync(cancellationToken).ConfigureAwait(false);
-            await SendHeartbeatAsync(client, cancellationToken).ConfigureAwait(false);
+            // EnterFreeRoamAsync completes from authoritative spectator state, but
+            // the renderer camera can still be between observer instances for a
+            // few frames after demo_gototick. Prove that the post-seek instance is
+            // observable before arming a one-shot override; otherwise the first
+            // hook frame can correctly revoke ownership as ObserverNotRoaming.
+            var gateStatus = await SendHeartbeatAsync(client, cancellationToken).ConfigureAwait(false);
+            var beforeObservationHookCalls = gateStatus.HookCalls;
+            var observed = await client.PrepareCameraObservationAsync(cancellationToken).ConfigureAwait(false);
+            UpdateStatus(observed);
+            observed = await WaitForNativeAsync(
+                client,
+                candidate => candidate.CameraObserved && candidate.Camera.IsValid &&
+                             candidate.HookCalls > beforeObservationHookCalls &&
+                             Math.Abs(candidate.ReplayTick - keyframe.DemoTick) <= SeekTickTolerance,
+                TimeSpan.FromSeconds(2),
+                CampathStartFailure.FreeRoamReacquisitionFailed,
+                "A fresh post-seek Free Roam camera frame was not observed.",
+                observed,
+                cancellationToken).ConfigureAwait(false);
             var transfer = await client.SetCameraSampleAsync(keyframe.Camera, cancellationToken).ConfigureAwait(false);
             UpdateStatus(transfer);
             var status = await client.EnableOverrideAsync(cancellationToken).ConfigureAwait(false);
@@ -1991,7 +2009,8 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             _log.Warn($"Native camera: {_message}");
         }
         var lifecycle = status.OverlayFlags &
-            (SmvmOverlayFlags.HookInstalled | SmvmOverlayFlags.PresentObserved | SmvmOverlayFlags.Ready);
+            (SmvmOverlayFlags.HookInstalled | SmvmOverlayFlags.PresentObserved | SmvmOverlayFlags.Ready |
+             SmvmOverlayFlags.MenuOpen | SmvmOverlayFlags.CleanView);
         if (status.RendererBackend != _loggedRendererBackend ||
             status.RendererError != _loggedRendererError || lifecycle != _loggedRendererLifecycle)
         {
