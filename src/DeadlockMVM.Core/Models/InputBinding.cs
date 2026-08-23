@@ -39,7 +39,7 @@ public readonly record struct InputBinding(InputBindingKind Kind, uint Code, Inp
 
     public bool IsValid =>
         Code != 0 && Enum.IsDefined(Kind) &&
-        (Kind == InputBindingKind.Keyboard || Code is >= 3 and <= 5);
+        (Kind == InputBindingKind.Keyboard || Code is >= 3 and <= 7);
 
     public override string ToString()
     {
@@ -50,7 +50,7 @@ public readonly record struct InputBinding(InputBindingKind Kind, uint Code, Inp
         if (Modifiers.HasFlag(InputModifiers.Alt)) parts.Add("Alt");
         if (Modifiers.HasFlag(InputModifiers.Shift)) parts.Add("Shift");
         if (Modifiers.HasFlag(InputModifiers.Windows)) parts.Add("Win");
-        parts.Add(Kind == InputBindingKind.Mouse ? $"Mouse{Code}" : FormatKey(Code));
+        parts.Add(Kind == InputBindingKind.Mouse ? FormatMouse(Code) : FormatKey(Code));
         return string.Join('+', parts);
     }
 
@@ -80,8 +80,17 @@ public readonly record struct InputBinding(InputBindingKind Kind, uint Code, Inp
 
         if (keyPart is null)
             return false;
+        if (keyPart.Equals("WheelUp", StringComparison.OrdinalIgnoreCase) ||
+            keyPart.Equals("WheelDown", StringComparison.OrdinalIgnoreCase))
+        {
+            binding = new InputBinding(
+                InputBindingKind.Mouse,
+                keyPart.Equals("WheelUp", StringComparison.OrdinalIgnoreCase) ? 6u : 7u,
+                modifiers);
+            return true;
+        }
         if (keyPart.StartsWith("Mouse", StringComparison.OrdinalIgnoreCase) &&
-            uint.TryParse(keyPart.AsSpan(5), out var mouse) && mouse is >= 3 and <= 5)
+            uint.TryParse(keyPart.AsSpan(5), out var mouse) && mouse is >= 3 and <= 7)
         {
             binding = new InputBinding(InputBindingKind.Mouse, mouse, modifiers);
             return true;
@@ -129,6 +138,13 @@ public readonly record struct InputBinding(InputBindingKind Kind, uint Code, Inp
         var named = NamedKeys.FirstOrDefault(pair => pair.Value == key);
         return named.Key ?? $"VK{key:X2}";
     }
+
+    private static string FormatMouse(uint code) => code switch
+    {
+        6 => "WheelUp",
+        7 => "WheelDown",
+        _ => $"Mouse{code}",
+    };
 }
 
 public static class HotkeyConflictDetector

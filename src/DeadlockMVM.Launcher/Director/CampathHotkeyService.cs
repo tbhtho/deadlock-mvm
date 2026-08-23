@@ -33,6 +33,7 @@ public sealed class CampathHotkeyService : IHotkeyService
     private const int WmSysKeyDown = 0x0104;
     private const int WmSysKeyUp = 0x0105;
     private const int WmMButtonDown = 0x0207;
+    private const int WmMouseWheel = 0x020A;
     private const int WmXButtonDown = 0x020B;
 
     private readonly Dispatcher _dispatcher;
@@ -133,10 +134,12 @@ public sealed class CampathHotkeyService : IHotkeyService
         if (code >= 0)
         {
             var message = unchecked((int)wParam);
+            var mouseData = unchecked((uint)Marshal.ReadInt32(lParam, 8));
             uint button = message switch
             {
                 WmMButtonDown => 3,
-                WmXButtonDown => unchecked((uint)((Marshal.ReadInt32(lParam, 8) >> 16) & 0xFFFF)) == 1 ? 4u : 5u,
+                WmXButtonDown => (mouseData >> 16) == 1 ? 4u : 5u,
+                WmMouseWheel => unchecked((short)(mouseData >> 16)) > 0 ? 6u : 7u,
                 _ => 0,
             };
             if (button != 0)

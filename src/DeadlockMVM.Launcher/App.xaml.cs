@@ -65,11 +65,20 @@ public partial class App : System.Windows.Application
 
             // Director window (hidden initially; shown on playback confirm or hotkey)
             var director = new DirectorWindow(camera, controller, nativeSession, settings, log);
+            var smvm = new SmvmHostCoordinator(
+                camera,
+                controller,
+                nativeSession,
+                director.ViewModel.Campath,
+                settings,
+                log,
+                Dispatcher);
             viewModel.SetDirector(director);
 
             var window = new MainWindow { DataContext = viewModel };
             window.Closed += async (_, _) =>
             {
+                await smvm.DisposeAsync();
                 director.Close();
                 await nativeSession.DisposeAsync();
                 controller.Dispose();

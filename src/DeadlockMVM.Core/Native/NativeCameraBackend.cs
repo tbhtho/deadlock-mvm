@@ -163,14 +163,20 @@ public sealed class NativeCameraBackend : IDisposable
                 return false;
 
             var value = (float)fov;
+            var memory = _memory;
+            if (memory is null)
+            {
+                DetachLocked("FOV write lost process memory");
+                return false;
+            }
             if (!TryReadConVarDataLocked(out var conVarData) || !TryReadCameraAddressLocked(out var camera))
             {
                 DetachLocked("FOV write lost the pointer chains");
                 return false;
             }
 
-            if (!_memory!.TryWriteF32(conVarData + ConVarDataValueOffset, value) ||
-                !_memory.TryWriteF32(camera + CameraFovOffset, value))
+            if (!memory.TryWriteF32(conVarData + ConVarDataValueOffset, value) ||
+                !memory.TryWriteF32(camera + CameraFovOffset, value))
             {
                 DetachLocked("FOV write failed");
                 return false;
@@ -199,6 +205,12 @@ public sealed class NativeCameraBackend : IDisposable
             var p = (float)Math.Clamp(pitch, -89.0, 89.0);
             var y = (float)NormalizeYaw(yaw);
             var r = (float)roll;
+            var memory = _memory;
+            if (memory is null)
+            {
+                DetachLocked("rotation write lost process memory");
+                return false;
+            }
 
             if (!TryReadCameraAddressLocked(out var camera))
             {
@@ -206,9 +218,9 @@ public sealed class NativeCameraBackend : IDisposable
                 return false;
             }
 
-            var ok = _memory!.TryWrite3F32(camera + CameraAnglesOffset, p, y, r) &&
-                     _memory.TryWrite3F32(camera + CameraAnglesMirrorOffset, p, y, r) &&
-                     _memory.TryWrite3F32(camera + CameraAnglesQuantizedOffset, Quantize(p), Quantize(y), 0f);
+            var ok = memory.TryWrite3F32(camera + CameraAnglesOffset, p, y, r) &&
+                     memory.TryWrite3F32(camera + CameraAnglesMirrorOffset, p, y, r) &&
+                     memory.TryWrite3F32(camera + CameraAnglesQuantizedOffset, Quantize(p), Quantize(y), 0f);
             if (!ok)
             {
                 DetachLocked("rotation write failed");

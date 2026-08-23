@@ -20,6 +20,7 @@ public sealed class CampathProject
     public CampathReplayIdentifier ReplayIdentifier { get; init; } = new(string.Empty, null);
     public CampathInterpolationMode InterpolationMode { get; init; } = CampathInterpolationMode.Linear;
     public CampathEasingMode EasingMode { get; init; } = CampathEasingMode.Linear;
+    public CampathEndBehavior EndBehavior { get; init; } = CampathEndBehavior.StopAndRelease;
     public List<CampathKeyframe> Keyframes { get; init; } = [];
 
     public bool IsValid =>
@@ -29,7 +30,8 @@ public sealed class CampathProject
         Keyframes is not null &&
         Keyframes.Count <= CampathPath.MaxKeyframes &&
         Keyframes.All(keyframe => keyframe.IsValid) &&
-        Enum.IsDefined(InterpolationMode) && Enum.IsDefined(EasingMode);
+        Enum.IsDefined(InterpolationMode) && Enum.IsDefined(EasingMode) &&
+        EndBehavior is CampathEndBehavior.StopAndRelease or CampathEndBehavior.HoldFinalCamera;
 
     public CampathPath ToPath() => new(Keyframes, InterpolationMode, EasingMode);
 }

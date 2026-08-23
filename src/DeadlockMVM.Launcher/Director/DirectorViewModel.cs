@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.IO;
 using System.Windows.Input;
 using DeadlockMVM.Core;
 using DeadlockMVM.Core.Contracts;
@@ -20,6 +21,7 @@ public sealed class DirectorViewModel : INotifyPropertyChanged
 {
     private readonly ICameraService _camera;
     private readonly ReplayController _controller;
+    private readonly NativeReplayCameraSession _nativeCamera;
     private readonly IAppSettings _settings;
     private readonly ILogService _log;
     private readonly System.Windows.Threading.Dispatcher? _dispatcher;
@@ -43,6 +45,7 @@ public sealed class DirectorViewModel : INotifyPropertyChanged
     {
         _camera = camera;
         _controller = controller;
+        _nativeCamera = nativeCamera;
         _settings = settings;
         _log = log;
         _dispatcher = System.Windows.Threading.Dispatcher.FromThread(System.Threading.Thread.CurrentThread);
@@ -50,7 +53,7 @@ public sealed class DirectorViewModel : INotifyPropertyChanged
         NavItems = new ObservableCollection<NavItem>();
         NavItems.Add(new NavItem("REPLAY", true, new RelayCommand(() => SelectedNav = NavItems[0])));
         NavItems.Add(new NavItem("CAMERA", true, new RelayCommand(() => SelectedNav = NavItems[1])));
-        NavItems.Add(new NavItem("DOLLY", true, new RelayCommand(() => SelectedNav = NavItems[2])));
+        NavItems.Add(new NavItem("CAMPATH", true, new RelayCommand(() => SelectedNav = NavItems[2])));
         NavItems.Add(new NavItem("VISUALS", false, new RelayCommand(() => SelectedNav = NavItems[3])));
         NavItems.Add(new NavItem("CAPTURE", false, new RelayCommand(() => SelectedNav = NavItems[4])));
         _selectedNav = NavItems[0];
@@ -63,12 +66,20 @@ public sealed class DirectorViewModel : INotifyPropertyChanged
         PauseCommand = new RelayCommand(() => _controller.Pause(), () => _controller.IsConnected);
         TogglePlaybackCommand = new RelayCommand(() => _controller.TogglePause(), () => _controller.IsConnected);
         TogglePauseCommand = TogglePlaybackCommand;
-        StepBackCommand = new RelayCommand(() => _controller.StepBack(), () => _controller.IsConnected);
-        StepForwardCommand = new RelayCommand(() => _controller.StepTick(1), () => _controller.IsConnected);
+        StepBackCommand = new RelayCommand(() =>
+        {
+            if (_controller.State.CurrentTick is { } tick && tick > 0)
+                _ = SeekFromDirectorAsync(tick - 1);
+        }, () => _controller.IsConnected);
+        StepForwardCommand = new RelayCommand(() =>
+        {
+            if (_controller.State.CurrentTick is { } tick && tick < int.MaxValue)
+                _ = SeekFromDirectorAsync(tick + 1);
+        }, () => _controller.IsConnected);
         SetSpeedCommand = new RelayCommand<double>(s => { if (s is { } v) _controller.SetSpeed(v); }, () => _controller.IsConnected);
         GotoTickCommand = new RelayCommand(() =>
         {
-            if (_gotoTickValue > 0) _controller.SeekToTick((int)_gotoTickValue);
+            if (_gotoTickValue > 0) _ = SeekFromDirectorAsync((int)_gotoTickValue);
         }, () => _controller.IsConnected);
         RefreshStateCommand = new RelayCommand(() =>
         {
@@ -104,7 +115,7 @@ public sealed class DirectorViewModel : INotifyPropertyChanged
 
     public bool IsCameraPage => _selectedNav?.Name == "CAMERA";
 
-    public bool IsDollyPage => _selectedNav?.Name == "DOLLY";
+    public bool IsDollyPage => _selectedNav?.Name == "CAMPATH";
 
     public bool IsOtherPage => !IsReplayPage && !IsCameraPage && !IsDollyPage;
 
@@ -178,6 +189,18 @@ public sealed class DirectorViewModel : INotifyPropertyChanged
     public ICommand RefreshStateCommand { get; }
 
     public IReadOnlyList<double> SpeedPresets => ReplayCommands.SpeedPresets;
+
+    private async Task SeekFromDirectorAsync(int tick)
+    {
+        try
+        {
+            await _nativeCamera.SeekReplayAsync(tick).ConfigureAwait(true);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or IOException)
+        {
+            _log.Warn($"Director seek failed: {ex.Message}");
+        }
+    }
 
     private void OnStateChanged(object? sender, ReplayState state)
     {

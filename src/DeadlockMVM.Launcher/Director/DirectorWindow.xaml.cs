@@ -19,6 +19,8 @@ public partial class DirectorWindow : Window
     private readonly ILogService _log;
     private readonly int _vconPort;
 
+    public DirectorViewModel ViewModel => _vm;
+
     public DirectorWindow(
         ICameraService camera,
         ReplayController controller,

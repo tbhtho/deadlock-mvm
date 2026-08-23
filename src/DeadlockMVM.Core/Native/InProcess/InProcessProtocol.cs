@@ -15,6 +15,12 @@ internal enum InProcessMessageType : ushort
     SetCampath = 8,
     ClearCampath = 9,
     PrepareCameraObservation = 10,
+    UpdateSmvmSnapshot = 11,
+    SetEditorCampath = 12,
+    ClearEditorCampath = 13,
+    SetRollOverride = 14,
+    EnableManualCamera = 15,
+    DisableManualCamera = 16,
     Status = 100,
 }
 
@@ -47,6 +53,294 @@ public enum InProcessErrorCode : uint
     ReplayClockUnavailable = 15,
 }
 
+public enum SmvmRendererBackend : uint
+{
+    None = 0,
+    D3D11 = 1,
+    Unsupported = 2,
+}
+
+public enum SmvmRendererError : uint
+{
+    None = 0,
+    RendererNotLoaded = 1,
+    UnsupportedRenderer = 2,
+    SwapchainProbeFailed = 3,
+    HookInstallFailed = 4,
+    PresentNotObserved = 5,
+    DeviceUnavailable = 6,
+    ResourceCreationFailed = 7,
+    WindowHookFailed = 8,
+    DeviceReset = 9,
+}
+
+[Flags]
+public enum SmvmOverlayFlags : uint
+{
+    None = 0,
+    HookInstalled = 1 << 0,
+    PresentObserved = 1 << 1,
+    Ready = 1 << 2,
+    MenuOpen = 1 << 3,
+    CleanView = 1 << 4,
+}
+
+[Flags]
+public enum SmvmSnapshotFlags : uint
+{
+    None = 0,
+    ReplayActive = 1 << 0,
+    PauseKnown = 1 << 1,
+    Paused = 1 << 2,
+    CameraReadable = 1 << 3,
+    FovWritable = 1 << 4,
+    RollWritable = 1 << 5,
+    CampathPlaying = 1 << 6,
+    CameraOwned = 1 << 7,
+    EditorPath = 1 << 8,
+    InternalEnabled = 1 << 9,
+    ShowToolbar = 1 << 10,
+    ShowPath = 1 << 11,
+    ShowCameras = 1 << 12,
+    ShowLabels = 1 << 13,
+    FovInverted = 1 << 14,
+    ManualCameraRequested = 1 << 15,
+    ManualCameraActive = 1 << 16,
+    InputTakeover = 1 << 17,
+    InvertY = 1 << 18,
+    ShowMinimalPill = 1 << 19,
+    Notifications = 1 << 20,
+    HidePathWhilePlaying = 1 << 21,
+}
+
+[Flags]
+public enum SmvmCapabilities : uint
+{
+    None = 0,
+    ManualCamera = 1 << 0,
+    RenderedRoll = 1 << 1,
+    PathVisualization = 1 << 2,
+    CameraSelfTest = 1 << 3,
+    CampathSelfTest = 1 << 4,
+}
+
+public enum SmvmMenuAnchor : uint
+{
+    Left = 0,
+    Right = 1,
+}
+
+public enum SmvmNotificationAnchor : uint
+{
+    TopLeft = 0,
+    TopRight = 1,
+    BottomLeft = 2,
+    BottomRight = 3,
+}
+
+public static class SmvmInputCode
+{
+    private const uint BaseMask = 0x0000FFFF;
+    private const uint ModifierMask = 0x000F0000;
+    private const InputModifiers AllowedModifiers = InputModifiers.Control | InputModifiers.Alt |
+                                                    InputModifiers.Shift | InputModifiers.Windows;
+
+    public const uint None = 0;
+    public const uint MouseMiddle = 0x1001;
+    public const uint MouseX1 = 0x1002;
+    public const uint MouseX2 = 0x1003;
+    public const uint WheelUp = 0x1004;
+    public const uint WheelDown = 0x1005;
+
+    public static bool IsBindingAllowedForSlot(int slot, InputBinding binding) =>
+        slot is >= 100 and <= 121 && binding.IsValid && Encode(binding) != None &&
+        (slot is < 100 or > 110 || binding.Kind == InputBindingKind.Keyboard);
+
+    public static uint Encode(InputBinding binding)
+    {
+        if (!binding.IsValid || (binding.Modifiers & ~AllowedModifiers) != 0 ||
+            (binding.Kind == InputBindingKind.Keyboard && binding.Code > 0xFF))
+            return None;
+        var code = binding.Kind == InputBindingKind.Mouse
+            ? binding.Code switch
+            {
+                3 => MouseMiddle,
+                4 => MouseX1,
+                5 => MouseX2,
+                6 => WheelUp,
+                7 => WheelDown,
+                _ => None,
+            }
+            : binding.Code;
+        return code | ((uint)binding.Modifiers << 16);
+    }
+
+    public static bool TryDecode(uint code, out InputBinding binding)
+    {
+        binding = default;
+        if (code == None || (code & ~(BaseMask | ModifierMask)) != 0)
+            return false;
+
+        var modifiers = (InputModifiers)((code & ModifierMask) >> 16);
+        if ((modifiers & ~AllowedModifiers) != 0)
+            return false;
+
+        var baseCode = code & BaseMask;
+        binding = baseCode switch
+        {
+            MouseMiddle => new InputBinding(InputBindingKind.Mouse, 3, modifiers),
+            MouseX1 => new InputBinding(InputBindingKind.Mouse, 4, modifiers),
+            MouseX2 => new InputBinding(InputBindingKind.Mouse, 5, modifiers),
+            WheelUp => new InputBinding(InputBindingKind.Mouse, 6, modifiers),
+            WheelDown => new InputBinding(InputBindingKind.Mouse, 7, modifiers),
+            > 0 and <= 0xFF => new InputBinding(InputBindingKind.Keyboard, baseCode, modifiers),
+            _ => default,
+        };
+        return binding.IsValid;
+    }
+
+    public static uint ParseOrDefault(string? text, uint fallback) =>
+        string.IsNullOrWhiteSpace(text)
+            ? None
+            : InputBinding.TryParse(text, out var binding) ? Encode(binding) : fallback;
+
+    public static uint ParseForSlotOrDefault(int slot, string? text, string? fallback)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return None;
+        if (InputBinding.TryParse(text, out var candidate) && IsBindingAllowedForSlot(slot, candidate))
+            return Encode(candidate);
+        return InputBinding.TryParse(fallback, out var defaultBinding) &&
+               IsBindingAllowedForSlot(slot, defaultBinding)
+            ? Encode(defaultBinding)
+            : None;
+    }
+}
+
+public enum SmvmActionType : uint
+{
+    None = 0,
+    ToggleReplayPause = 1,
+    SetTimescale = 2,
+    SeekTick = 3,
+    StepBack = 4,
+    StepForward = 5,
+    FreeRoam = 6,
+    PreviousPlayer = 7,
+    NextPlayer = 8,
+    InEye = 9,
+    Chase = 10,
+    SetFov = 11,
+    SetRoll = 12,
+    SaveCamera = 13,
+    RestoreCamera = 14,
+    AddKeyframe = 15,
+    DeleteKeyframe = 16,
+    SelectKeyframe = 17,
+    GoToKeyframe = 18,
+    UpdateKeyframe = 19,
+    ClearPath = 20,
+    SetInterpolation = 21,
+    SetEasing = 22,
+    PlayFromStart = 23,
+    PlayFromCurrent = 24,
+    StopCampath = 25,
+    SetEndBehavior = 26,
+    UndoEdit = 27,
+    RedoEdit = 28,
+    ToggleToolbar = 29,
+    ToggleShowPath = 30,
+    ToggleShowCameras = 31,
+    ToggleShowLabels = 32,
+    SetBinding = 33,
+    SetPathName = 34,
+    SavePath = 35,
+    LoadNextPath = 36,
+    ToggleManualCamera = 37,
+    ReacquireCamera = 38,
+    CameraSelfTest = 39,
+    CampathSelfTest = 40,
+    ToggleNotifications = 41,
+    ToggleInputTakeover = 42,
+    SetUiScale = 43,
+    SetMenuOpacity = 44,
+    SetMenuAnchor = 45,
+    SetMovementSpeed = 46,
+    SetMouseSensitivity = 47,
+    SetSmoothing = 48,
+    ToggleInvertY = 49,
+    ResetBindings = 50,
+    ToggleMinimalPill = 51,
+    ToggleHidePathWhilePlaying = 52,
+}
+
+public sealed record SmvmAction(
+    SmvmActionType Type,
+    int Index,
+    long Tick,
+    double Value,
+    CameraSample Camera,
+    string Text)
+{
+    public static SmvmAction None { get; } = new(SmvmActionType.None, -1, -1, 0, default, string.Empty);
+}
+
+public sealed record SmvmSnapshot(
+    SmvmSnapshotFlags Flags,
+    long CurrentTick,
+    long TotalTicks,
+    double Timescale,
+    CameraSample Camera,
+    SpecCameraMode ObserverMode,
+    int SelectedKeyframe,
+    int KeyframeCount,
+    CampathInterpolationMode Interpolation,
+    CampathEasingMode Easing,
+    CampathEndBehavior EndBehavior,
+    CampathPlaybackState PlaybackState,
+    CampathStartFailure StartFailure,
+    uint MenuKey,
+    uint AddKey,
+    uint DeleteKey,
+    uint CleanViewKey,
+    double FovStep,
+    uint RollLeftKey,
+    uint RollRightKey,
+    uint RollResetKey,
+    CameraAvailability CameraAvailability,
+    CameraOwnership CameraOwnership,
+    SmvmCapabilities Capabilities,
+    uint ForwardKey,
+    uint BackwardKey,
+    uint LeftKey,
+    uint RightKey,
+    uint UpKey,
+    uint DownKey,
+    uint FastKey,
+    uint PrecisionKey,
+    uint PlayStartKey,
+    uint PlayCurrentKey,
+    uint StopKey,
+    uint UndoKey,
+    uint RedoKey,
+    uint ShowPathKey,
+    uint ShowCamerasKey,
+    uint ShowLabelsKey,
+    double MovementSpeed,
+    double BoostMultiplier,
+    double PrecisionMultiplier,
+    double MouseSensitivity,
+    double Smoothing,
+    double UiScale,
+    double MenuOpacity,
+    double PathLabelScale,
+    SmvmMenuAnchor MenuAnchor,
+    SmvmNotificationAnchor NotificationAnchor,
+    string ReplayName,
+    string PathName,
+    string Status,
+    string CameraStatus);
+
 [Flags]
 public enum InProcessStatusFlags : uint
 {
@@ -61,6 +355,10 @@ public enum InProcessStatusFlags : uint
     CommandLineReplay = 1 << 7,
     CampathActive = 1 << 8,
     CameraObserved = 1 << 9,
+    CampathCompleted = 1 << 10,
+    RollOverrideActive = 1 << 11,
+    ManualCameraRequested = 1 << 12,
+    ManualCameraActive = 1 << 13,
 }
 
 public sealed record InProcessCameraStatus(
@@ -72,20 +370,29 @@ public sealed record InProcessCameraStatus(
     ulong AppliedSequence,
     ulong HookCalls,
     long ReplayTick,
-    CameraSample Camera)
+    CameraSample Camera,
+    SmvmRendererBackend RendererBackend,
+    SmvmRendererError RendererError,
+    SmvmOverlayFlags OverlayFlags,
+    uint OverlayFrameMicroseconds,
+    SmvmAction Action)
 {
     public bool Ready => State == InProcessBackendState.Ready &&
                          Flags.HasFlag(InProcessStatusFlags.HookInstalled);
     public bool OverrideActive => Flags.HasFlag(InProcessStatusFlags.OverrideActive);
+    public bool RollOverrideActive => Flags.HasFlag(InProcessStatusFlags.RollOverrideActive);
+    public bool ManualCameraRequested => Flags.HasFlag(InProcessStatusFlags.ManualCameraRequested);
+    public bool ManualCameraActive => Flags.HasFlag(InProcessStatusFlags.ManualCameraActive);
     public bool CameraObserved => Flags.HasFlag(InProcessStatusFlags.CameraObserved) && Camera.IsValid && ReplayTick >= 0;
 }
 
 internal static class InProcessProtocol
 {
     public const uint Magic = 0x4D564D43;
-    public const ushort Version = 3;
+    public const ushort Version = 7;
     public const int HeaderSize = 20;
-    public const int StatusSize = 104;
+    public const int StatusSize = 264;
+    public const int SmvmSnapshotSize = 640;
     public const int CameraSampleSize = 56;
     public const int CampathKeyframeSize = 64;
     public const int CampathHeaderSize = 16;
@@ -150,7 +457,9 @@ internal static class InProcessProtocol
         return SerializeCampath(new CampathPath(new[] { path.From, path.To }));
     }
 
-    public static byte[] SerializeCampath(CampathPath path)
+    public static byte[] SerializeCampath(
+        CampathPath path,
+        CampathEndBehavior endBehavior = CampathEndBehavior.StopAndRelease)
     {
         ArgumentNullException.ThrowIfNull(path);
         if (!path.IsValid)
@@ -160,8 +469,32 @@ internal static class InProcessProtocol
         BinaryPrimitives.WriteUInt32LittleEndian(payload, checked((uint)path.Keyframes.Count));
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(4), (uint)path.Interpolation);
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(8), (uint)path.Easing);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(12), (uint)endBehavior);
         for (var index = 0; index < path.Keyframes.Count; index++)
             WriteKeyframe(payload, CampathHeaderSize + (index * CampathKeyframeSize), path.Keyframes[index]);
+        return payload;
+    }
+
+    public static byte[] SerializeEditorCampath(
+        IReadOnlyList<CampathKeyframe> keyframes,
+        CampathInterpolationMode interpolation,
+        CampathEasingMode easing)
+    {
+        ArgumentNullException.ThrowIfNull(keyframes);
+        if (keyframes.Count is < 1 or > CampathPath.MaxKeyframes ||
+            !Enum.IsDefined(interpolation) || !Enum.IsDefined(easing))
+            throw new ArgumentOutOfRangeException(nameof(keyframes));
+        var ordered = keyframes.OrderBy(keyframe => keyframe.DemoTick).ToArray();
+        if (ordered.Any(keyframe => !keyframe.IsValid) ||
+            ordered.Zip(ordered.Skip(1), (left, right) => left.DemoTick < right.DemoTick).Any(valid => !valid))
+            throw new ArgumentOutOfRangeException(nameof(keyframes));
+        var payload = new byte[CampathHeaderSize + (CampathKeyframeSize * ordered.Length)];
+        BinaryPrimitives.WriteUInt32LittleEndian(payload, checked((uint)ordered.Length));
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(4), (uint)interpolation);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(8), (uint)easing);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(12), (uint)CampathEndBehavior.StopAndRelease);
+        for (var index = 0; index < ordered.Length; index++)
+            WriteKeyframe(payload, CampathHeaderSize + (index * CampathKeyframeSize), ordered[index]);
         return payload;
     }
 
@@ -180,27 +513,151 @@ internal static class InProcessProtocol
         return payload;
     }
 
+    public static byte[] SerializeRoll(double roll)
+    {
+        if (!double.IsFinite(roll) || roll is < -180.0 or > 180.0)
+            throw new ArgumentOutOfRangeException(nameof(roll));
+        var payload = new byte[sizeof(double)];
+        WriteDouble(payload, 0, roll);
+        return payload;
+    }
+
+    public static byte[] SerializeSmvmSnapshot(SmvmSnapshot snapshot)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        var payload = new byte[SmvmSnapshotSize];
+        BinaryPrimitives.WriteUInt32LittleEndian(payload, 2);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(4), (uint)snapshot.Flags);
+        BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(8), snapshot.CurrentTick);
+        BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(16), snapshot.TotalTicks);
+        WriteDouble(payload, 24, snapshot.Timescale);
+        WriteCameraSample(payload, 32, snapshot.Camera);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(88), snapshot.ObserverMode switch
+        {
+            SpecCameraMode.InEye => 3,
+            SpecCameraMode.FreeRoam => 4,
+            SpecCameraMode.Chase => 6,
+            _ => 0,
+        });
+        BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan(92), snapshot.SelectedKeyframe);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(96), checked((uint)Math.Max(snapshot.KeyframeCount, 0)));
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(100), (uint)snapshot.Interpolation);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(104), (uint)snapshot.Easing);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(108), (uint)snapshot.EndBehavior);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(112), (uint)snapshot.PlaybackState);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(116), (uint)snapshot.StartFailure);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(120), snapshot.MenuKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(124), snapshot.AddKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(128), snapshot.DeleteKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(132), snapshot.CleanViewKey);
+        WriteDouble(payload, 136, snapshot.FovStep);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(144), snapshot.RollLeftKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(148), snapshot.RollRightKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(152), snapshot.RollResetKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(156), (uint)snapshot.CameraAvailability);
+        WriteUtf8(payload.AsSpan(160, 64), snapshot.ReplayName);
+        WriteUtf8(payload.AsSpan(224, 64), snapshot.PathName);
+        WriteUtf8(payload.AsSpan(288, 128), snapshot.Status);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(416), (uint)snapshot.CameraOwnership);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(420), (uint)snapshot.Capabilities);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(424), snapshot.ForwardKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(428), snapshot.BackwardKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(432), snapshot.LeftKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(436), snapshot.RightKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(440), snapshot.UpKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(444), snapshot.DownKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(448), snapshot.FastKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(452), snapshot.PrecisionKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(456), snapshot.PlayStartKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(460), snapshot.PlayCurrentKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(464), snapshot.StopKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(468), snapshot.UndoKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(472), snapshot.RedoKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(476), snapshot.ShowPathKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(480), snapshot.ShowCamerasKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(484), snapshot.ShowLabelsKey);
+        WriteDouble(payload, 488, snapshot.MovementSpeed);
+        WriteDouble(payload, 496, snapshot.BoostMultiplier);
+        WriteDouble(payload, 504, snapshot.PrecisionMultiplier);
+        WriteDouble(payload, 512, snapshot.MouseSensitivity);
+        WriteDouble(payload, 520, snapshot.Smoothing);
+        WriteDouble(payload, 528, snapshot.UiScale);
+        WriteDouble(payload, 536, snapshot.MenuOpacity);
+        WriteDouble(payload, 544, snapshot.PathLabelScale);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(552), (uint)snapshot.MenuAnchor);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(556), (uint)snapshot.NotificationAnchor);
+        WriteUtf8(payload.AsSpan(560, 80), snapshot.CameraStatus);
+        return payload;
+    }
+
     public static InProcessCameraStatus ParseStatus(ReadOnlySpan<byte> payload)
     {
         if (payload.Length != StatusSize)
             throw new InvalidDataException("Native status payload has the wrong size.");
+
+        var state = (InProcessBackendState)BinaryPrimitives.ReadUInt32LittleEndian(payload);
+        var error = (InProcessErrorCode)BinaryPrimitives.ReadUInt32LittleEndian(payload[4..]);
+        var flags = (InProcessStatusFlags)BinaryPrimitives.ReadUInt32LittleEndian(payload[8..]);
+        var rendererBackend = (SmvmRendererBackend)BinaryPrimitives.ReadUInt32LittleEndian(payload[104..]);
+        var rendererError = (SmvmRendererError)BinaryPrimitives.ReadUInt32LittleEndian(payload[108..]);
+        var overlayFlags = (SmvmOverlayFlags)BinaryPrimitives.ReadUInt32LittleEndian(payload[112..]);
+        const InProcessStatusFlags knownStatusFlags =
+            InProcessStatusFlags.Resolved | InProcessStatusFlags.HookInstalled |
+            InProcessStatusFlags.PipeConnected | InProcessStatusFlags.ReplayGate |
+            InProcessStatusFlags.OverrideRequested | InProcessStatusFlags.OverrideActive |
+            InProcessStatusFlags.HasSample | InProcessStatusFlags.CommandLineReplay |
+            InProcessStatusFlags.CampathActive | InProcessStatusFlags.CameraObserved |
+            InProcessStatusFlags.CampathCompleted | InProcessStatusFlags.RollOverrideActive |
+            InProcessStatusFlags.ManualCameraRequested | InProcessStatusFlags.ManualCameraActive;
+        const SmvmOverlayFlags knownOverlayFlags =
+            SmvmOverlayFlags.HookInstalled | SmvmOverlayFlags.PresentObserved |
+            SmvmOverlayFlags.Ready | SmvmOverlayFlags.MenuOpen | SmvmOverlayFlags.CleanView;
+        if (!Enum.IsDefined(state) || !Enum.IsDefined(error) || (flags & ~knownStatusFlags) != 0 ||
+            !Enum.IsDefined(rendererBackend) || !Enum.IsDefined(rendererError) ||
+            (overlayFlags & ~knownOverlayFlags) != 0)
+            throw new InvalidDataException("Native status contains an unsupported state or flag.");
+
+        var actionType = (SmvmActionType)BinaryPrimitives.ReadUInt32LittleEndian(payload[120..]);
+        if (!Enum.IsDefined(actionType) || payload[263] != 0)
+            throw new InvalidDataException("Native status contains an invalid SMVM action.");
+        var camera = new CameraSample(
+            ReadDouble(payload, 48), ReadDouble(payload, 56), ReadDouble(payload, 64),
+            ReadDouble(payload, 72), ReadDouble(payload, 80), ReadDouble(payload, 88),
+            ReadDouble(payload, 96));
+        if (flags.HasFlag(InProcessStatusFlags.CameraObserved) && !camera.IsValid)
+            throw new InvalidDataException("Native status marks an invalid camera sample as observed.");
+
+        var actionCamera = new CameraSample(
+            ReadDouble(payload, 144), ReadDouble(payload, 152), ReadDouble(payload, 160),
+            ReadDouble(payload, 168), ReadDouble(payload, 176), ReadDouble(payload, 184),
+            ReadDouble(payload, 192));
+        var actionTick = BinaryPrimitives.ReadInt64LittleEndian(payload[128..]);
+        var actionValue = ReadDouble(payload, 136);
+        if (!double.IsFinite(actionValue))
+            throw new InvalidDataException("Native status contains a non-finite SMVM action value.");
+        if (actionType == SmvmActionType.AddKeyframe && (actionTick < 0 || !actionCamera.IsValid))
+            throw new InvalidDataException("Native status contains an invalid camera-capture action.");
         return new InProcessCameraStatus(
-            (InProcessBackendState)BinaryPrimitives.ReadUInt32LittleEndian(payload),
-            (InProcessErrorCode)BinaryPrimitives.ReadUInt32LittleEndian(payload[4..]),
-            (InProcessStatusFlags)BinaryPrimitives.ReadUInt32LittleEndian(payload[8..]),
+            state,
+            error,
+            flags,
             checked((int)BinaryPrimitives.ReadUInt32LittleEndian(payload[12..])),
             BinaryPrimitives.ReadUInt64LittleEndian(payload[16..]),
             BinaryPrimitives.ReadUInt64LittleEndian(payload[24..]),
             BinaryPrimitives.ReadUInt64LittleEndian(payload[32..]),
             BinaryPrimitives.ReadInt64LittleEndian(payload[40..]),
-            new CameraSample(
-                ReadDouble(payload, 48),
-                ReadDouble(payload, 56),
-                ReadDouble(payload, 64),
-                ReadDouble(payload, 72),
-                ReadDouble(payload, 80),
-                ReadDouble(payload, 88),
-                ReadDouble(payload, 96)));
+            camera,
+            rendererBackend,
+            rendererError,
+            overlayFlags,
+            BinaryPrimitives.ReadUInt32LittleEndian(payload[116..]),
+            new SmvmAction(
+                actionType,
+                BinaryPrimitives.ReadInt32LittleEndian(payload[124..]),
+                actionTick,
+                actionValue,
+                actionCamera,
+                ReadUtf8(payload.Slice(200, 64))));
     }
 
     private static void WriteDouble(Span<byte> payload, int offset, double value) =>
@@ -213,5 +670,33 @@ internal static class InProcessProtocol
     {
         BinaryPrimitives.WriteInt64LittleEndian(payload[offset..], keyframe.DemoTick);
         SerializeCameraSample(keyframe.Camera).CopyTo(payload[(offset + 8)..]);
+    }
+
+    private static void WriteCameraSample(Span<byte> payload, int offset, CameraSample sample)
+    {
+        WriteDouble(payload, offset, sample.X);
+        WriteDouble(payload, offset + 8, sample.Y);
+        WriteDouble(payload, offset + 16, sample.Z);
+        WriteDouble(payload, offset + 24, sample.Pitch);
+        WriteDouble(payload, offset + 32, sample.Yaw);
+        WriteDouble(payload, offset + 40, sample.Roll);
+        WriteDouble(payload, offset + 48, sample.Fov);
+    }
+
+    private static void WriteUtf8(Span<byte> destination, string? value)
+    {
+        destination.Clear();
+        if (string.IsNullOrEmpty(value) || destination.Length < 2)
+            return;
+        var bytes = System.Text.Encoding.UTF8.GetBytes(value);
+        bytes.AsSpan(0, Math.Min(bytes.Length, destination.Length - 1)).CopyTo(destination);
+    }
+
+    private static string ReadUtf8(ReadOnlySpan<byte> source)
+    {
+        var length = source.IndexOf((byte)0);
+        if (length < 0)
+            length = source.Length;
+        return System.Text.Encoding.UTF8.GetString(source[..length]);
     }
 }

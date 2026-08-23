@@ -6,8 +6,10 @@ using System.Windows.Threading;
 using DeadlockMVM.Core;
 using DeadlockMVM.Core.Contracts;
 using DeadlockMVM.Core.Models;
+using DeadlockMVM.Core.Native.InProcess;
 using DeadlockMVM.Core.Services;
 using DeadlockMVM.Launcher.Director;
+using MvmInputBinding = DeadlockMVM.Core.Models.InputBinding;
 
 namespace DeadlockMVM.Launcher.ViewModels;
 
@@ -99,6 +101,153 @@ public sealed class MainViewModel : ViewModelBase
     public ICommand UseSelectedReplayCommand { get; }
 
     public ICommand OpenDirectorCommand { get; }
+
+    public IReadOnlyList<SmvmInterfaceMode> InterfaceModes { get; } = Enum.GetValues<SmvmInterfaceMode>();
+
+    public SmvmInterfaceMode InterfaceMode
+    {
+        get => _settings.InterfaceMode;
+        set
+        {
+            if (_settings.InterfaceMode == value || !Enum.IsDefined(value))
+                return;
+            _settings.InterfaceMode = value;
+            _settings.Save();
+            OnPropertyChanged(nameof(InterfaceMode));
+        }
+    }
+
+    public string SmvmMenuHotkey
+    {
+        get => _settings.SmvmMenuHotkey;
+        set => SetSmvmBinding(nameof(SmvmMenuHotkey), value, 111,
+            binding => _settings.SmvmMenuHotkey = binding);
+    }
+
+    public string SmvmAddHotkey
+    {
+        get => _settings.SmvmAddHotkey;
+        set => SetSmvmBinding(nameof(SmvmAddHotkey), value, 112,
+            binding => _settings.SmvmAddHotkey = binding);
+    }
+
+    public string SmvmDeleteHotkey
+    {
+        get => _settings.SmvmDeleteHotkey;
+        set => SetSmvmBinding(nameof(SmvmDeleteHotkey), value, 113,
+            binding => _settings.SmvmDeleteHotkey = binding);
+    }
+
+    public string SmvmCleanViewHotkey
+    {
+        get => _settings.SmvmCleanViewHotkey;
+        set => SetSmvmBinding(nameof(SmvmCleanViewHotkey), value, 114,
+            binding => _settings.SmvmCleanViewHotkey = binding);
+    }
+
+    public string SmvmRollLeftHotkey
+    {
+        get => _settings.SmvmRollLeftHotkey;
+        set => SetSmvmBinding(nameof(SmvmRollLeftHotkey), value, 108,
+            binding => _settings.SmvmRollLeftHotkey = binding);
+    }
+
+    public string SmvmRollRightHotkey
+    {
+        get => _settings.SmvmRollRightHotkey;
+        set => SetSmvmBinding(nameof(SmvmRollRightHotkey), value, 109,
+            binding => _settings.SmvmRollRightHotkey = binding);
+    }
+
+    public string SmvmRollResetHotkey
+    {
+        get => _settings.SmvmRollResetHotkey;
+        set => SetSmvmBinding(nameof(SmvmRollResetHotkey), value, 110,
+            binding => _settings.SmvmRollResetHotkey = binding);
+    }
+
+    public string SmvmShowPathHotkey
+    {
+        get => _settings.SmvmShowPathHotkey;
+        set => SetSmvmBinding(nameof(SmvmShowPathHotkey), value, 120,
+            binding => _settings.SmvmShowPathHotkey = binding);
+    }
+
+    public string SmvmShowCamerasHotkey
+    {
+        get => _settings.SmvmShowCamerasHotkey;
+        set => SetSmvmBinding(nameof(SmvmShowCamerasHotkey), value, 121,
+            binding => _settings.SmvmShowCamerasHotkey = binding);
+    }
+
+    private void SetSmvmBinding(string propertyName, string? value, int slot, Action<string> assign)
+    {
+        var candidate = value?.Trim() ?? string.Empty;
+        MvmInputBinding? parsedCandidate = null;
+        if (candidate.Length > 0)
+        {
+            if (!MvmInputBinding.TryParse(candidate, out var parsed))
+            {
+                StatusMessage = $"{candidate} is not a valid keyboard, modifier, or Mouse3/4/5 binding.";
+                OnPropertyChanged(propertyName);
+                return;
+            }
+            parsedCandidate = parsed;
+            if (!SmvmInputCode.IsBindingAllowedForSlot(slot, parsed))
+            {
+                StatusMessage = $"{propertyName.Replace("Smvm", string.Empty).Replace("Hotkey", string.Empty)} requires a keyboard key.";
+                OnPropertyChanged(propertyName);
+                return;
+            }
+            candidate = parsed.ToString();
+        }
+        var existing = GetSmvmBindings();
+        var conflict = existing.FirstOrDefault(pair => pair.Key != propertyName && parsedCandidate is { } binding &&
+            MvmInputBinding.TryParse(pair.Value, out var existingBinding) && existingBinding == binding);
+        if (!string.IsNullOrEmpty(conflict.Key))
+        {
+            StatusMessage = $"{candidate} is already assigned to {conflict.Key.Replace("Smvm", string.Empty).Replace("Hotkey", string.Empty)}.";
+            OnPropertyChanged(propertyName);
+            return;
+        }
+        if (parsedCandidate is { } reserved && MvmInputBinding.TryParse(_settings.DirectorHotkey, out var director) &&
+            reserved == director)
+        {
+            StatusMessage = $"{candidate} is already assigned to the external Director.";
+            OnPropertyChanged(propertyName);
+            return;
+        }
+        assign(candidate);
+        _settings.Save();
+        OnPropertyChanged(propertyName);
+        StatusMessage = candidate.Length == 0 ? "SMVM action unbound." : $"SMVM binding set to {candidate}.";
+    }
+
+    private Dictionary<string, string> GetSmvmBindings() => new(StringComparer.Ordinal)
+    {
+        [nameof(SmvmMenuHotkey)] = _settings.SmvmMenuHotkey,
+        [nameof(SmvmAddHotkey)] = _settings.SmvmAddHotkey,
+        [nameof(SmvmDeleteHotkey)] = _settings.SmvmDeleteHotkey,
+        [nameof(SmvmCleanViewHotkey)] = _settings.SmvmCleanViewHotkey,
+        [nameof(SmvmRollLeftHotkey)] = _settings.SmvmRollLeftHotkey,
+        [nameof(SmvmRollRightHotkey)] = _settings.SmvmRollRightHotkey,
+        [nameof(SmvmRollResetHotkey)] = _settings.SmvmRollResetHotkey,
+        [nameof(SmvmShowPathHotkey)] = _settings.SmvmShowPathHotkey,
+        [nameof(SmvmShowCamerasHotkey)] = _settings.SmvmShowCamerasHotkey,
+        ["Forward"] = _settings.SmvmForwardHotkey,
+        ["Backward"] = _settings.SmvmBackHotkey,
+        ["Move Left"] = _settings.SmvmLeftHotkey,
+        ["Move Right"] = _settings.SmvmRightHotkey,
+        ["Move Up"] = _settings.SmvmUpHotkey,
+        ["Move Down"] = _settings.SmvmDownHotkey,
+        ["Fast Movement"] = _settings.SmvmFastHotkey,
+        ["Precision Movement"] = _settings.SmvmPrecisionHotkey,
+        ["Play From Start"] = _settings.SmvmPlayStartHotkey,
+        ["Play From Current"] = _settings.SmvmPlayCurrentHotkey,
+        ["Stop Campath"] = _settings.SmvmStopHotkey,
+        ["Undo"] = _settings.SmvmUndoHotkey,
+        ["Redo"] = _settings.SmvmRedoHotkey,
+    };
 
     public void SetDirector(DirectorWindow director)
     {
@@ -193,11 +342,28 @@ public sealed class MainViewModel : ViewModelBase
         get => _directorHotkey;
         set
         {
-            if (!SetProperty(ref _directorHotkey, value ?? string.Empty))
+            var candidate = value?.Trim() ?? string.Empty;
+            if (!MvmInputBinding.TryParse(candidate, out var parsed) || parsed.Kind != InputBindingKind.Keyboard)
+            {
+                StatusMessage = $"{candidate} is not a valid keyboard Director hotkey.";
+                OnPropertyChanged(nameof(DirectorHotkey));
+                return;
+            }
+            candidate = parsed.ToString();
+            var conflict = GetSmvmBindings().FirstOrDefault(pair =>
+                MvmInputBinding.TryParse(pair.Value, out var binding) && binding == parsed);
+            if (!string.IsNullOrEmpty(conflict.Key))
+            {
+                StatusMessage = $"{candidate} is already assigned to {conflict.Key.Replace("Smvm", string.Empty).Replace("Hotkey", string.Empty)}.";
+                OnPropertyChanged(nameof(DirectorHotkey));
+                return;
+            }
+            if (!SetProperty(ref _directorHotkey, candidate))
                 return;
 
             _settings.DirectorHotkey = _directorHotkey;
             _settings.Save();
+            StatusMessage = $"Director hotkey set to {_directorHotkey}.";
         }
     }
 
@@ -451,7 +617,8 @@ public sealed class MainViewModel : ViewModelBase
                         ? $"Playback confirmed by engine: '{gamePath}.dem'"
                         : $"Playback NOT confirmed within timeout: '{gamePath}.dem'");
 
-                    if (confirmed && _director is not null)
+                    if (confirmed && _director is not null &&
+                        _settings.InterfaceMode is SmvmInterfaceMode.ExternalDirector or SmvmInterfaceMode.BothDeveloper)
                     {
                         System.Windows.Application.Current.Dispatcher.Invoke(() => _director.ToggleVisibility());
                     }

@@ -51,7 +51,21 @@ public static class NativeReplayModuleLoader
                 foreach (ProcessModule module in process.Modules)
                 {
                     if (string.Equals(module.ModuleName, RequiredDllName, StringComparison.OrdinalIgnoreCase))
-                        return new NativeModuleLoadResult(true, true, "Native replay camera is already loaded.");
+                    {
+                        var loadedPath = Path.GetFullPath(module.FileName);
+                        if (!string.Equals(loadedPath, fullPath, StringComparison.OrdinalIgnoreCase))
+                        {
+                            return new NativeModuleLoadResult(
+                                false,
+                                true,
+                                $"A native replay camera from a different path is already loaded: {loadedPath}. " +
+                                "Restart Deadlock before loading this build.");
+                        }
+                        return new NativeModuleLoadResult(
+                            true,
+                            true,
+                            "The validated native replay camera path is already loaded; protocol compatibility will be checked next.");
+                    }
                 }
             }
             catch (Win32Exception ex)

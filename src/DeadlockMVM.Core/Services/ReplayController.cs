@@ -33,6 +33,7 @@ public sealed class ReplayController : IReplayPlaybackState, IDisposable
     private string _host = "127.0.0.1";
     private int _port;
     private long _nextReconnectUtcTicks;
+    private long _lastDemoInfoRequestUtcTicks;
     private bool _userDisconnected;
     private string _readyMarker = string.Empty;
     private volatile bool _ready;
@@ -97,6 +98,7 @@ public sealed class ReplayController : IReplayPlaybackState, IDisposable
 
         // Ask the engine who we are; results are applied once ready.
         SafeSend(ReplayCommands.QueryDemoInfo);
+        Interlocked.Exchange(ref _lastDemoInfoRequestUtcTicks, DateTime.UtcNow.Ticks);
         StartPolling();
     }
 
@@ -188,6 +190,19 @@ public sealed class ReplayController : IReplayPlaybackState, IDisposable
             return;
 
         _sentCommandSinceLastOutput = true;
+
+        // VConsole can connect before +playdemo has finished loading. A one-shot
+        // demo_info at connect then has no server_start_tick, which used to leave
+        // the native backend unavailable for the entire otherwise healthy run.
+        // Retry only while calibration is absent, at a bounded cadence, and stop
+        // immediately once the engine supplies the real offset.
+        var now = DateTime.UtcNow.Ticks;
+        if (_ready && _parser.GameTickOffset is null &&
+            now - Interlocked.Read(ref _lastDemoInfoRequestUtcTicks) >= TimeSpan.FromSeconds(2).Ticks)
+        {
+            if (SafeSend(ReplayCommands.QueryDemoInfo))
+                Interlocked.Exchange(ref _lastDemoInfoRequestUtcTicks, now);
+        }
 
         // The response arrives asynchronously via OnOutputLine; stall detection
         // happens once the reply updates CurrentTick (see MergeEngineState).
