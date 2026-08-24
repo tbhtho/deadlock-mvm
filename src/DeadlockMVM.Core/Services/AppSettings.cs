@@ -24,25 +24,31 @@ public sealed class AppSettings : IAppSettings
         public string SmvmDeleteHotkey { get; set; } = "L";
         public string SmvmCleanViewHotkey { get; set; } = "F10";
         public string SmvmRestoreUiHotkey { get; set; } = "F9";
+        public string SmvmCycleUiHotkey { get; set; } = "F8";
+        public string SmvmToggleFreeCameraHotkey { get; set; } = "F2";
+        public string SmvmReplayPauseHotkey { get; set; } = "RightShift";
+        public string SmvmStepBackHotkey { get; set; } = "PageUp";
+        public string SmvmStepForwardHotkey { get; set; } = "PageDown";
         public bool SmvmCameraInputTakeover { get; set; } = true;
         public string SmvmForwardHotkey { get; set; } = "W";
         public string SmvmBackHotkey { get; set; } = "S";
         public string SmvmLeftHotkey { get; set; } = "A";
         public string SmvmRightHotkey { get; set; } = "D";
         public string SmvmUpHotkey { get; set; } = "Space";
-        public string SmvmDownHotkey { get; set; } = "VK11";
-        public string SmvmFastHotkey { get; set; } = "VK10";
-        public string SmvmPrecisionHotkey { get; set; } = "VK12";
+        public string SmvmDownHotkey { get; set; } = "LeftCtrl";
+        public string SmvmFastHotkey { get; set; } = "LeftShift";
+        public string SmvmPrecisionHotkey { get; set; } = "LeftAlt";
         public string SmvmRollLeftHotkey { get; set; } = "Q";
         public string SmvmRollRightHotkey { get; set; } = "E";
         public string SmvmRollResetHotkey { get; set; } = "R";
-        public string SmvmPlayStartHotkey { get; set; } = string.Empty;
-        public string SmvmPlayCurrentHotkey { get; set; } = string.Empty;
-        public string SmvmStopHotkey { get; set; } = string.Empty;
+        public string SmvmPlayStartHotkey { get; set; } = "F3";
+        public string SmvmPlayCurrentHotkey { get; set; } = "F5";
+        public string SmvmStopHotkey { get; set; } = "F4";
         public string SmvmUndoHotkey { get; set; } = "Ctrl+Z";
         public string SmvmRedoHotkey { get; set; } = "Ctrl+Y";
         public string SmvmShowPathHotkey { get; set; } = string.Empty;
         public string SmvmShowCamerasHotkey { get; set; } = string.Empty;
+        public string SmvmShowLabelsHotkey { get; set; } = string.Empty;
         public double SmvmMovementSpeed { get; set; } = 600;
         public double SmvmMovementBoost { get; set; } = 4;
         public double SmvmMovementPrecision { get; set; } = 0.2;
@@ -139,6 +145,36 @@ public sealed class AppSettings : IAppSettings
     {
         get => _document.SmvmRestoreUiHotkey;
         set => _document.SmvmRestoreUiHotkey = NormalizeSlotBinding(122, value, "F9");
+    }
+
+    public string SmvmCycleUiHotkey
+    {
+        get => _document.SmvmCycleUiHotkey;
+        set => _document.SmvmCycleUiHotkey = NormalizeSlotBinding(123, value, "F8");
+    }
+
+    public string SmvmToggleFreeCameraHotkey
+    {
+        get => _document.SmvmToggleFreeCameraHotkey;
+        set => _document.SmvmToggleFreeCameraHotkey = NormalizeSlotBinding(124, value, "F2");
+    }
+
+    public string SmvmReplayPauseHotkey
+    {
+        get => _document.SmvmReplayPauseHotkey;
+        set => _document.SmvmReplayPauseHotkey = NormalizeSlotBinding(125, value, "RightShift");
+    }
+
+    public string SmvmStepBackHotkey
+    {
+        get => _document.SmvmStepBackHotkey;
+        set => _document.SmvmStepBackHotkey = NormalizeSlotBinding(127, value, "PageUp");
+    }
+
+    public string SmvmStepForwardHotkey
+    {
+        get => _document.SmvmStepForwardHotkey;
+        set => _document.SmvmStepForwardHotkey = NormalizeSlotBinding(128, value, "PageDown");
     }
 
     public bool SmvmCameraInputTakeover
@@ -253,6 +289,12 @@ public sealed class AppSettings : IAppSettings
     {
         get => _document.SmvmShowCamerasHotkey;
         set => _document.SmvmShowCamerasHotkey = value?.Trim() ?? string.Empty;
+    }
+
+    public string SmvmShowLabelsHotkey
+    {
+        get => _document.SmvmShowLabelsHotkey;
+        set => _document.SmvmShowLabelsHotkey = value?.Trim() ?? string.Empty;
     }
 
     public double SmvmMovementSpeed
@@ -452,13 +494,22 @@ public sealed class AppSettings : IAppSettings
         _document.SmvmLeftHotkey = NormalizeSlotBinding(102, _document.SmvmLeftHotkey, "A");
         _document.SmvmRightHotkey = NormalizeSlotBinding(103, _document.SmvmRightHotkey, "D");
         _document.SmvmUpHotkey = NormalizeSlotBinding(104, _document.SmvmUpHotkey, "Space");
-        _document.SmvmDownHotkey = NormalizeSlotBinding(105, _document.SmvmDownHotkey, "VK11");
-        _document.SmvmFastHotkey = NormalizeSlotBinding(106, _document.SmvmFastHotkey, "VK10");
-        _document.SmvmPrecisionHotkey = NormalizeSlotBinding(107, _document.SmvmPrecisionHotkey, "VK12");
+        _document.SmvmDownHotkey = NormalizeSlotBinding(105, _document.SmvmDownHotkey, "LeftCtrl");
+        _document.SmvmFastHotkey = NormalizeSlotBinding(106, _document.SmvmFastHotkey, "LeftShift");
+        _document.SmvmPrecisionHotkey = NormalizeSlotBinding(107, _document.SmvmPrecisionHotkey, "LeftAlt");
         _document.SmvmRollLeftHotkey = NormalizeSlotBinding(108, _document.SmvmRollLeftHotkey, "Q");
         _document.SmvmRollRightHotkey = NormalizeSlotBinding(109, _document.SmvmRollRightHotkey, "E");
         _document.SmvmRollResetHotkey = NormalizeSlotBinding(110, _document.SmvmRollResetHotkey, "R");
         _document.SmvmRestoreUiHotkey = NormalizeSlotBinding(122, _document.SmvmRestoreUiHotkey, "F9");
+        _document.SmvmCycleUiHotkey = NormalizeSlotBinding(123, _document.SmvmCycleUiHotkey, "F8");
+        _document.SmvmToggleFreeCameraHotkey = NormalizeSlotBinding(
+            124, _document.SmvmToggleFreeCameraHotkey, "F2");
+        _document.SmvmReplayPauseHotkey = NormalizeSlotBinding(
+            125, _document.SmvmReplayPauseHotkey, "RightShift");
+        _document.SmvmStepBackHotkey = NormalizeSlotBinding(
+            127, _document.SmvmStepBackHotkey, "PageUp");
+        _document.SmvmStepForwardHotkey = NormalizeSlotBinding(
+            128, _document.SmvmStepForwardHotkey, "PageDown");
     }
 
     private static string NormalizeSlotBinding(int slot, string? value, string fallback)

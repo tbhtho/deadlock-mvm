@@ -188,7 +188,7 @@
                                 <TextBlock Grid.Row="2" Text="Delete keyframe" Style="{StaticResource SectionLabel}" />
                                 <TextBox Grid.Row="2" Grid.Column="1" Style="{StaticResource DarkTextBox}"
                                          Text="{Binding SmvmDeleteHotkey}" Margin="6,0,0,3" />
-                                <TextBlock Grid.Row="3" Text="Clean view" Style="{StaticResource SectionLabel}" />
+                                <TextBlock Grid.Row="3" Text="Clean footage" Style="{StaticResource SectionLabel}" />
                                 <TextBox Grid.Row="3" Grid.Column="1" Style="{StaticResource DarkTextBox}"
                                          Text="{Binding SmvmCleanViewHotkey}" Margin="6,0,0,3" />
                                 <TextBlock Grid.Row="4" Text="Roll left" Style="{StaticResource SectionLabel}" />

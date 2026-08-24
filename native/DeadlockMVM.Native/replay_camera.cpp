@@ -970,8 +970,12 @@ void WriteVector(const std::uintptr_t address, const float x, const float y, con
     }
     void* current_camera = nullptr;
     void** current_vtable = nullptr;
+    // SMVM Free Camera may acquire the authoritative rendered camera after an
+    // explicit managed Free Camera request even when Deadlock defers its
+    // spectator-mode byte while the replay is paused. Full overrides/Campaths
+    // retain their stricter engine Free Roam requirement above.
     if (!ResolveCamera(backend, current_camera, current_vtable) || current_camera != camera ||
-        current_vtable != backend.hooked_vtable.load(std::memory_order_acquire) || !IsObserverRoaming(backend)) {
+        current_vtable != backend.hooked_vtable.load(std::memory_order_acquire)) {
         RevokeCameraOwnership(backend, ErrorCode::observer_not_roaming);
         return false;
     }
@@ -1025,9 +1029,16 @@ void WriteVector(const std::uintptr_t address, const float x, const float y, con
 
     void* current_camera = nullptr;
     void** current_vtable = nullptr;
+    const auto manual_requested = backend.manual_camera_requested.load(std::memory_order_acquire);
     if (!ResolveCamera(backend, current_camera, current_vtable) || current_camera != camera ||
-        current_vtable != backend.hooked_vtable.load(std::memory_order_acquire) || !IsObserverRoaming(backend)) {
-        RevokeCameraOwnership(backend, ErrorCode::observer_not_roaming);
+        current_vtable != backend.hooked_vtable.load(std::memory_order_acquire) ||
+        (!manual_requested && !IsObserverRoaming(backend))) {
+        // Observation is read-only and may be armed while spec_goto is still
+        // settling after a replay seek. Keep the proof request alive until a
+        // strict roaming frame arrives; full/manual writes remain fail-closed.
+        backend.camera_observed.store(false, std::memory_order_release);
+        backend.camera_observed_milliseconds.store(0, std::memory_order_release);
+        backend.error.store(ErrorCode::observer_not_roaming, std::memory_order_release);
         return false;
     }
     return true;
@@ -1716,6 +1727,11 @@ void ResetConnectionGate(Backend& backend) noexcept {
                 if (hello_received && backend.replay_active.load(std::memory_order_acquire) &&
                     backend.free_roam.load(std::memory_order_acquire) &&
                     backend.game_tick_offset.load(std::memory_order_acquire) >= 0 && InstallHook(backend)) {
+                    // Every observation request is a new proof barrier. A stale
+                    // CameraObserved bit from the previous camera instance must
+                    // never authorize a post-seek Campath transfer.
+                    backend.camera_observed.store(false, std::memory_order_release);
+                    backend.camera_observed_milliseconds.store(0, std::memory_order_release);
                     backend.observation_requested.store(true, std::memory_order_release);
                     backend.error.store(ErrorCode::none, std::memory_order_release);
                 } else {

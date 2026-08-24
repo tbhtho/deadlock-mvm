@@ -153,8 +153,8 @@ void ProtocolTests() {
           "sample payload size is fixed");
     Check(ExpectedPayloadSize(MessageType::get_status) == 0, "status request has no payload");
     Check(sizeof(HeartbeatPayload) == 24, "heartbeat carries the replay clock calibration");
-    Check(sizeof(SmvmSnapshotPayload) == 688 && sizeof(StatusPayload) == 264,
-          "SMVM v8 snapshot and status layouts are fixed");
+    Check(sizeof(SmvmSnapshotPayload) == 712 && sizeof(StatusPayload) == 264,
+          "SMVM v9 snapshot and status layouts are fixed");
     Check(ExpectedPayloadSize(MessageType::set_roll_override) == sizeof(RollPayload),
           "roll override payload is one narrowly typed value");
     Check(ValidatePayloadSize(MessageType::prepare_camera_observation, 0),
@@ -172,7 +172,7 @@ void ProtocolTests() {
           "fixed SMVM snapshot payload is accepted");
 
     SmvmSnapshotPayload snapshot{};
-    snapshot.snapshot_version = 4;
+    snapshot.snapshot_version = 5;
     snapshot.current_tick = -1;
     snapshot.total_ticks = -1;
     snapshot.timescale = 1.0;

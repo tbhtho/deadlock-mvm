@@ -8,7 +8,7 @@
 namespace deadlock_mvm {
 
 constexpr std::uint32_t kProtocolMagic = 0x4D564D43; // "CMVM" little-endian
-constexpr std::uint16_t kProtocolVersion = 8;
+constexpr std::uint16_t kProtocolVersion = 9;
 constexpr std::size_t kMaxCampathKeyframes = 128;
 constexpr double kMinFov = 5.0;
 constexpr double kMaxFov = 170.0;
@@ -197,6 +197,8 @@ enum SmvmOverlayFlags : std::uint32_t {
     smvm_overlay_ready = 1u << 2,
     smvm_overlay_menu_open = 1u << 3,
     smvm_overlay_clean_view = 1u << 4,
+    smvm_overlay_manual_pointer_active = 1u << 5,
+    smvm_overlay_manual_mouse_observed = 1u << 6,
 };
 
 enum SmvmSnapshotFlags : std::uint32_t {
@@ -376,6 +378,8 @@ enum class SmvmActionType : std::uint32_t {
     set_replay_bar_scale = 66,
     set_replay_bar_opacity = 67,
     set_replay_bar_anchor = 68,
+    cycle_replay_interface = 69,
+    apply_movie_maker_defaults = 70,
 };
 
 #pragma pack(push, 1)
@@ -492,6 +496,12 @@ struct SmvmSnapshotPayload final {
     double replay_bar_scale;
     double replay_bar_opacity;
     SmvmReplayBarAnchor replay_bar_anchor;
+    std::uint32_t cycle_ui_key;
+    std::uint32_t toggle_free_camera_key;
+    std::uint32_t replay_pause_key;
+    std::uint32_t step_back_key;
+    std::uint32_t step_forward_key;
+    std::uint32_t reserved;
 };
 
 constexpr std::size_t kMaxCampathDocuments = 32;
@@ -547,7 +557,7 @@ static_assert(sizeof(CameraSample) == 56);
 static_assert(sizeof(RollPayload) == 8);
 static_assert(sizeof(CampathKeyframe) == 64);
 static_assert(sizeof(CampathPayloadHeader) == 16);
-static_assert(sizeof(SmvmSnapshotPayload) == 688);
+static_assert(sizeof(SmvmSnapshotPayload) == 712);
 static_assert(sizeof(SmvmActionPayload) == 144);
 static_assert(sizeof(StatusPayload) == 264);
 static_assert(sizeof(CampathDocumentEntry) == 144);
@@ -647,7 +657,7 @@ constexpr std::size_t kMaxMessageBytes =
     constexpr auto known_ui_capabilities = deadlock_ui_capability_hide_panorama |
         deadlock_ui_capability_restore_panorama | deadlock_ui_capability_smvm_replay_ui |
         deadlock_ui_capability_clean_footage;
-    if (snapshot.snapshot_version != 4 || (snapshot.flags & ~known_flags) != 0 ||
+    if (snapshot.snapshot_version != 5 || (snapshot.flags & ~known_flags) != 0 ||
         (snapshot.capabilities & ~known_capabilities) != 0 ||
         snapshot.deadlock_ui_mode > DeadlockUiMode::death_notices_only ||
         snapshot.deadlock_ui_error > DeadlockUiError::restore_failed ||
@@ -666,6 +676,11 @@ constexpr std::size_t kMaxMessageBytes =
         !ValidateSmvmInput(snapshot.menu_key) || !ValidateSmvmInput(snapshot.add_key) ||
         !ValidateSmvmInput(snapshot.delete_key) || !ValidateSmvmInput(snapshot.clean_view_key) ||
         !ValidateSmvmKeyboardInput(snapshot.restore_ui_key) ||
+        !ValidateSmvmKeyboardInput(snapshot.cycle_ui_key) ||
+        !ValidateSmvmKeyboardInput(snapshot.toggle_free_camera_key) ||
+        !ValidateSmvmKeyboardInput(snapshot.replay_pause_key) ||
+        !ValidateSmvmKeyboardInput(snapshot.step_back_key) ||
+        !ValidateSmvmKeyboardInput(snapshot.step_forward_key) ||
         !ValidateSmvmKeyboardInput(snapshot.roll_left_key) ||
         !ValidateSmvmKeyboardInput(snapshot.roll_right_key) ||
         !ValidateSmvmKeyboardInput(snapshot.roll_reset_key) ||

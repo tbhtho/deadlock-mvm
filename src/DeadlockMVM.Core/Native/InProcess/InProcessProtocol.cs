@@ -84,6 +84,8 @@ public enum SmvmOverlayFlags : uint
     Ready = 1 << 2,
     MenuOpen = 1 << 3,
     CleanView = 1 << 4,
+    ManualPointerActive = 1 << 5,
+    ManualMouseObserved = 1 << 6,
 }
 
 [Flags]
@@ -222,7 +224,7 @@ public static class SmvmInputCode
     public const uint WheelDown = 0x1005;
 
     public static bool IsBindingAllowedForSlot(int slot, InputBinding binding) =>
-        slot is >= 100 and <= 122 && binding.IsValid && Encode(binding) != None &&
+        slot is >= 100 and <= 128 && binding.IsValid && Encode(binding) != None &&
         (slot is >= 111 and <= 121 || binding.Kind == InputBindingKind.Keyboard);
 
     public static uint Encode(InputBinding binding)
@@ -357,6 +359,8 @@ public enum SmvmActionType : uint
     SetReplayBarScale = 66,
     SetReplayBarOpacity = 67,
     SetReplayBarAnchor = 68,
+    CycleReplayInterface = 69,
+    ApplyMovieMakerDefaults = 70,
 }
 
 public sealed record SmvmAction(
@@ -434,7 +438,12 @@ public sealed record SmvmSnapshot(
     int VConsolePort,
     double ReplayBarScale,
     double ReplayBarOpacity,
-    SmvmReplayBarAnchor ReplayBarAnchor);
+    SmvmReplayBarAnchor ReplayBarAnchor,
+    uint CycleUiKey,
+    uint ToggleFreeCameraKey,
+    uint ReplayPauseKey,
+    uint StepBackKey,
+    uint StepForwardKey);
 
 [Flags]
 public enum InProcessStatusFlags : uint
@@ -484,10 +493,10 @@ public sealed record InProcessCameraStatus(
 internal static class InProcessProtocol
 {
     public const uint Magic = 0x4D564D43;
-    public const ushort Version = 8;
+    public const ushort Version = 9;
     public const int HeaderSize = 20;
     public const int StatusSize = 264;
-    public const int SmvmSnapshotSize = 688;
+    public const int SmvmSnapshotSize = 712;
     public const int CameraSampleSize = 56;
     public const int CampathKeyframeSize = 64;
     public const int CampathHeaderSize = 16;
@@ -623,7 +632,7 @@ internal static class InProcessProtocol
     {
         ArgumentNullException.ThrowIfNull(snapshot);
         var payload = new byte[SmvmSnapshotSize];
-        BinaryPrimitives.WriteUInt32LittleEndian(payload, 4);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload, 5);
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(4), (uint)snapshot.Flags);
         BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(8), snapshot.CurrentTick);
         BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(16), snapshot.TotalTicks);
@@ -695,6 +704,11 @@ internal static class InProcessProtocol
         WriteDouble(payload, 668, snapshot.ReplayBarScale);
         WriteDouble(payload, 676, snapshot.ReplayBarOpacity);
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(684), (uint)snapshot.ReplayBarAnchor);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(688), snapshot.CycleUiKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(692), snapshot.ToggleFreeCameraKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(696), snapshot.ReplayPauseKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(700), snapshot.StepBackKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(704), snapshot.StepForwardKey);
         return payload;
     }
 
@@ -753,7 +767,8 @@ internal static class InProcessProtocol
             InProcessStatusFlags.ManualCameraRequested | InProcessStatusFlags.ManualCameraActive;
         const SmvmOverlayFlags knownOverlayFlags =
             SmvmOverlayFlags.HookInstalled | SmvmOverlayFlags.PresentObserved |
-            SmvmOverlayFlags.Ready | SmvmOverlayFlags.MenuOpen | SmvmOverlayFlags.CleanView;
+            SmvmOverlayFlags.Ready | SmvmOverlayFlags.MenuOpen | SmvmOverlayFlags.CleanView |
+            SmvmOverlayFlags.ManualPointerActive | SmvmOverlayFlags.ManualMouseObserved;
         if (!Enum.IsDefined(state) || !Enum.IsDefined(error) || (flags & ~knownStatusFlags) != 0 ||
             !Enum.IsDefined(rendererBackend) || !Enum.IsDefined(rendererError) ||
             (overlayFlags & ~knownOverlayFlags) != 0)

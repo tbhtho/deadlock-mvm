@@ -1,7 +1,7 @@
 namespace DeadlockMVM.Core.Native.InProcess;
 
 /// <summary>
-/// Computes the camera/editor capability bitmask published in the protocol-v8 snapshot.
+/// Computes the camera/editor capability bitmask published in the current SMVM snapshot.
 /// Kept in Core (pure function) so capability gating is unit-testable; the
 /// launcher host coordinator only supplies the live inputs.
 /// </summary>

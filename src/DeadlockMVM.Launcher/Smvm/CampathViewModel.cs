@@ -224,7 +224,7 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         Status = rejection switch
         {
             SmvmCaptureRejection.ReplayUnavailable => "Keyframe capture rejected: replay playback is unavailable.",
-            SmvmCaptureRejection.NotInFreeRoam => "Keyframe capture rejected: switch to Free Camera and reacquire Manual Camera.",
+            SmvmCaptureRejection.NotInFreeRoam => "Keyframe capture rejected: enter SMVM Free Camera again.",
             SmvmCaptureRejection.CameraUnreadable => "Keyframe capture rejected: the rendered camera is not readable.",
             SmvmCaptureRejection.NativeBackendUnavailable => "Keyframe capture rejected: the native camera backend is unavailable.",
             SmvmCaptureRejection.CampathOwnsCamera => "Keyframe capture rejected: stop Campath playback first.",
@@ -290,9 +290,9 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         SelectedKeyframe = keyframe;
         Status = !replaced
             ? startedDraft
-                ? $"Draft created — keyframe 1 added at tick {keyframe.DemoTick}."
-                : $"Keyframe {Keyframes.IndexOf(keyframe) + 1} added at tick {keyframe.DemoTick}."
-            : $"Keyframe at tick {keyframe.DemoTick} updated.";
+                ? $"Draft created — Keyframe added — Tick {keyframe.DemoTick}"
+                : $"Keyframe added — Tick {keyframe.DemoTick}"
+            : $"Keyframe updated — Tick {keyframe.DemoTick}";
         _log.Info($"Campath: {Status}{(fromHotkey ? " (hotkey)" : string.Empty)}");
         OnCollectionChanged();
         Autosave();

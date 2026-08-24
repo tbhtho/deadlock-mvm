@@ -43,7 +43,7 @@ public sealed class DeadlockUiController
             _replay.SendRaw(mode == DeadlockUiMode.DeadlockUi
                 ? RestorePanoramaCommand
                 : HidePanoramaCommand);
-            SetState(mode, DeadlockUiError.None, string.Empty);
+            SetMode(mode, DeadlockUiError.None, string.Empty);
             _log.Info($"Deadlock UI mode applied: {mode}.");
             return true;
         }
@@ -53,6 +53,18 @@ public sealed class DeadlockUiController
                 TryRestoreAfterFailure();
             return Fail(DeadlockUiError.ApplyFailed, $"Could not apply {mode}: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Leaves Clean Footage without guessing which visible interface the editor
+    /// was using before it was hidden.
+    /// </summary>
+    public bool RestorePreviousVisibleMode(bool replayActive)
+    {
+        var state = State;
+        if (state.Mode != DeadlockUiMode.CleanFootage)
+            return true;
+        return Apply(NormalizeVisibleMode(state.PreviousVisibleMode), replayActive);
     }
 
     public bool Restore(bool force = false)
@@ -65,7 +77,11 @@ public sealed class DeadlockUiController
         try
         {
             _replay.SendRaw(RestorePanoramaCommand);
-            SetState(DeadlockUiMode.DeadlockUi, DeadlockUiError.None, string.Empty);
+            SetState(
+                DeadlockUiMode.DeadlockUi,
+                DeadlockUiMode.DeadlockUi,
+                DeadlockUiError.None,
+                string.Empty);
             _log.Info("Deadlock UI restored.");
             return true;
         }
@@ -91,16 +107,43 @@ public sealed class DeadlockUiController
     private bool Fail(DeadlockUiError error, string detail)
     {
         var current = State;
-        SetState(current.Mode, error, detail);
+        SetState(current.Mode, current.PreviousVisibleMode, error, detail);
         _log.Warn($"Deadlock UI: {detail}");
         return false;
     }
 
-    private void SetState(DeadlockUiMode mode, DeadlockUiError error, string detail)
+    private void SetMode(DeadlockUiMode mode, DeadlockUiError error, string detail)
     {
         lock (_gate)
-            _state = new DeadlockUiState(mode, Capabilities, error, detail);
+        {
+            var previousVisible = mode == DeadlockUiMode.CleanFootage
+                ? NormalizeVisibleMode(_state.Mode == DeadlockUiMode.CleanFootage
+                    ? _state.PreviousVisibleMode
+                    : _state.Mode)
+                : NormalizeVisibleMode(mode);
+            _state = new DeadlockUiState(mode, previousVisible, Capabilities, error, detail);
+        }
     }
+
+    private void SetState(
+        DeadlockUiMode mode,
+        DeadlockUiMode previousVisibleMode,
+        DeadlockUiError error,
+        string detail)
+    {
+        lock (_gate)
+            _state = new DeadlockUiState(
+                mode,
+                NormalizeVisibleMode(previousVisibleMode),
+                Capabilities,
+                error,
+                detail);
+    }
+
+    private static DeadlockUiMode NormalizeVisibleMode(DeadlockUiMode mode) =>
+        mode is DeadlockUiMode.DeadlockUi or DeadlockUiMode.SmvmReplayUi
+            ? mode
+            : DeadlockUiMode.DeadlockUi;
 
     public static DeadlockUiCapabilities Capabilities =>
         DeadlockUiCapabilities.HidePanorama |
@@ -111,11 +154,13 @@ public sealed class DeadlockUiController
 
 public sealed record DeadlockUiState(
     DeadlockUiMode Mode,
+    DeadlockUiMode PreviousVisibleMode,
     DeadlockUiCapabilities Capabilities,
     DeadlockUiError Error,
     string Detail)
 {
     public static DeadlockUiState Default { get; } = new(
+        DeadlockUiMode.DeadlockUi,
         DeadlockUiMode.DeadlockUi,
         DeadlockUiController.Capabilities,
         DeadlockUiError.None,

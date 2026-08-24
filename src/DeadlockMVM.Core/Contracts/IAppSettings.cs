@@ -29,6 +29,11 @@ public interface IAppSettings
     string SmvmDeleteHotkey { get; set; }
     string SmvmCleanViewHotkey { get; set; }
     string SmvmRestoreUiHotkey { get; set; }
+    string SmvmCycleUiHotkey { get; set; }
+    string SmvmToggleFreeCameraHotkey { get; set; }
+    string SmvmReplayPauseHotkey { get; set; }
+    string SmvmStepBackHotkey { get; set; }
+    string SmvmStepForwardHotkey { get; set; }
     bool SmvmCameraInputTakeover { get; set; }
     string SmvmForwardHotkey { get; set; }
     string SmvmBackHotkey { get; set; }
@@ -48,6 +53,7 @@ public interface IAppSettings
     string SmvmRedoHotkey { get; set; }
     string SmvmShowPathHotkey { get; set; }
     string SmvmShowCamerasHotkey { get; set; }
+    string SmvmShowLabelsHotkey { get; set; }
     double SmvmMovementSpeed { get; set; }
     double SmvmMovementBoost { get; set; }
     double SmvmMovementPrecision { get; set; }

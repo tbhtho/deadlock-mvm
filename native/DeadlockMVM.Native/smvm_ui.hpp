@@ -24,6 +24,7 @@ enum class SmvmPage : std::uint32_t {
 
 enum class SmvmSettingsSection : std::uint32_t {
     camera,
+    replay,
     campath,
     interface_settings,
     storage,
@@ -34,7 +35,7 @@ enum class SmvmSettingsSection : std::uint32_t {
 // Shared with the overlay-side capture state machine.
 inline constexpr std::int32_t kSmvmFirstManualBindingAction = 100;
 inline constexpr std::int32_t kSmvmFirstEditorBindingAction = 111;
-inline constexpr std::int32_t kSmvmLastBindingAction = 122;
+inline constexpr std::int32_t kSmvmLastBindingAction = 128;
 
 inline constexpr std::size_t kSmvmMaxToasts = 3;
 inline constexpr std::uint64_t kSmvmToastDurationMs = 2500;
@@ -79,6 +80,8 @@ struct SmvmUiState final {
     bool documents_valid{};
     std::int64_t replay_scrub_tick{};
     bool replay_scrubbing{};
+    bool clean_hint_pending{};
+    std::uint64_t clean_hint_until_ms{};
 };
 
 struct SmvmUiFrameParams final {

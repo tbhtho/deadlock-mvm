@@ -256,7 +256,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
             ParseBinding(_settings.SmvmRedoHotkey, "Ctrl+Y"),
             ParseBinding(_settings.SmvmShowPathHotkey, string.Empty),
             ParseBinding(_settings.SmvmShowCamerasHotkey, string.Empty),
-            SmvmInputCode.None,
+            ParseBinding(_settings.SmvmShowLabelsHotkey, string.Empty),
             _settings.SmvmMovementSpeed,
             _settings.SmvmMovementBoost,
             _settings.SmvmMovementPrecision,
@@ -283,7 +283,12 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
             _settings.VConsolePort,
             _settings.SmvmReplayBarScale,
             _settings.SmvmReplayBarOpacity,
-            _settings.SmvmReplayBarAnchor);
+            _settings.SmvmReplayBarAnchor,
+            SmvmInputCode.ParseForSlotOrDefault(123, _settings.SmvmCycleUiHotkey, "F8"),
+            SmvmInputCode.ParseForSlotOrDefault(124, _settings.SmvmToggleFreeCameraHotkey, "F2"),
+            SmvmInputCode.ParseForSlotOrDefault(125, _settings.SmvmReplayPauseHotkey, "RightShift"),
+            SmvmInputCode.ParseForSlotOrDefault(127, _settings.SmvmStepBackHotkey, string.Empty),
+            SmvmInputCode.ParseForSlotOrDefault(128, _settings.SmvmStepForwardHotkey, string.Empty));
     }
 
     private CameraOwnership ResolveCameraOwnership(bool replayActive, InProcessCameraStatus? native)
@@ -494,6 +499,16 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                 _settings.Save();
                 _deadlockUi.Restore(force: true);
                 break;
+            case SmvmActionType.CycleReplayInterface:
+            {
+                var current = _deadlockUi.State.Mode == DeadlockUiMode.CleanFootage
+                    ? _deadlockUi.State.PreviousVisibleMode
+                    : _deadlockUi.State.Mode;
+                ApplyDeadlockUiMode(current == DeadlockUiMode.DeadlockUi
+                    ? DeadlockUiMode.SmvmReplayUi
+                    : DeadlockUiMode.DeadlockUi);
+                break;
+            }
             case SmvmActionType.SetReplayBarScale:
                 _settings.SmvmReplayBarScale = action.Value;
                 _settings.Save();
@@ -738,6 +753,10 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                 ResetSmvmBindings();
                 _settings.Save();
                 break;
+            case SmvmActionType.ApplyMovieMakerDefaults:
+                ApplyMovieMakerDefaults();
+                _settings.Save();
+                break;
             case SmvmActionType.ToggleMinimalPill:
                 _settings.SmvmShowMinimalPill = !_settings.SmvmShowMinimalPill;
                 _settings.Save();
@@ -763,7 +782,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                 break;
             case SmvmActionType.ReacquireCamera:
                 if (_native.CampathPlaying)
-                    throw new InvalidOperationException("Stop Campath before reacquiring the manual camera.");
+                    throw new InvalidOperationException("Stop Campath before reacquiring SMVM Free Camera.");
                 if (_native.ManualCameraDesired || _native.ManualCameraActive)
                     await _native.DisableManualCameraAsync(_stop.Token).ConfigureAwait(true);
                 await _camera.EnterFreeRoamAsync(_stop.Token).ConfigureAwait(true);
@@ -854,34 +873,83 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
 
     private void ResetSmvmBindings()
     {
-        _settings.SmvmMenuHotkey = "Tab";
-        _settings.SmvmAddHotkey = "Mouse3";
-        _settings.SmvmDeleteHotkey = "L";
-        _settings.SmvmCleanViewHotkey = "F10";
-        _settings.SmvmRestoreUiHotkey = "F9";
-        _settings.SmvmForwardHotkey = "W";
-        _settings.SmvmBackHotkey = "S";
-        _settings.SmvmLeftHotkey = "A";
-        _settings.SmvmRightHotkey = "D";
-        _settings.SmvmUpHotkey = "Space";
-        _settings.SmvmDownHotkey = "VK11";
-        _settings.SmvmFastHotkey = "VK10";
-        _settings.SmvmPrecisionHotkey = "VK12";
-        _settings.SmvmRollLeftHotkey = "Q";
-        _settings.SmvmRollRightHotkey = "E";
-        _settings.SmvmRollResetHotkey = "R";
-        _settings.SmvmPlayStartHotkey = string.Empty;
-        _settings.SmvmPlayCurrentHotkey = string.Empty;
-        _settings.SmvmStopHotkey = string.Empty;
-        _settings.SmvmUndoHotkey = "Ctrl+Z";
-        _settings.SmvmRedoHotkey = "Ctrl+Y";
-        _settings.SmvmShowPathHotkey = string.Empty;
-        _settings.SmvmShowCamerasHotkey = string.Empty;
+        ApplyBindingPreset([
+            (111, "Tab"), (112, "Mouse3"), (113, "L"), (114, "F10"), (122, "F9"),
+            (123, "F8"), (124, "F2"), (125, "RightShift"),
+            (100, "W"), (101, "S"), (102, "A"), (103, "D"), (104, "Space"),
+            (105, "LeftCtrl"), (106, "LeftShift"), (107, "LeftAlt"),
+            (108, "Q"), (109, "E"), (110, "R"),
+            (115, "F3"), (116, "F5"), (117, "F4"), (118, "Ctrl+Z"), (119, "Ctrl+Y"),
+            (120, string.Empty), (121, string.Empty), (126, string.Empty),
+            (127, "PageUp"), (128, "PageDown")
+        ], "Canonical defaults");
     }
+
+    private void ApplyMovieMakerDefaults()
+    {
+        ApplyBindingPreset([
+            (111, "Tab"), (112, "Mouse3"), (113, "L"), (114, "F10"), (122, "F9"),
+            (123, "F8"), (124, "F2"), (125, "RightShift"),
+            (100, "W"), (101, "S"), (102, "A"), (103, "D"), (104, "Space"),
+            (105, "LeftCtrl"), (106, "LeftShift"), (107, "LeftAlt"),
+            (108, "Q"), (109, "E"), (110, "R"),
+            (115, "F3"), (116, string.Empty), (117, "F4"),
+            (118, "Ctrl+Z"), (119, "Ctrl+Y"),
+            (120, string.Empty), (121, string.Empty), (126, string.Empty),
+            (127, string.Empty), (128, string.Empty)
+        ], "Movie Maker defaults");
+    }
+
+    private void ApplyBindingPreset((int Slot, string Binding)[] preset, string name)
+    {
+        var parsed = new List<(int Slot, InputBinding Binding)>();
+        foreach (var item in preset)
+        {
+            if (string.IsNullOrEmpty(item.Binding))
+                continue;
+            if (!InputBinding.TryParse(item.Binding, out var binding) ||
+                !SmvmInputCode.IsBindingAllowedForSlot(item.Slot, binding))
+            {
+                _log.Warn($"SMVM {name} rejected: invalid binding {item.Binding} for " +
+                          $"{DescribeSmvmBinding(item.Slot)}.");
+                return;
+            }
+            foreach (var other in parsed)
+            {
+                if (!BindingsConflict(other.Binding, binding))
+                    continue;
+                _log.Warn($"SMVM {name} rejected: {item.Binding} conflicts with " +
+                          $"{DescribeSmvmBinding(other.Slot)}.");
+                return;
+            }
+            parsed.Add((item.Slot, binding));
+        }
+
+        foreach (var item in preset)
+            AssignSmvmBinding(item.Slot, item.Binding);
+        _log.Info($"SMVM {name} applied after conflict check ({parsed.Count} active bindings).");
+    }
+
+    private static bool BindingsConflict(InputBinding left, InputBinding right)
+    {
+        if (left.Kind != right.Kind || left.Modifiers != right.Modifiers)
+            return false;
+        if (left.Code == right.Code)
+            return true;
+        if (left.Kind != InputBindingKind.Keyboard)
+            return false;
+        return IsModifierFamily(left.Code, right.Code, 0x10, 0xA0, 0xA1) ||
+               IsModifierFamily(left.Code, right.Code, 0x11, 0xA2, 0xA3) ||
+               IsModifierFamily(left.Code, right.Code, 0x12, 0xA4, 0xA5);
+    }
+
+    private static bool IsModifierFamily(uint left, uint right, uint generic, uint leftKey, uint rightKey) =>
+        (left == generic && (right == leftKey || right == rightKey)) ||
+        (right == generic && (left == leftKey || left == rightKey));
 
     private void SetSmvmBinding(int index, double rawValue)
     {
-        if (index is < 100 or > 122)
+        if (index is < 100 or > 128)
         {
             _log.Warn($"SMVM binding rejected: unsupported slot {index}.");
             return;
@@ -909,11 +977,11 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         }
 
         var canonical = binding.ToString();
-        foreach (var otherIndex in Enumerable.Range(100, 23))
+        foreach (var otherIndex in Enumerable.Range(100, 29))
         {
             if (otherIndex == index ||
                 !InputBinding.TryParse(ReadSmvmBinding(otherIndex), out var existing) ||
-                existing != binding)
+                !BindingsConflict(existing, binding))
                 continue;
 
             _log.Warn($"SMVM binding rejected: {canonical} is assigned to {DescribeSmvmBinding(otherIndex)}.");
@@ -950,6 +1018,12 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         120 => _settings.SmvmShowPathHotkey,
         121 => _settings.SmvmShowCamerasHotkey,
         122 => _settings.SmvmRestoreUiHotkey,
+        123 => _settings.SmvmCycleUiHotkey,
+        124 => _settings.SmvmToggleFreeCameraHotkey,
+        125 => _settings.SmvmReplayPauseHotkey,
+        126 => _settings.SmvmShowLabelsHotkey,
+        127 => _settings.SmvmStepBackHotkey,
+        128 => _settings.SmvmStepForwardHotkey,
         _ => string.Empty,
     };
 
@@ -980,6 +1054,12 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
             case 120: _settings.SmvmShowPathHotkey = value; break;
             case 121: _settings.SmvmShowCamerasHotkey = value; break;
             case 122: _settings.SmvmRestoreUiHotkey = value; break;
+            case 123: _settings.SmvmCycleUiHotkey = value; break;
+            case 124: _settings.SmvmToggleFreeCameraHotkey = value; break;
+            case 125: _settings.SmvmReplayPauseHotkey = value; break;
+            case 126: _settings.SmvmShowLabelsHotkey = value; break;
+            case 127: _settings.SmvmStepBackHotkey = value; break;
+            case 128: _settings.SmvmStepForwardHotkey = value; break;
         }
     }
 
@@ -999,7 +1079,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         111 => "Menu",
         112 => "Add Keyframe",
         113 => "Delete Keyframe",
-        114 => "Clean View",
+        114 => "Clean Footage",
         115 => "Play From Start",
         116 => "Play From Current",
         117 => "Stop",
@@ -1008,6 +1088,12 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         120 => "Show Path",
         121 => "Show Cameras",
         122 => "Restore Deadlock UI",
+        123 => "Cycle Replay Interface",
+        124 => "Toggle Free Camera",
+        125 => "Replay Play/Pause",
+        126 => "Show Labels",
+        127 => "Replay Step Back",
+        128 => "Replay Step Forward",
         _ => $"Slot {index}",
     };
 
