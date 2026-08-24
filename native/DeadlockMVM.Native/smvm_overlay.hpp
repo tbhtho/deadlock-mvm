@@ -35,8 +35,8 @@ struct SmvmOverlayCallbacks final {
 };
 
 struct SmvmManualInputFrame final {
-    double mouse_delta_x{};
-    double mouse_delta_y{};
+    double look_right{};
+    double look_up{};
     double wheel_steps{};
     bool forward{};
     bool backward{};
@@ -60,5 +60,8 @@ bool StopSmvmOverlay() noexcept;
     const SmvmSnapshotPayload& snapshot,
     SmvmManualInputFrame& frame) noexcept;
 void ResetSmvmManualInput() noexcept;
+// Re-runs only the Free Camera pointer acquisition path. Camera transform,
+// FOV, Roll, and camera ownership remain untouched.
+void SmvmReacquireFreeCameraInput() noexcept;
 
 } // namespace deadlock_mvm

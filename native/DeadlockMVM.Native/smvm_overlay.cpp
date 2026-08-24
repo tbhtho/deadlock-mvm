@@ -1,5 +1,6 @@
 #include "smvm_overlay.hpp"
 
+#include "free_camera_input.hpp"
 #include "render_camera_policy.hpp"
 #include "manual_mouse_fallback.hpp"
 #include "smvm_input_route.hpp"
@@ -92,6 +93,28 @@ enum class SmvmPointerAction : std::uint16_t {
     x2_click = 5,
     wheel = 6,
     validate = 7,
+};
+
+enum class ManualInputFailure : std::uint32_t {
+    none = 0,
+    invalid_window_thread = 1,
+    sdl_api_unavailable = 2,
+    sdl_window_unavailable = 3,
+    menu_or_foreground = 4,
+    sdl_enable_failed = 5,
+    sdl_verify_failed = 6,
+    raw_registration_missing = 7,
+    readiness_incomplete = 8,
+    camera_snapshot_not_ready = 9,
+    menu_restore_failed = 10,
+};
+
+enum class RawMouseRegistrationDisposition : std::uint32_t {
+    query_failed = 0,
+    none = 1,
+    null_target = 2,
+    exact_window = 3,
+    other_window = 4,
 };
 
 // UI input event kinds queued from the window thread for ImGui.
@@ -236,16 +259,30 @@ struct OverlayState final {
     std::atomic<bool> resize_hook_reachable{false};
     std::atomic<std::int32_t> mouse_x{0};
     std::atomic<std::int32_t> mouse_y{0};
-    std::atomic<std::int64_t> manual_mouse_delta_x{0};
-    std::atomic<std::int64_t> manual_mouse_delta_y{0};
+    std::atomic<std::int64_t> manual_look_right_delta{0};
+    std::atomic<std::int64_t> manual_look_up_delta{0};
     std::atomic<std::int32_t> manual_wheel_delta{0};
     std::atomic<bool> manual_pointer_requested{false};
     std::atomic<bool> manual_pointer_active{false};
     std::atomic<bool> manual_mouse_observed{false};
     std::atomic<std::uint64_t> manual_raw_mouse_observed_ms{0};
+    std::atomic<std::uint64_t> manual_fallback_mouse_observed_ms{0};
+    std::atomic<bool> manual_fallback_mouse_observed{false};
     std::atomic<bool> manual_legacy_mouse_seeded{false};
+    std::atomic<bool> manual_discard_next_legacy_sample{true};
+    std::atomic<std::uint64_t> manual_fallback_settle_until_ms{0};
     std::atomic<std::int32_t> manual_legacy_mouse_x{0};
     std::atomic<std::int32_t> manual_legacy_mouse_y{0};
+    std::atomic<bool> manual_keyboard_ready{false};
+    std::atomic<bool> manual_relative_mouse_ready{false};
+    std::atomic<bool> manual_raw_input_ready{false};
+    std::atomic<bool> manual_cursor_ready{false};
+    std::atomic<bool> manual_foreground_ready{false};
+    std::atomic<bool> manual_window_procedure_ready{false};
+    std::atomic<bool> manual_engine_input_ready{false};
+    std::atomic<bool> manual_input_error{false};
+    std::atomic<std::uint32_t> manual_input_failure{0};
+    std::atomic<std::uint32_t> manual_raw_registration_disposition{0};
     std::array<std::atomic<std::uint8_t>, 256> key_down{};
     std::array<std::atomic<std::uint8_t>, 256> manual_key_routes{};
     std::array<std::atomic<std::uint8_t>, 256> menu_key_routes{};
@@ -368,6 +405,30 @@ constexpr auto kPathLine = Color(0xD2, 0xA4, 0x53, 150);
 constexpr auto kSelectedMarker = Color(0xD2, 0xA4, 0x53, 255);
 constexpr auto kMarker = Color(0x9A, 0x93, 0x8A, 200);
 
+[[nodiscard]] std::uint32_t ManualInputOverlayFlags() noexcept {
+    const auto& state = g_overlay;
+    std::uint32_t flags = 0;
+    if (state.manual_pointer_requested.load(std::memory_order_acquire))
+        flags |= smvm_overlay_manual_pointer_requested;
+    if (state.manual_keyboard_ready.load(std::memory_order_acquire))
+        flags |= smvm_overlay_keyboard_ready;
+    if (state.manual_relative_mouse_ready.load(std::memory_order_acquire))
+        flags |= smvm_overlay_relative_mouse_ready;
+    if (state.manual_raw_input_ready.load(std::memory_order_acquire))
+        flags |= smvm_overlay_raw_input_ready;
+    if (state.manual_cursor_ready.load(std::memory_order_acquire))
+        flags |= smvm_overlay_cursor_ready;
+    if (state.manual_foreground_ready.load(std::memory_order_acquire))
+        flags |= smvm_overlay_foreground_ready;
+    if (state.manual_window_procedure_ready.load(std::memory_order_acquire))
+        flags |= smvm_overlay_window_procedure_ready;
+    if (state.manual_engine_input_ready.load(std::memory_order_acquire))
+        flags |= smvm_overlay_engine_input_ready;
+    if (state.manual_fallback_mouse_observed.load(std::memory_order_acquire))
+        flags |= smvm_overlay_fallback_mouse_observed;
+    return flags;
+}
+
 void PublishStatus(
     const SmvmRendererBackend backend,
     const SmvmRendererError error,
@@ -383,6 +444,7 @@ void PublishStatus(
         flags |= smvm_overlay_manual_pointer_active;
     if (state.manual_mouse_observed.load(std::memory_order_acquire))
         flags |= smvm_overlay_manual_mouse_observed;
+    flags |= ManualInputOverlayFlags();
     if (frame_microseconds > 0)
         state.frame_microseconds.store(frame_microseconds, std::memory_order_release);
     state.last_renderer_error.store(static_cast<std::uint32_t>(error), std::memory_order_release);
@@ -453,6 +515,8 @@ void PublishStatus(
 }
 
 void SetMenuOpen(bool open) noexcept;
+[[nodiscard]] bool CanUseManualCamera(const SmvmSnapshotPayload& snapshot) noexcept;
+[[nodiscard]] bool CanConsumeManualCameraInput(const SmvmSnapshotPayload& snapshot) noexcept;
 void EmergencyRestoreDeadlockUi() noexcept;
 
 [[nodiscard]] DeadlockUiMode PreviousVisibleMode() noexcept {
@@ -840,6 +904,7 @@ void AddLine(
         flags |= smvm_overlay_manual_pointer_active;
     if (g_overlay.manual_mouse_observed.load(std::memory_order_acquire))
         flags |= smvm_overlay_manual_mouse_observed;
+    flags |= ManualInputOverlayFlags();
     return flags;
 }
 
@@ -1464,20 +1529,118 @@ struct SdlMouseApi final {
     return true;
 }
 
+[[nodiscard]] RawMouseRegistrationDisposition RawMouseRegistrationForWindow(
+    const HWND window) noexcept {
+    std::array<RAWINPUTDEVICE, kMaxRegisteredRawInputDevices> registrations{};
+    UINT count = 0;
+    if (!ReadRegisteredRawInputDevices(registrations, count))
+        return RawMouseRegistrationDisposition::query_failed;
+    auto disposition = RawMouseRegistrationDisposition::none;
+    for (UINT index = 0; index < count; ++index) {
+        const auto& registration = registrations[index];
+        if (!IsRawMouseRegistration(registration))
+            continue;
+        if (registration.hwndTarget == nullptr)
+            return RawMouseRegistrationDisposition::null_target;
+        if (registration.hwndTarget == window)
+            return RawMouseRegistrationDisposition::exact_window;
+        disposition = RawMouseRegistrationDisposition::other_window;
+    }
+    return disposition;
+}
+
+void ClearManualMouseReadiness() noexcept {
+    auto& state = g_overlay;
+    state.manual_pointer_active.store(false, std::memory_order_release);
+    state.manual_relative_mouse_ready.store(false, std::memory_order_release);
+    state.manual_raw_input_ready.store(false, std::memory_order_release);
+    state.manual_cursor_ready.store(false, std::memory_order_release);
+    state.manual_foreground_ready.store(false, std::memory_order_release);
+    state.manual_window_procedure_ready.store(false, std::memory_order_release);
+    state.manual_engine_input_ready.store(false, std::memory_order_release);
+}
+
+void ResetManualMouseAcquisitionState(const HWND window) noexcept {
+    auto& state = g_overlay;
+    constexpr auto reset = ResetMouseAcquisition();
+    state.manual_look_right_delta.store(reset.accumulated_look_right, std::memory_order_release);
+    state.manual_look_up_delta.store(reset.accumulated_look_up, std::memory_order_release);
+    state.manual_wheel_delta.store(0, std::memory_order_release);
+    state.manual_mouse_observed.store(false, std::memory_order_release);
+    state.manual_raw_mouse_observed_ms.store(reset.raw_timestamp_ms, std::memory_order_release);
+    state.manual_fallback_mouse_observed_ms.store(
+        reset.fallback_timestamp_ms, std::memory_order_release);
+    state.manual_fallback_mouse_observed.store(false, std::memory_order_release);
+
+    POINT point{};
+    const auto baseline_ready = window != nullptr && GetCursorPos(&point) != FALSE &&
+        ScreenToClient(window, &point) != FALSE;
+    if (baseline_ready) {
+        state.manual_legacy_mouse_x.store(point.x, std::memory_order_release);
+        state.manual_legacy_mouse_y.store(point.y, std::memory_order_release);
+    }
+    state.manual_legacy_mouse_seeded.store(
+        baseline_ready || reset.fallback_seeded, std::memory_order_release);
+    // SDL may queue a baseline, recenter, and delayed recenter echo. Raw Input
+    // remains authoritative while the short legacy-only settle window refreshes
+    // the absolute fallback baseline. If the queue is empty, the original
+    // one-accepted-sample guard still protects the first later fallback packet.
+    state.manual_discard_next_legacy_sample.store(
+        reset.discard_next_fallback_sample, std::memory_order_release);
+    state.manual_fallback_settle_until_ms.store(
+        window != nullptr ? GetTickCount64() + kFallbackMouseReacquisitionSettleMs : 0,
+        std::memory_order_release);
+}
+
+[[nodiscard]] FreeCameraInputReadiness CurrentFreeCameraInputReadiness(
+    const HWND window) noexcept {
+    const auto& state = g_overlay;
+    return {
+        state.manual_keyboard_ready.load(std::memory_order_acquire),
+        state.manual_relative_mouse_ready.load(std::memory_order_acquire),
+        state.manual_raw_input_ready.load(std::memory_order_acquire),
+        state.manual_cursor_ready.load(std::memory_order_acquire),
+        state.manual_foreground_ready.load(std::memory_order_acquire) &&
+            GetForegroundWindow() == window,
+        state.manual_window_procedure_ready.load(std::memory_order_acquire) &&
+            reinterpret_cast<WNDPROC>(GetWindowLongPtrW(window, GWLP_WNDPROC)) ==
+                &SmvmWindowProcedure,
+        state.manual_engine_input_ready.load(std::memory_order_acquire) &&
+            !state.input_restore_pending.load(std::memory_order_acquire),
+    };
+}
+
 [[nodiscard]] bool ApplyManualPointerStateOnWindowThread(
     const HWND window,
     const bool enabled) noexcept {
     auto& state = g_overlay;
+    if (enabled) {
+        state.manual_keyboard_ready.store(false, std::memory_order_release);
+        state.manual_input_failure.store(
+            static_cast<std::uint32_t>(ManualInputFailure::none), std::memory_order_release);
+    }
     if (window == nullptr || !IsWindow(window) ||
-        GetWindowThreadProcessId(window, nullptr) != GetCurrentThreadId())
+        GetWindowThreadProcessId(window, nullptr) != GetCurrentThreadId()) {
+        state.manual_input_failure.store(
+            static_cast<std::uint32_t>(ManualInputFailure::invalid_window_thread),
+            std::memory_order_release);
         return false;
+    }
 
     SdlMouseApi api{};
-    if (!ResolveSdlMouseApi(api))
+    if (!ResolveSdlMouseApi(api)) {
+        state.manual_input_failure.store(
+            static_cast<std::uint32_t>(ManualInputFailure::sdl_api_unavailable),
+            std::memory_order_release);
         return false;
+    }
     auto* sdl_window = FindSdlWindowForHwnd(api, window);
-    if (sdl_window == nullptr)
+    if (sdl_window == nullptr) {
+        state.manual_input_failure.store(
+            static_cast<std::uint32_t>(ManualInputFailure::sdl_window_unavailable),
+            std::memory_order_release);
         return false;
+    }
 
     if (!enabled) {
         auto restored = true;
@@ -1492,54 +1655,94 @@ struct SdlMouseApi final {
                     state.sdl_relative_mouse_restore_pending = false;
             }
         }
-        state.manual_pointer_active.store(false, std::memory_order_release);
-        state.manual_mouse_observed.store(false, std::memory_order_release);
-        state.manual_raw_mouse_observed_ms.store(0, std::memory_order_release);
-        state.manual_legacy_mouse_seeded.store(false, std::memory_order_release);
+        ClearManualMouseReadiness();
+        state.manual_keyboard_ready.store(false, std::memory_order_release);
+        ResetManualMouseAcquisitionState(nullptr);
+        state.manual_input_error.store(false, std::memory_order_release);
+        state.manual_input_failure.store(
+            static_cast<std::uint32_t>(ManualInputFailure::none), std::memory_order_release);
         return restored;
     }
 
     if (state.menu_open.load(std::memory_order_acquire) || GetForegroundWindow() != window) {
-        state.manual_pointer_active.store(false, std::memory_order_release);
-        return true;
+        state.manual_input_failure.store(
+            static_cast<std::uint32_t>(ManualInputFailure::menu_or_foreground),
+            std::memory_order_release);
+        ClearManualMouseReadiness();
+        return false;
     }
+
+    ClearManualMouseReadiness();
+    ResetManualMouseAcquisitionState(window);
 
     const auto was_relative = api.get_relative_mode(sdl_window);
     if (!was_relative)
         state.manual_relative_mouse_restore_pending = true;
-    if (!was_relative && !api.set_relative_mode(sdl_window, true))
+    if (!was_relative && !api.set_relative_mode(sdl_window, true)) {
+        state.manual_input_failure.store(
+            static_cast<std::uint32_t>(ManualInputFailure::sdl_enable_failed),
+            std::memory_order_release);
         return false;
-    if (!api.get_relative_mode(sdl_window))
+    }
+    if (!api.get_relative_mode(sdl_window)) {
+        state.manual_input_failure.store(
+            static_cast<std::uint32_t>(ManualInputFailure::sdl_verify_failed),
+            std::memory_order_release);
         return false;
+    }
+    state.manual_relative_mouse_ready.store(true, std::memory_order_release);
 
     // SDL relative mode is the supported owner of Deadlock's process-wide Raw
     // Input registration. Verify that the transport was actually rebuilt; a
     // visible cursor with no mouse registration is the paused-camera failure
     // this transition exists to prevent.
-    std::array<RAWINPUTDEVICE, kMaxRegisteredRawInputDevices> registrations{};
-    UINT count = 0;
-    if (!ReadRegisteredRawInputDevices(registrations, count))
-        return false;
-    auto has_mouse = false;
-    for (UINT index = 0; index < count; ++index)
-        has_mouse = has_mouse || IsRawMouseRegistration(registrations[index]);
-    if (!has_mouse) {
+    const auto raw_registration = RawMouseRegistrationForWindow(window);
+    state.manual_raw_registration_disposition.store(
+        static_cast<std::uint32_t>(raw_registration), std::memory_order_release);
+    // SDL3 may intentionally target its private helper HWND rather than the
+    // DXGI output HWND. That registration is authoritative while SDL reports
+    // relative mode active; preserve the exact target and require only that a
+    // current process mouse registration exists.
+    if (raw_registration == RawMouseRegistrationDisposition::query_failed ||
+        raw_registration == RawMouseRegistrationDisposition::none) {
+        state.manual_input_failure.store(
+            static_cast<std::uint32_t>(ManualInputFailure::raw_registration_missing),
+            std::memory_order_release);
         if (state.manual_relative_mouse_restore_pending) {
             static_cast<void>(api.set_relative_mode(sdl_window, false));
             state.manual_relative_mouse_restore_pending = false;
         }
+        ClearManualMouseReadiness();
         return false;
     }
 
-    state.manual_pointer_active.store(true, std::memory_order_release);
-    state.manual_mouse_observed.store(false, std::memory_order_release);
-    state.manual_raw_mouse_observed_ms.store(0, std::memory_order_release);
-    state.manual_legacy_mouse_seeded.store(false, std::memory_order_release);
-    return true;
+    state.manual_raw_input_ready.store(true, std::memory_order_release);
+    SetCursor(nullptr);
+    state.manual_cursor_ready.store(!state.cursor_shown, std::memory_order_release);
+    state.manual_foreground_ready.store(GetForegroundWindow() == window, std::memory_order_release);
+    state.manual_window_procedure_ready.store(
+        reinterpret_cast<WNDPROC>(GetWindowLongPtrW(window, GWLP_WNDPROC)) ==
+            &SmvmWindowProcedure,
+        std::memory_order_release);
+    state.manual_engine_input_ready.store(
+        !state.input_restore_pending.load(std::memory_order_acquire), std::memory_order_release);
+    const auto ready = CurrentFreeCameraInputReadiness(window).MouseReady();
+    state.manual_pointer_active.store(ready, std::memory_order_release);
+    state.manual_keyboard_ready.store(ready, std::memory_order_release);
+    if (!ready)
+        state.manual_input_failure.store(
+            static_cast<std::uint32_t>(ManualInputFailure::readiness_incomplete),
+            std::memory_order_release);
+    if (!ready)
+        ClearManualMouseReadiness();
+    else
+        state.manual_input_error.store(false, std::memory_order_release);
+    return ready;
 }
 
 void SuspendManualPointerForFocusLoss(const HWND window) noexcept {
     auto& state = g_overlay;
+    state.manual_keyboard_ready.store(false, std::memory_order_release);
     if (!state.manual_pointer_active.exchange(false, std::memory_order_acq_rel))
         return;
     SdlMouseApi api{};
@@ -1547,20 +1750,23 @@ void SuspendManualPointerForFocusLoss(const HWND window) noexcept {
         return;
     if (auto* sdl_window = FindSdlWindowForHwnd(api, window); sdl_window != nullptr)
         static_cast<void>(api.set_relative_mode(sdl_window, false));
-    state.manual_mouse_observed.store(false, std::memory_order_release);
-    state.manual_raw_mouse_observed_ms.store(0, std::memory_order_release);
-    state.manual_legacy_mouse_seeded.store(false, std::memory_order_release);
+    ClearManualMouseReadiness();
+    ResetManualMouseAcquisitionState(nullptr);
 }
 
 [[nodiscard]] bool SuspendInputSystemOnWindowThread() noexcept;
 [[nodiscard]] bool RestoreInputSystemOnWindowThread() noexcept;
+[[nodiscard]] bool SetModalInputMaintenanceOnWindowThread(HWND window, bool enabled) noexcept;
 
-[[nodiscard]] bool PointerStateRestorePending() noexcept {
+[[nodiscard]] bool MenuPointerStateRestorePending() noexcept {
     const auto& state = g_overlay;
     return state.previous_clip_valid || state.sdl_relative_mouse_restore_pending ||
-           state.manual_relative_mouse_restore_pending ||
            state.raw_mouse_restore_pending.load(std::memory_order_acquire) ||
            state.input_restore_pending.load(std::memory_order_acquire);
+}
+
+[[nodiscard]] bool PointerStateRestorePending() noexcept {
+    return MenuPointerStateRestorePending() || g_overlay.manual_relative_mouse_restore_pending;
 }
 
 [[nodiscard]] bool ApplyCursorStateOnWindowThread(const bool menu_open) noexcept {
@@ -1624,7 +1830,75 @@ void SuspendManualPointerForFocusLoss(const HWND window) noexcept {
     // deliver an editor-owned press while teardown is still in progress.
     const auto input_restored = RestoreInputSystemOnWindowThread();
     return clip_restored && sdl_restored && raw_restored && input_restored &&
-           !PointerStateRestorePending();
+           !MenuPointerStateRestorePending();
+}
+
+[[nodiscard]] bool ResumeFreeCameraInputAfterMenu(const HWND window) noexcept {
+    auto& state = g_overlay;
+    SmvmSnapshotPayload snapshot{};
+    const auto camera_active = ReadSnapshot(snapshot) && CanUseManualCamera(snapshot);
+    if (!ShouldReacquireFreeCameraInputAfterMenu(
+            true,
+            state.menu_open.load(std::memory_order_acquire),
+            state.manual_pointer_requested.load(std::memory_order_acquire),
+            camera_active)) {
+        state.manual_keyboard_ready.store(false, std::memory_order_release);
+        state.manual_input_failure.store(
+            static_cast<std::uint32_t>(ManualInputFailure::camera_snapshot_not_ready),
+            std::memory_order_release);
+        return false;
+    }
+
+    if (!ApplyManualPointerStateOnWindowThread(window, true))
+        return false;
+    const auto ready = CurrentFreeCameraInputReadiness(window).FullyReady();
+    if (!ready)
+        ClearManualMouseReadiness();
+    return ready;
+}
+
+[[nodiscard]] bool ApplyMenuTransitionOnWindowThread(
+    const HWND window,
+    const bool should_open) noexcept {
+    auto& state = g_overlay;
+    auto transition_ok = ApplyCursorStateOnWindowThread(should_open);
+    if (transition_ok)
+        transition_ok = SetModalInputMaintenanceOnWindowThread(window, should_open);
+    if (transition_ok && should_open) {
+        state.manual_keyboard_ready.store(false, std::memory_order_release);
+        ClearManualMouseReadiness();
+        ResetManualMouseAcquisitionState(nullptr);
+    }
+    if (transition_ok && !should_open &&
+        state.manual_pointer_requested.load(std::memory_order_acquire))
+        transition_ok = ResumeFreeCameraInputAfterMenu(window);
+
+    if (transition_ok) {
+        if (!should_open)
+            state.manual_input_error.store(false, std::memory_order_release);
+        return true;
+    }
+
+    if (!should_open) {
+        // A requested Free Camera without a complete keyboard + mouse route is
+        // not a usable mode. Reopen the editor with a typed error and let Retry
+        // run the same deliberate transition again; camera composition remains
+        // owned and untouched throughout.
+        state.menu_open.store(true, std::memory_order_release);
+        state.manual_keyboard_ready.store(false, std::memory_order_release);
+        ClearManualMouseReadiness();
+        ResetManualMouseAcquisitionState(nullptr);
+        static_cast<void>(ApplyCursorStateOnWindowThread(true));
+        static_cast<void>(SetModalInputMaintenanceOnWindowThread(window, true));
+        if (state.manual_input_failure.load(std::memory_order_acquire) ==
+            static_cast<std::uint32_t>(ManualInputFailure::none)) {
+            state.manual_input_failure.store(
+                static_cast<std::uint32_t>(ManualInputFailure::menu_restore_failed),
+                std::memory_order_release);
+        }
+        state.manual_input_error.store(true, std::memory_order_release);
+    }
+    return false;
 }
 
 [[nodiscard]] bool SetModalInputMaintenanceOnWindowThread(
@@ -2083,6 +2357,7 @@ void SetMenuOpen(const bool open) noexcept {
     }
     // Neither entering nor leaving the modal editor may carry a held gameplay
     // input or accumulated mouse/wheel impulse across the ownership boundary.
+    state.manual_keyboard_ready.store(false, std::memory_order_release);
     ResetSmvmManualInput();
     if (!open) {
         ResetBindingCaptureState();
@@ -2097,14 +2372,7 @@ void SetMenuOpen(const bool open) noexcept {
     if (window != nullptr && IsWindow(window)) {
         const auto window_thread = GetWindowThreadProcessId(window, nullptr);
         if (window_thread == GetCurrentThreadId()) {
-            transition_ok = ApplyCursorStateOnWindowThread(open);
-            if (transition_ok)
-                transition_ok = SetModalInputMaintenanceOnWindowThread(window, open);
-            if (transition_ok && open)
-                state.manual_pointer_active.store(false, std::memory_order_release);
-            if (transition_ok && !open &&
-                state.manual_pointer_requested.load(std::memory_order_acquire))
-                transition_ok = ApplyManualPointerStateOnWindowThread(window, true);
+            transition_ok = ApplyMenuTransitionOnWindowThread(window, open);
         } else {
             transition_ok = PostMessageW(
                 window, kSmvmCursorTransitionMessage, open ? TRUE : FALSE, 0) != FALSE;
@@ -2126,14 +2394,31 @@ void RequestManualPointerState(const bool enabled) noexcept {
     const auto previous = state.manual_pointer_requested.exchange(enabled, std::memory_order_acq_rel);
     if (previous == enabled)
         return;
+    state.manual_keyboard_ready.store(false, std::memory_order_release);
     if (!enabled)
         ResetSmvmManualInput();
+    if (!enabled) {
+        state.manual_input_error.store(false, std::memory_order_release);
+        state.manual_input_failure.store(
+            static_cast<std::uint32_t>(ManualInputFailure::none), std::memory_order_release);
+    }
+    if (enabled && state.menu_open.load(std::memory_order_acquire)) {
+        // Camera ownership can become active while the activating UI click is
+        // still being released. The OPEN -> CLOSED transition owns acquisition
+        // and validates the full route after ImGui has finished that click.
+        return;
+    }
     const auto window = state.output_window;
     if (window == nullptr || !IsWindow(window) ||
         PostMessageW(window, kSmvmManualPointerTransitionMessage, enabled ? TRUE : FALSE, 0) == FALSE) {
-        if (enabled)
-            state.manual_pointer_requested.store(false, std::memory_order_release);
-        state.manual_pointer_active.store(false, std::memory_order_release);
+        ClearManualMouseReadiness();
+        if (enabled) {
+            state.manual_input_failure.store(
+                static_cast<std::uint32_t>(ManualInputFailure::invalid_window_thread),
+                std::memory_order_release);
+            state.manual_input_error.store(true, std::memory_order_release);
+            SetMenuOpen(true);
+        }
         PublishStatus(SmvmRendererBackend::d3d11, SmvmRendererError::window_hook_failed);
     }
 }
@@ -2314,6 +2599,18 @@ void RequestManualPointerState(const bool enabled) noexcept {
            (snapshot.flags & smvm_snapshot_replay_active) != 0 &&
            (snapshot.flags & smvm_snapshot_manual_camera_active) != 0 &&
            (snapshot.flags & smvm_snapshot_campath_playing) == 0 && snapshot.observer_mode == 4;
+}
+
+[[nodiscard]] bool CanConsumeManualCameraInput(const SmvmSnapshotPayload& snapshot) noexcept {
+    const auto& state = g_overlay;
+    const auto window = state.output_window;
+    const auto readiness = CurrentFreeCameraInputReadiness(window);
+    return state.manual_pointer_active.load(std::memory_order_acquire) &&
+           CanConsumeFreeCameraInput(
+               state.menu_open.load(std::memory_order_acquire),
+               state.manual_pointer_requested.load(std::memory_order_acquire),
+               CanUseManualCamera(snapshot),
+               readiness);
 }
 
 [[nodiscard]] bool PointInsideReplayBar(
@@ -2534,8 +2831,11 @@ void RefreshMenuCursorPosition(const HWND window) noexcept {
                         sizeof(RAWINPUTHEADER)) == static_cast<UINT>(-1) || size > storage.size())
         return false;
     const auto* input = reinterpret_cast<const RAWINPUT*>(storage.data());
-    const auto manual = has_snapshot && !menu_open && CanUseManualCamera(snapshot);
-    const auto takeover = manual && (snapshot.flags & smvm_snapshot_input_takeover) != 0;
+    const auto camera_available = has_snapshot && !menu_open && CanUseManualCamera(snapshot);
+    const auto manual = camera_available && CanConsumeManualCameraInput(snapshot);
+    const auto input_takeover = camera_available &&
+        (snapshot.flags & smvm_snapshot_input_takeover) != 0;
+    const auto manual_takeover = manual && input_takeover;
     if (input->header.dwType == RIM_TYPEMOUSE) {
         // Free Cam registers raw mouse input without the corresponding legacy
         // WM_MOUSEMOVE stream. Sample the real client cursor for menu hit tests;
@@ -2586,7 +2886,7 @@ void RefreshMenuCursorPosition(const HWND window) noexcept {
                             : MAKEWPARAM(0, XBUTTON1);
                         handled = HandleSmvmMouseBinding(message, wparam, snapshot);
                     }
-                    if (handled || (takeover && input_codes[index] != SmvmInputCode::none &&
+                    if (handled || (input_takeover && input_codes[index] != SmvmInputCode::none &&
                                     EditorBindingOwnsMouseCode(snapshot, input_codes[index]))) {
                         static_cast<void>(TrackConsumedMouseIndex(index, kMenuRawKeyRoute));
                         owns_editor_button = true;
@@ -2616,32 +2916,39 @@ void RefreshMenuCursorPosition(const HWND window) noexcept {
         }
 
         auto owns_packet = false;
-        if (manual && (input->data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) == 0) {
-            const auto delta_x = input->data.mouse.lLastX;
-            const auto delta_y = input->data.mouse.lLastY;
-            if (delta_x != 0 || delta_y != 0) {
-                g_overlay.manual_mouse_delta_x.fetch_add(delta_x, std::memory_order_release);
-                g_overlay.manual_mouse_delta_y.fetch_add(delta_y, std::memory_order_release);
+        const auto relative_motion =
+            (input->data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) == 0 &&
+            (input->data.mouse.lLastX != 0 || input->data.mouse.lLastY != 0);
+        if (manual && relative_motion) {
+            const auto delta = NormalizeRawMouseDelta(
+                input->data.mouse.lLastX, input->data.mouse.lLastY);
+            if (delta.look_right != 0 || delta.look_up != 0) {
+                g_overlay.manual_look_right_delta.fetch_add(
+                    delta.look_right, std::memory_order_release);
+                g_overlay.manual_look_up_delta.fetch_add(delta.look_up, std::memory_order_release);
                 g_overlay.manual_mouse_observed.store(true, std::memory_order_release);
                 g_overlay.manual_raw_mouse_observed_ms.store(
                     GetTickCount64(), std::memory_order_release);
                 owns_packet = true;
             }
         }
-        if (manual && wheel_delta != 0) {
+        if (!manual && input_takeover && relative_motion)
+            owns_packet = true;
+        if (input_takeover && wheel_delta != 0) {
             g_overlay.raw_wheel_consumed_ms.store(GetTickCount64(), std::memory_order_release);
-            g_overlay.manual_wheel_delta.fetch_add(wheel_delta, std::memory_order_release);
+            if (manual)
+                g_overlay.manual_wheel_delta.fetch_add(wheel_delta, std::memory_order_release);
             owns_packet = true;
         }
-        const auto editor_owns_wheel = takeover && wheel_delta != 0 && EditorBindingOwnsMouseCode(
+        const auto editor_owns_wheel = input_takeover && wheel_delta != 0 && EditorBindingOwnsMouseCode(
             snapshot, wheel_delta > 0 ? SmvmInputCode::wheel_up : SmvmInputCode::wheel_down);
-        const auto contains_owned_wheel = manual && (button_flags & RI_MOUSE_WHEEL) != 0;
+        const auto contains_owned_wheel = input_takeover && (button_flags & RI_MOUSE_WHEEL) != 0;
         contains_unowned_button = contains_unowned_button || (button_flags & RI_MOUSE_HWHEEL) != 0;
         // A RAWINPUT packet cannot be split. Preserve any unrelated button in a
         // mixed packet, even though that also lets the coalesced motion through.
         return !contains_unowned_button &&
                (owns_editor_button ||
-                (takeover && (owns_packet || contains_owned_wheel || editor_owns_wheel)));
+                (input_takeover && (owns_packet || contains_owned_wheel || editor_owns_wheel)));
     }
     if (input->header.dwType == RIM_TYPEKEYBOARD) {
         const auto key = NormalizeRawVirtualKey(input->data.keyboard);
@@ -2660,13 +2967,15 @@ void RefreshMenuCursorPosition(const HWND window) noexcept {
         const auto tracked_release = !down && ConsumeTrackedKeyUp(key, kMenuRawKeyRoute);
         if (preheld_release)
             return false;
-        if (down && takeover && EditorBindingOwnsKeyboardKey(snapshot, key)) {
+        if (down && input_takeover && EditorBindingOwnsKeyboardKey(snapshot, key)) {
             TrackConsumedKeyDown(key, kMenuRawKeyRoute);
             return true;
         }
         const auto consumed = RouteManualKeyboardEvent(
-            snapshot, key, down, kManualRawKeyRoute, takeover);
-        return tracked_release || consumed;
+            snapshot, key, down, kManualRawKeyRoute, manual_takeover);
+        const auto swallow_while_acquiring = !manual && input_takeover &&
+            ManualBindingOwnsKey(snapshot, key);
+        return tracked_release || consumed || swallow_while_acquiring;
     }
     return false;
 }
@@ -2865,14 +3174,7 @@ LRESULT CALLBACK SmvmWindowProcedure(
     if (message == kSmvmCursorTransitionMessage) {
         const auto should_open =
             !state.stop_requested.load(std::memory_order_acquire) && wparam != FALSE;
-        auto transition_ok = ApplyCursorStateOnWindowThread(should_open);
-        if (transition_ok)
-            transition_ok = SetModalInputMaintenanceOnWindowThread(window, should_open);
-        if (transition_ok && should_open)
-            state.manual_pointer_active.store(false, std::memory_order_release);
-        if (transition_ok && !should_open &&
-            state.manual_pointer_requested.load(std::memory_order_acquire))
-            transition_ok = ApplyManualPointerStateOnWindowThread(window, true);
+        auto transition_ok = ApplyMenuTransitionOnWindowThread(window, should_open);
         if (!transition_ok && should_open) {
             state.menu_open.store(false, std::memory_order_release);
             ResetSmvmManualInput();
@@ -2887,8 +3189,10 @@ LRESULT CALLBACK SmvmWindowProcedure(
     if (message == kSmvmManualPointerTransitionMessage) {
         const auto enabled = !state.stop_requested.load(std::memory_order_acquire) && wparam != FALSE;
         const auto transition_ok = ApplyManualPointerStateOnWindowThread(window, enabled);
-        if (enabled && !transition_ok)
-            state.manual_pointer_requested.store(false, std::memory_order_release);
+        if (enabled && !transition_ok) {
+            state.manual_input_error.store(true, std::memory_order_release);
+            SetMenuOpen(true);
+        }
         PublishStatus(
             SmvmRendererBackend::d3d11,
             transition_ok ? SmvmRendererError::none : SmvmRendererError::window_hook_failed);
@@ -3006,7 +3310,7 @@ LRESULT CALLBACK SmvmWindowProcedure(
     }
     if (state.stop_requested.load(std::memory_order_acquire))
         return CallWindowProcW(original, window, message, wparam, lparam);
-    if (!state.menu_open.load(std::memory_order_acquire) && PointerStateRestorePending()) {
+    if (!state.menu_open.load(std::memory_order_acquire) && MenuPointerStateRestorePending()) {
         const auto restored = ApplyCursorStateOnWindowThread(false);
         if (!restored)
             PublishStatus(SmvmRendererBackend::d3d11, SmvmRendererError::window_hook_failed);
@@ -3112,7 +3416,9 @@ LRESULT CALLBACK SmvmWindowProcedure(
         state.mouse_y.store(mouse_y, std::memory_order_relaxed);
         if (menu_open)
             return 0;
-        if (has_snapshot && CanUseManualCamera(snapshot)) {
+        const auto manual_camera = has_snapshot && CanUseManualCamera(snapshot);
+        const auto manual_input_ready = manual_camera && CanConsumeManualCameraInput(snapshot);
+        if (manual_input_ready) {
             const auto was_seeded = state.manual_legacy_mouse_seeded.exchange(
                 true, std::memory_order_acq_rel);
             const auto previous_x = state.manual_legacy_mouse_x.exchange(
@@ -3124,16 +3430,26 @@ LRESULT CALLBACK SmvmWindowProcedure(
             const auto delta = ResolveLegacyMouseDelta(
                 was_seeded, previous_x, previous_y, mouse_x, mouse_y,
                 raw_at != 0 && now - raw_at <= 50);
-            if (delta.accepted) {
-                state.manual_mouse_delta_x.fetch_add(delta.x, std::memory_order_release);
-                state.manual_mouse_delta_y.fetch_add(delta.y, std::memory_order_release);
+            if (ShouldApplyFallbackMouseSample(
+                    delta.accepted,
+                    now,
+                    state.manual_fallback_settle_until_ms.load(std::memory_order_acquire),
+                    state.manual_discard_next_legacy_sample)) {
+                const auto canonical = NormalizeFallbackMouseDelta(delta.x, delta.y);
+                state.manual_look_right_delta.fetch_add(
+                    canonical.look_right, std::memory_order_release);
+                state.manual_look_up_delta.fetch_add(canonical.look_up, std::memory_order_release);
                 state.manual_mouse_observed.store(true, std::memory_order_release);
+                state.manual_fallback_mouse_observed.store(true, std::memory_order_release);
+                state.manual_fallback_mouse_observed_ms.store(now, std::memory_order_release);
             }
             if ((snapshot.flags & smvm_snapshot_input_takeover) != 0)
                 return 0;
         } else {
             state.manual_legacy_mouse_seeded.store(false, std::memory_order_release);
         }
+        if (manual_camera && (snapshot.flags & smvm_snapshot_input_takeover) != 0)
+            return 0;
         if (has_snapshot &&
             PointInsideReplayBar(window, snapshot, GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)))
             return 0;
@@ -3195,7 +3511,8 @@ LRESULT CALLBACK SmvmWindowProcedure(
             return 0;
         }
         if (CanUseManualCamera(snapshot)) {
-            state.manual_wheel_delta.fetch_add(delta, std::memory_order_release);
+            if (CanConsumeManualCameraInput(snapshot))
+                state.manual_wheel_delta.fetch_add(delta, std::memory_order_release);
             if ((snapshot.flags & smvm_snapshot_input_takeover) != 0)
                 return 0;
             return CallWindowProcW(original, window, message, wparam, lparam);
@@ -3284,27 +3601,33 @@ LRESULT CALLBACK SmvmWindowProcedure(
             TrackConsumedKeyDown(normalized_key, kMenuWindowKeyRoute);
             return 0;
         }
-        const auto takeover = CanUseManualCamera(snapshot) &&
+        const auto input_takeover = CanUseManualCamera(snapshot) &&
             (snapshot.flags & smvm_snapshot_input_takeover) != 0;
+        const auto manual_takeover = input_takeover && CanConsumeManualCameraInput(snapshot);
         if (RouteManualKeyboardEvent(
                 snapshot,
                 normalized_key,
                 true,
                 kManualWindowKeyRoute,
-                takeover))
+                manual_takeover))
+            return 0;
+        if (input_takeover && !manual_takeover && ManualBindingOwnsKey(snapshot, normalized_key))
             return 0;
     }
     if (message == WM_KEYUP || message == WM_SYSKEYUP) {
         if (menu_open && UiFeedingAllowed(menu_open))
             PushUiEvent(smvm_ui_event_key, static_cast<std::int32_t>(normalized_key), 0);
-        const auto takeover = has_snapshot && CanUseManualCamera(snapshot) &&
+        const auto input_takeover = has_snapshot && CanUseManualCamera(snapshot) &&
             (snapshot.flags & smvm_snapshot_input_takeover) != 0;
+        const auto manual_takeover = input_takeover && CanConsumeManualCameraInput(snapshot);
         if (RouteManualKeyboardEvent(
                 snapshot,
                 normalized_key,
                 false,
                 kManualWindowKeyRoute,
-                takeover))
+                manual_takeover))
+            return 0;
+        if (input_takeover && !manual_takeover && ManualBindingOwnsKey(snapshot, normalized_key))
             return 0;
         if (ConsumeTrackedKeyUp(normalized_key, kMenuWindowKeyRoute))
             return 0;
@@ -3557,7 +3880,13 @@ LRESULT CALLBACK SmvmWindowProcedure(
         return true;
     }
 
-    RequestManualPointerState(CanUseManualCamera(snapshot));
+    const auto manual_camera_usable = CanUseManualCamera(snapshot);
+    // Readiness becomes true only on the game-window thread after the complete
+    // SDL/Raw Input/cursor acquisition succeeds. Do not publish keyboard-ready
+    // from Present while a posted menu-close transition is still pending.
+    if (!manual_camera_usable || state.menu_open.load(std::memory_order_acquire))
+        state.manual_keyboard_ready.store(false, std::memory_order_release);
+    RequestManualPointerState(manual_camera_usable);
 
     CameraSample rendered_camera{};
     const auto has_rendered_camera = state.callbacks.read_rendered_camera != nullptr &&
@@ -3652,6 +3981,16 @@ LRESULT CALLBACK SmvmWindowProcedure(
         params.frame_microseconds = state.frame_microseconds.load(std::memory_order_acquire);
         params.overlay_flags = OverlayFlags();
         params.renderer_error = state.last_renderer_error.load(std::memory_order_acquire);
+        params.raw_mouse_timestamp_ms =
+            state.manual_raw_mouse_observed_ms.load(std::memory_order_acquire);
+        params.fallback_mouse_timestamp_ms =
+            state.manual_fallback_mouse_observed_ms.load(std::memory_order_acquire);
+        params.free_camera_input_error =
+            state.manual_input_error.load(std::memory_order_acquire);
+        params.free_camera_input_failure =
+            state.manual_input_failure.load(std::memory_order_acquire);
+        params.raw_registration_disposition =
+            state.manual_raw_registration_disposition.load(std::memory_order_acquire);
         params.queue_action = [context = state.callbacks.context,
                                queue = state.callbacks.queue_action](const SmvmActionPayload& action) {
             return queue != nullptr && queue(context, action);
@@ -4356,15 +4695,39 @@ void SmvmOpenMenu() noexcept {
     SetMenuOpen(true);
 }
 
+void SmvmReacquireFreeCameraInput() noexcept {
+    auto& state = g_overlay;
+    if (!state.manual_pointer_requested.load(std::memory_order_acquire)) {
+        state.manual_input_failure.store(
+            static_cast<std::uint32_t>(ManualInputFailure::camera_snapshot_not_ready),
+            std::memory_order_release);
+        state.manual_input_error.store(true, std::memory_order_release);
+        return;
+    }
+    if (state.menu_open.load(std::memory_order_acquire)) {
+        SetMenuOpen(false);
+        return;
+    }
+    const auto window = state.output_window;
+    if (window == nullptr || !IsWindow(window) ||
+        PostMessageW(window, kSmvmManualPointerTransitionMessage, TRUE, 0) == FALSE) {
+        state.manual_input_failure.store(
+            static_cast<std::uint32_t>(ManualInputFailure::invalid_window_thread),
+            std::memory_order_release);
+        state.manual_input_error.store(true, std::memory_order_release);
+        SetMenuOpen(true);
+    }
+}
+
 bool ConsumeSmvmManualInput(
     const SmvmSnapshotPayload& snapshot,
     SmvmManualInputFrame& frame) noexcept {
     frame = {};
     auto& state = g_overlay;
     if (!state.started.load(std::memory_order_acquire) ||
-        state.menu_open.load(std::memory_order_acquire) || !CanUseManualCamera(snapshot)) {
-        state.manual_mouse_delta_x.store(0, std::memory_order_release);
-        state.manual_mouse_delta_y.store(0, std::memory_order_release);
+        !CanConsumeManualCameraInput(snapshot)) {
+        state.manual_look_right_delta.store(0, std::memory_order_release);
+        state.manual_look_up_delta.store(0, std::memory_order_release);
         state.manual_wheel_delta.store(0, std::memory_order_release);
         return false;
     }
@@ -4383,10 +4746,10 @@ bool ConsumeSmvmManualInput(
                state.manual_key_routes[base].load(std::memory_order_acquire) != 0;
     };
 
-    frame.mouse_delta_x = static_cast<double>(
-        state.manual_mouse_delta_x.exchange(0, std::memory_order_acq_rel));
-    frame.mouse_delta_y = static_cast<double>(
-        state.manual_mouse_delta_y.exchange(0, std::memory_order_acq_rel));
+    frame.look_right = static_cast<double>(
+        state.manual_look_right_delta.exchange(0, std::memory_order_acq_rel));
+    frame.look_up = static_cast<double>(
+        state.manual_look_up_delta.exchange(0, std::memory_order_acq_rel));
     frame.wheel_steps = static_cast<double>(
         state.manual_wheel_delta.exchange(0, std::memory_order_acq_rel)) / WHEEL_DELTA;
     frame.forward = binding_down(snapshot.forward_key);
@@ -4405,11 +4768,15 @@ bool ConsumeSmvmManualInput(
 
 void ResetSmvmManualInput() noexcept {
     auto& state = g_overlay;
-    state.manual_mouse_delta_x.store(0, std::memory_order_release);
-    state.manual_mouse_delta_y.store(0, std::memory_order_release);
+    state.manual_look_right_delta.store(0, std::memory_order_release);
+    state.manual_look_up_delta.store(0, std::memory_order_release);
     state.manual_wheel_delta.store(0, std::memory_order_release);
     state.manual_raw_mouse_observed_ms.store(0, std::memory_order_release);
+    state.manual_fallback_mouse_observed_ms.store(0, std::memory_order_release);
+    state.manual_fallback_mouse_observed.store(false, std::memory_order_release);
     state.manual_legacy_mouse_seeded.store(false, std::memory_order_release);
+    state.manual_discard_next_legacy_sample.store(true, std::memory_order_release);
+    state.manual_fallback_settle_until_ms.store(0, std::memory_order_release);
     for (auto& key : state.key_down)
         key.store(0, std::memory_order_release);
     for (auto& routes : state.manual_key_routes)
@@ -4443,7 +4810,21 @@ bool StartSmvmOverlay(const HMODULE self_module, const SmvmOverlayCallbacks& cal
     state.manual_pointer_active.store(false, std::memory_order_release);
     state.manual_mouse_observed.store(false, std::memory_order_release);
     state.manual_raw_mouse_observed_ms.store(0, std::memory_order_release);
+    state.manual_fallback_mouse_observed_ms.store(0, std::memory_order_release);
+    state.manual_fallback_mouse_observed.store(false, std::memory_order_release);
     state.manual_legacy_mouse_seeded.store(false, std::memory_order_release);
+    state.manual_discard_next_legacy_sample.store(true, std::memory_order_release);
+    state.manual_fallback_settle_until_ms.store(0, std::memory_order_release);
+    state.manual_keyboard_ready.store(false, std::memory_order_release);
+    state.manual_relative_mouse_ready.store(false, std::memory_order_release);
+    state.manual_raw_input_ready.store(false, std::memory_order_release);
+    state.manual_cursor_ready.store(false, std::memory_order_release);
+    state.manual_foreground_ready.store(false, std::memory_order_release);
+    state.manual_window_procedure_ready.store(false, std::memory_order_release);
+    state.manual_engine_input_ready.store(false, std::memory_order_release);
+    state.manual_input_error.store(false, std::memory_order_release);
+    state.manual_input_failure.store(0, std::memory_order_release);
+    state.manual_raw_registration_disposition.store(0, std::memory_order_release);
     state.manual_relative_mouse_restore_pending = false;
     state.presentation_mode.store(
         static_cast<std::uint32_t>(DeadlockUiMode::deadlock_ui), std::memory_order_release);

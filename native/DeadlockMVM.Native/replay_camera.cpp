@@ -1016,8 +1016,8 @@ void WriteVector(const std::uintptr_t address, const float x, const float y, con
     approach(value.up, target.up);
     // Raw mouse deltas are per-frame impulses. Carrying them forward creates
     // a rotation tail after the user stops moving the mouse.
-    value.mouse_x = target.mouse_x;
-    value.mouse_y = target.mouse_y;
+    value.look_right = target.look_right;
+    value.look_up = target.look_up;
     value.roll = target.roll;
     value.wheel_steps = target.wheel_steps;
     value.reset_roll = target.reset_roll;
@@ -1164,8 +1164,8 @@ void* __fastcall CameraUpdateHook(void* camera) noexcept {
                     motion.forward = (input.forward ? 1.0 : 0.0) - (input.backward ? 1.0 : 0.0);
                     motion.right = (input.right ? 1.0 : 0.0) - (input.left ? 1.0 : 0.0);
                     motion.up = (input.up ? 1.0 : 0.0) - (input.down ? 1.0 : 0.0);
-                    motion.mouse_x = input.mouse_delta_x;
-                    motion.mouse_y = input.mouse_delta_y;
+                    motion.look_right = input.look_right;
+                    motion.look_up = input.look_up;
                     motion.roll = (input.roll_right ? 1.0 : 0.0) - (input.roll_left ? 1.0 : 0.0);
                     motion.wheel_steps = input.wheel_steps;
                     motion.reset_roll = input.reset_roll;

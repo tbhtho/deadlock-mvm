@@ -8,7 +8,7 @@
 namespace deadlock_mvm {
 
 constexpr std::uint32_t kProtocolMagic = 0x4D564D43; // "CMVM" little-endian
-constexpr std::uint16_t kProtocolVersion = 10;
+constexpr std::uint16_t kProtocolVersion = 11;
 constexpr std::size_t kMaxCampathKeyframes = 128;
 constexpr double kMinFov = 5.0;
 constexpr double kMaxFov = 170.0;
@@ -199,6 +199,15 @@ enum SmvmOverlayFlags : std::uint32_t {
     smvm_overlay_clean_view = 1u << 4,
     smvm_overlay_manual_pointer_active = 1u << 5,
     smvm_overlay_manual_mouse_observed = 1u << 6,
+    smvm_overlay_manual_pointer_requested = 1u << 7,
+    smvm_overlay_keyboard_ready = 1u << 8,
+    smvm_overlay_relative_mouse_ready = 1u << 9,
+    smvm_overlay_raw_input_ready = 1u << 10,
+    smvm_overlay_cursor_ready = 1u << 11,
+    smvm_overlay_foreground_ready = 1u << 12,
+    smvm_overlay_window_procedure_ready = 1u << 13,
+    smvm_overlay_engine_input_ready = 1u << 14,
+    smvm_overlay_fallback_mouse_observed = 1u << 15,
 };
 
 enum SmvmSnapshotFlags : std::uint32_t {

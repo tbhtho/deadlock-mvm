@@ -2077,7 +2077,12 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         var lifecycle = status.OverlayFlags &
             (SmvmOverlayFlags.HookInstalled | SmvmOverlayFlags.PresentObserved | SmvmOverlayFlags.Ready |
              SmvmOverlayFlags.MenuOpen | SmvmOverlayFlags.CleanView |
-             SmvmOverlayFlags.ManualPointerActive | SmvmOverlayFlags.ManualMouseObserved);
+             SmvmOverlayFlags.ManualPointerActive | SmvmOverlayFlags.ManualMouseObserved |
+             SmvmOverlayFlags.ManualPointerRequested | SmvmOverlayFlags.KeyboardReady |
+             SmvmOverlayFlags.RelativeMouseReady | SmvmOverlayFlags.RawInputReady |
+             SmvmOverlayFlags.CursorReady | SmvmOverlayFlags.ForegroundReady |
+             SmvmOverlayFlags.WindowProcedureReady | SmvmOverlayFlags.EngineInputReady |
+             SmvmOverlayFlags.FallbackMouseObserved);
         if (status.RendererBackend != _loggedRendererBackend ||
             status.RendererError != _loggedRendererError || lifecycle != _loggedRendererLifecycle)
         {

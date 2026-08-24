@@ -1,4 +1,5 @@
 #include "campath_math.hpp"
+#include "free_camera_input.hpp"
 #include "hook_lifecycle.hpp"
 #include "manual_camera_math.hpp"
 #include "manual_mouse_fallback.hpp"
@@ -280,8 +281,30 @@ void ProtocolTests() {
     const auto legacy_delta = ResolveLegacyMouseDelta(true, 100, 100, 110, 94, false);
     Check(legacy_delta.accepted && legacy_delta.x == 10 && legacy_delta.y == -6,
           "bounded legacy mouse motion remains available when raw SDL packets are absent");
+    const auto raw_canonical = NormalizeRawMouseDelta(10, -6);
+    const auto fallback_canonical = NormalizeFallbackMouseDelta(legacy_delta.x, legacy_delta.y);
+    Check(raw_canonical.look_right == fallback_canonical.look_right &&
+              raw_canonical.look_up == fallback_canonical.look_up &&
+              raw_canonical.look_right == 10 && raw_canonical.look_up == 6,
+          "Raw Input and fallback normalize to one physical right/up convention");
     Check(!ResolveLegacyMouseDelta(true, 100, 100, 900, 100, false).accepted,
           "absolute cursor warps cannot jump the fallback camera");
+    std::atomic<bool> discard_next_fallback{true};
+    Check(!ShouldApplyFallbackMouseSample(false, 100, 175, discard_next_fallback) &&
+              discard_next_fallback.load(std::memory_order_acquire),
+          "rejected fallback samples preserve the post-menu reacquisition guard");
+    Check(!ShouldApplyFallbackMouseSample(true, 110, 175, discard_next_fallback) &&
+              !discard_next_fallback.load(std::memory_order_acquire),
+          "an accepted recenter packet is discarded during the fallback settle window");
+    Check(!ShouldApplyFallbackMouseSample(true, 140, 175, discard_next_fallback),
+          "a delayed legacy recenter echo is also discarded during the settle window");
+    Check(ShouldApplyFallbackMouseSample(true, 176, 175, discard_next_fallback),
+          "the first fallback sample after the recenter queue settles is usable immediately");
+    std::atomic<bool> no_recenter_packet{true};
+    Check(!ShouldApplyFallbackMouseSample(true, 176, 175, no_recenter_packet) &&
+              !no_recenter_packet.load(std::memory_order_acquire) &&
+              ShouldApplyFallbackMouseSample(true, 177, 175, no_recenter_packet),
+          "without a settle-window packet the original one-sample fallback guard remains");
 
     Check(sizeof(CampathDocumentEntry) == 144, "Campath document entry layout is fixed");
     Check(ValidatePayloadSize(MessageType::set_campath_documents,
@@ -315,8 +338,8 @@ void ProtocolTests() {
     Check(std::abs(std::hypot(diagonal.x, diagonal.y) - tuning.movement_speed * 0.1) < 1e-8,
           "manual diagonal movement is normalized and frame time is bounded");
     motion = {};
-    motion.mouse_x = 500.0;
-    motion.mouse_y = 2000.0;
+    motion.look_right = 500.0;
+    motion.look_up = 2000.0;
     motion.roll = 10.0;
     motion.wheel_steps = 100.0;
     const auto rotated = ApplyManualCameraMotion(
@@ -346,12 +369,95 @@ void ProtocolTests() {
     inverted_tuning.invert_y = true;
     inverted_tuning.invert_fov = true;
     motion = {};
-    motion.mouse_y = 10.0;
+    motion.look_up = 10.0;
     motion.wheel_steps = 2.0;
     const auto inverted = ApplyManualCameraMotion(
         CameraSample{0, 0, 0, 0, 0, 0, 70}, motion, inverted_tuning, 1.0 / 60.0);
     Check(inverted.pitch < 0.0 && inverted.fov > 70.0,
           "manual camera honors invert-Y and inverted FOV wheel direction");
+
+    ManualCameraMotion right_look{};
+    right_look.look_right = 10.0;
+    const auto looked_right = ApplyManualCameraMotion(
+        CameraSample{0, 0, 0, 0, 0, 0, 70}, right_look, tuning, 0.0);
+    ManualCameraMotion left_look{};
+    left_look.look_right = -10.0;
+    const auto looked_left = ApplyManualCameraMotion(
+        CameraSample{0, 0, 0, 0, 0, 0, 70}, left_look, tuning, 0.0);
+    Check(looked_right.yaw < 0.0 && looked_left.yaw > 0.0,
+          "positive canonical X turns rendered Yaw right and negative X turns left");
+
+    ManualCameraMotion up_look{};
+    up_look.look_up = 10.0;
+    const auto looked_up = ApplyManualCameraMotion(
+        CameraSample{0, 0, 0, 0, 0, 0, 70}, up_look, tuning, 0.0);
+    ManualCameraMotion down_look{};
+    down_look.look_up = -10.0;
+    const auto looked_down = ApplyManualCameraMotion(
+        CameraSample{0, 0, 0, 0, 0, 0, 70}, down_look, tuning, 0.0);
+    auto only_y_inverted = tuning;
+    only_y_inverted.invert_y = true;
+    const auto inverted_up = ApplyManualCameraMotion(
+        CameraSample{0, 0, 0, 0, 0, 0, 70}, up_look, only_y_inverted, 0.0);
+    const auto inverted_right = ApplyManualCameraMotion(
+        CameraSample{0, 0, 0, 0, 0, 0, 70}, right_look, only_y_inverted, 0.0);
+    Check(looked_up.pitch > 0.0 && looked_down.pitch < 0.0 && inverted_up.pitch < 0.0 &&
+              std::abs(inverted_right.yaw - looked_right.yaw) < 1e-9,
+          "default vertical is physical up/down and Invert Y changes vertical only");
+
+    constexpr FreeCameraInputReadiness all_ready{true, true, true, true, true, true, true};
+    auto mouse_missing = all_ready;
+    mouse_missing.raw_input_ready = false;
+    Check(all_ready.FullyReady() && !mouse_missing.FullyReady() && !mouse_missing.MouseReady(),
+          "keyboard readiness cannot mask a missing relative mouse route");
+    Check(ShouldReacquireFreeCameraInputAfterMenu(true, false, true, true) &&
+              !ShouldReacquireFreeCameraInputAfterMenu(false, false, true, true) &&
+              !ShouldReacquireFreeCameraInputAfterMenu(true, false, false, true),
+          "only an OPEN to CLOSED transition with requested active Free Camera reacquires input");
+    const auto acquisition_reset = ResetMouseAcquisition();
+    Check(acquisition_reset.accumulated_look_right == 0 &&
+              acquisition_reset.accumulated_look_up == 0 &&
+              acquisition_reset.raw_timestamp_ms == 0 &&
+              acquisition_reset.fallback_timestamp_ms == 0 &&
+              !acquisition_reset.fallback_seeded &&
+              acquisition_reset.discard_next_fallback_sample,
+          "input reacquisition clears stale deltas/timestamps and requests one fresh fallback sample");
+    FreeCameraMenuLifecycle lifecycle{};
+    lifecycle.free_camera_requested = true;
+    lifecycle.free_camera_active = true;
+    lifecycle.readiness = all_ready;
+    const CameraSample retained_composition{123, -1177, 473.2, -7.38, 95.8, 15, 40};
+    auto composition = retained_composition;
+    auto repeated_transitions_ready = lifecycle.CanConsume();
+    for (auto cycle = 0; cycle < 20; ++cycle) {
+        lifecycle.mouse = {19, -7, 101, 202, true, false};
+        lifecycle.OpenMenu();
+        repeated_transitions_ready = repeated_transitions_ready &&
+            lifecycle.menu_open && !lifecycle.CanConsume() && !lifecycle.readiness.FullyReady() &&
+            lifecycle.mouse.accumulated_look_right == 0 &&
+            lifecycle.mouse.accumulated_look_up == 0 &&
+            lifecycle.mouse.raw_timestamp_ms == 0 &&
+            lifecycle.mouse.fallback_timestamp_ms == 0 &&
+            !lifecycle.mouse.fallback_seeded &&
+            lifecycle.mouse.discard_next_fallback_sample;
+        repeated_transitions_ready = repeated_transitions_ready &&
+            lifecycle.CloseMenu(all_ready) && lifecycle.CanConsume() &&
+            composition.x == retained_composition.x &&
+            composition.y == retained_composition.y &&
+            composition.z == retained_composition.z &&
+            composition.pitch == retained_composition.pitch &&
+            composition.yaw == retained_composition.yaw &&
+            composition.roll == retained_composition.roll &&
+            composition.fov == retained_composition.fov;
+    }
+    Check(repeated_transitions_ready && lifecycle.successful_reacquisitions == 20,
+          "twenty mutable OPEN to CLOSED cycles suspend, reset, reacquire, and retain composition");
+    lifecycle.OpenMenu();
+    Check(!lifecycle.CloseMenu(mouse_missing) && !lifecycle.CanConsume(),
+          "incomplete mouse readiness cannot consume keyboard or wheel input");
+    lifecycle.OpenMenu();
+    Check(lifecycle.CloseMenu(all_ready) && lifecycle.CanConsume(),
+          "retry restores a fully consumable Free Camera input route");
     motion = {};
     motion.forward = 1.0;
     auto boosted_tuning = tuning;

@@ -246,6 +246,34 @@ void RequestCapture(const FrameContext& context) noexcept {
     }
 }
 
+[[nodiscard]] const char* ManualInputFailureText(const std::uint32_t failure) noexcept {
+    switch (failure) {
+        case 0: return "None";
+        case 1: return "Invalid HWND / window thread";
+        case 2: return "SDL API unavailable";
+        case 3: return "SDL window unavailable";
+        case 4: return "Menu open / foreground mismatch";
+        case 5: return "SDL relative enable failed";
+        case 6: return "SDL relative verification failed";
+        case 7: return "Raw Input registration missing";
+        case 8: return "Readiness validation incomplete";
+        case 9: return "Camera snapshot not ready";
+        case 10: return "Menu input restore failed";
+        default: return "Unknown";
+    }
+}
+
+[[nodiscard]] const char* RawRegistrationText(const std::uint32_t disposition) noexcept {
+    switch (disposition) {
+        case 0: return "Query failed / not sampled";
+        case 1: return "No mouse registration";
+        case 2: return "Foreground target";
+        case 3: return "Deadlock HWND target";
+        case 4: return "Different HWND target";
+        default: return "Unknown";
+    }
+}
+
 [[nodiscard]] bool HasUnsavedCampathWork(const SmvmSnapshotPayload& snapshot) noexcept {
     return (snapshot.flags & smvm_snapshot_campath_unsaved) != 0 ||
            (snapshot.campath_session == SmvmCampathSession::draft_path &&
@@ -451,7 +479,14 @@ void DrawCameraPage(const FrameContext& context) noexcept {
         ImGui::SameLine();
         if (smvm_theme::Button("Next", true, ImVec2(70.0F * scale, 0.0F)))
             QueueAction(context, SmvmActionType::next_player);
-        if (context.state->free_camera_activation_pending) {
+        if (context.params->free_camera_input_error) {
+            ImGui::PushStyleColor(ImGuiCol_Text, smvm_theme::Vec4(smvm_theme::colors::kError));
+            ImGui::TextUnformatted(
+                "Free Camera kept the menu open because relative mouse input was not ready.");
+            ImGui::PopStyleColor();
+            if (smvm_theme::Button("Retry Input", manual_active, ImVec2(108.0F * scale, 0.0F)))
+                SmvmReacquireFreeCameraInput();
+        } else if (context.state->free_camera_activation_pending) {
             SecondaryText("Starting Free Camera from the current rendered view...");
         } else if (GetTickCount64() < context.state->free_camera_activation_error_until_ms) {
             ImGui::PushStyleColor(ImGuiCol_Text, smvm_theme::Vec4(smvm_theme::colors::kError));
@@ -1202,6 +1237,57 @@ void DrawAdvancedSettings(const FrameContext& context) noexcept {
         value = {};
         static_cast<void>(std::snprintf(value.data(), value.size(), "0x%08X", params.overlay_flags));
         smvm_theme::ValueRow("Overlay Flags", value.data(), true);
+        smvm_theme::EndSection();
+    }
+    ImGui::Spacing();
+
+    if (smvm_theme::BeginSection("Free Camera Input")) {
+        const auto flags = params.overlay_flags;
+        const auto flag = [flags](const std::uint32_t value) noexcept {
+            return (flags & value) != 0;
+        };
+        const auto keyboard_ready = flag(smvm_overlay_keyboard_ready);
+        const auto relative_ready = flag(smvm_overlay_relative_mouse_ready);
+        const auto raw_ready = flag(smvm_overlay_raw_input_ready);
+        const auto cursor_ready = flag(smvm_overlay_cursor_ready);
+        const auto foreground_ready = flag(smvm_overlay_foreground_ready);
+        const auto wndproc_ready = flag(smvm_overlay_window_procedure_ready);
+        const auto engine_ready = flag(smvm_overlay_engine_input_ready);
+        smvm_theme::ValueRow("Keyboard", keyboard_ready ? "Ready" : "Suspended", false, true);
+        smvm_theme::ValueRow("SDL Relative", relative_ready ? "Ready" : "Suspended", false,
+                             true);
+        smvm_theme::ValueRow("Raw Input", raw_ready ? "Registered" : "Not registered", false, true);
+        smvm_theme::ValueRow("Cursor", cursor_ready ? "Captured / hidden" : "Editor owned", false,
+                             true);
+        smvm_theme::ValueRow("Focus / WndProc",
+                             foreground_ready && wndproc_ready ? "Ready" : "Not ready", false,
+                             true);
+        smvm_theme::ValueRow("Engine Input", engine_ready ? "Restored" : "Suspended", false, true);
+        smvm_theme::ValueRow(
+            "Last Failure", ManualInputFailureText(params.free_camera_input_failure), false, true);
+        smvm_theme::ValueRow(
+            "Raw Target", RawRegistrationText(params.raw_registration_disposition), false, true);
+        std::array<char, 64> mouse_age{};
+        const auto now = GetTickCount64();
+        if (params.raw_mouse_timestamp_ms != 0) {
+            static_cast<void>(std::snprintf(
+                mouse_age.data(), mouse_age.size(), "Raw %llu ms ago",
+                static_cast<unsigned long long>(now - params.raw_mouse_timestamp_ms)));
+        } else if (params.fallback_mouse_timestamp_ms != 0) {
+            static_cast<void>(std::snprintf(
+                mouse_age.data(), mouse_age.size(), "Fallback %llu ms ago",
+                static_cast<unsigned long long>(now - params.fallback_mouse_timestamp_ms)));
+        } else {
+            static_cast<void>(std::snprintf(mouse_age.data(), mouse_age.size(), "Awaiting motion"));
+        }
+        smvm_theme::ValueRow("Last Mouse", mouse_age.data(), true);
+        const auto manual_active = (snapshot.flags & smvm_snapshot_manual_camera_active) != 0;
+        if (smvm_theme::Button(
+                "REACQUIRE FREE CAMERA INPUT", manual_active, ImVec2(248.0F * scale, 0.0F)))
+            SmvmReacquireFreeCameraInput();
+        if (!manual_active)
+            smvm_theme::Tooltip("Enter Free Camera before reacquiring its input route.");
+        SecondaryText("Preserves Position, Pitch/Yaw, Roll, FOV, and camera ownership.");
         smvm_theme::EndSection();
     }
     ImGui::Spacing();

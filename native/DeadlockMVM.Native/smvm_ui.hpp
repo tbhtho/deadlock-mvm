@@ -100,6 +100,11 @@ struct SmvmUiFrameParams final {
     std::uint32_t frame_microseconds{};
     std::uint32_t overlay_flags{};
     std::uint32_t renderer_error{};
+    std::uint64_t raw_mouse_timestamp_ms{};
+    std::uint64_t fallback_mouse_timestamp_ms{};
+    bool free_camera_input_error{};
+    std::uint32_t free_camera_input_failure{};
+    std::uint32_t raw_registration_disposition{};
     std::function<bool(const SmvmActionPayload&)> queue_action{};
     std::function<void()> request_capture{};
 };
@@ -132,5 +137,6 @@ void SmvmBeginBindingCapture(std::int32_t action, std::uint32_t original) noexce
 void SmvmClearBinding(std::int32_t action, std::uint32_t original) noexcept;
 void SmvmCloseMenu() noexcept;
 void SmvmOpenMenu() noexcept;
+void SmvmReacquireFreeCameraInput() noexcept;
 
 } // namespace deadlock_mvm

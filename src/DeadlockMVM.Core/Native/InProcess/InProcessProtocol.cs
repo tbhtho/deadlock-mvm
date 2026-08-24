@@ -86,6 +86,15 @@ public enum SmvmOverlayFlags : uint
     CleanView = 1 << 4,
     ManualPointerActive = 1 << 5,
     ManualMouseObserved = 1 << 6,
+    ManualPointerRequested = 1 << 7,
+    KeyboardReady = 1 << 8,
+    RelativeMouseReady = 1 << 9,
+    RawInputReady = 1 << 10,
+    CursorReady = 1 << 11,
+    ForegroundReady = 1 << 12,
+    WindowProcedureReady = 1 << 13,
+    EngineInputReady = 1 << 14,
+    FallbackMouseObserved = 1 << 15,
 }
 
 [Flags]
@@ -501,7 +510,7 @@ public sealed record InProcessCameraStatus(
 internal static class InProcessProtocol
 {
     public const uint Magic = 0x4D564D43;
-    public const ushort Version = 10;
+    public const ushort Version = 11;
     public const int HeaderSize = 20;
     public const int StatusSize = 264;
     public const int SmvmSnapshotSize = 728;
@@ -779,7 +788,12 @@ internal static class InProcessProtocol
         const SmvmOverlayFlags knownOverlayFlags =
             SmvmOverlayFlags.HookInstalled | SmvmOverlayFlags.PresentObserved |
             SmvmOverlayFlags.Ready | SmvmOverlayFlags.MenuOpen | SmvmOverlayFlags.CleanView |
-            SmvmOverlayFlags.ManualPointerActive | SmvmOverlayFlags.ManualMouseObserved;
+            SmvmOverlayFlags.ManualPointerActive | SmvmOverlayFlags.ManualMouseObserved |
+            SmvmOverlayFlags.ManualPointerRequested | SmvmOverlayFlags.KeyboardReady |
+            SmvmOverlayFlags.RelativeMouseReady | SmvmOverlayFlags.RawInputReady |
+            SmvmOverlayFlags.CursorReady | SmvmOverlayFlags.ForegroundReady |
+            SmvmOverlayFlags.WindowProcedureReady | SmvmOverlayFlags.EngineInputReady |
+            SmvmOverlayFlags.FallbackMouseObserved;
         if (!Enum.IsDefined(state) || !Enum.IsDefined(error) || (flags & ~knownStatusFlags) != 0 ||
             !Enum.IsDefined(rendererBackend) || !Enum.IsDefined(rendererError) ||
             (overlayFlags & ~knownOverlayFlags) != 0)

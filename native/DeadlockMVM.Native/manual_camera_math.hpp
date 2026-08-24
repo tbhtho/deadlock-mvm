@@ -11,8 +11,9 @@ struct ManualCameraMotion final {
     double forward{};
     double right{};
     double up{};
-    double mouse_x{};
-    double mouse_y{};
+    // Canonical mouse impulses: positive is physical right/up.
+    double look_right{};
+    double look_up{};
     double roll{};
     double wheel_steps{};
     bool reset_roll{};
@@ -70,8 +71,13 @@ struct ManualCameraTuning final {
     result.y += distance * ((motion.forward * forward_y) + (motion.right * right_y) + (motion.up * up_y));
     result.z += distance * ((motion.forward * forward_z) + (motion.right * right_z) + (motion.up * up_z));
 
-    result.yaw = NormalizeAngle(result.yaw + (motion.mouse_x * tuning.mouse_sensitivity));
-    const auto pitch_delta = motion.mouse_y * tuning.mouse_sensitivity * (tuning.invert_y ? -1.0 : 1.0);
+    // Deadlock's rendered spectator angles turn toward physical right when Yaw
+    // decreases and toward physical up when Pitch increases. Keep that engine
+    // convention here, after both Raw Input and the fallback have normalized to
+    // the transport-independent right/up convention.
+    result.yaw = NormalizeAngle(result.yaw - (motion.look_right * tuning.mouse_sensitivity));
+    const auto pitch_delta = motion.look_up * tuning.mouse_sensitivity *
+        (tuning.invert_y ? -1.0 : 1.0);
     result.pitch = std::clamp(result.pitch + pitch_delta, -89.0, 89.0);
     result.roll = motion.reset_roll
         ? 0.0
