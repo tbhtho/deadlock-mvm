@@ -17,6 +17,9 @@ struct SmvmOverlayCallbacks final {
         CampathPayloadHeader& header,
         CampathKeyframe* keyframes,
         std::size_t capacity) noexcept{};
+    // Latest Campath document list pushed by the managed host; returns false
+    // when none was received or the last copy is stale.
+    bool (*read_campath_documents)(void* context, CampathDocumentsPayload& documents) noexcept{};
     bool (*queue_action)(void* context, const SmvmActionPayload& action) noexcept{};
     void (*request_camera_capture)(void* context) noexcept{};
     void (*publish_status)(

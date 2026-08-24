@@ -8,7 +8,6 @@ using DeadlockMVM.Core.Contracts;
 using DeadlockMVM.Core.Models;
 using DeadlockMVM.Core.Native.InProcess;
 using DeadlockMVM.Core.Services;
-using DeadlockMVM.Launcher.Director;
 using MvmInputBinding = DeadlockMVM.Core.Models.InputBinding;
 
 namespace DeadlockMVM.Launcher.ViewModels;
@@ -22,11 +21,9 @@ public sealed class MainViewModel : ViewModelBase
     private readonly ILogService _log;
     private readonly IAppSettings _settings;
     private readonly DispatcherTimer _timer;
-    private DirectorWindow? _director;
 
     private string _gameExecutablePath = string.Empty;
     private string _extraArguments = string.Empty;
-    private string _directorHotkey = "Ctrl+Alt+M";
     private string _commandPreview = string.Empty;
     private string _statusMessage = "Ready";
     private string _steamPath = string.Empty;
@@ -63,7 +60,6 @@ public sealed class MainViewModel : ViewModelBase
         _extraArguments = string.IsNullOrWhiteSpace(settings.ExtraLaunchArguments)
             ? DefaultLaunchArguments
             : settings.ExtraLaunchArguments;
-        _directorHotkey = settings.DirectorHotkey;
 
         LaunchCommand = new RelayCommand(Launch, () => CanLaunch);
         RefreshCommand = new RelayCommand(Refresh);
@@ -74,7 +70,6 @@ public sealed class MainViewModel : ViewModelBase
         ShowHomeCommand = new RelayCommand(() => IsReplaysPage = false);
         ShowReplaysCommand = new RelayCommand(ShowReplaysPage);
         UseSelectedReplayCommand = new RelayCommand(UseSelectedReplay);
-        OpenDirectorCommand = new RelayCommand(OpenDirector, () => _director is not null);
 
         _timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(3) };
         _timer.Tick += (_, _) => RefreshProcesses();
@@ -99,23 +94,6 @@ public sealed class MainViewModel : ViewModelBase
     public ICommand ShowReplaysCommand { get; }
 
     public ICommand UseSelectedReplayCommand { get; }
-
-    public ICommand OpenDirectorCommand { get; }
-
-    public IReadOnlyList<SmvmInterfaceMode> InterfaceModes { get; } = Enum.GetValues<SmvmInterfaceMode>();
-
-    public SmvmInterfaceMode InterfaceMode
-    {
-        get => _settings.InterfaceMode;
-        set
-        {
-            if (_settings.InterfaceMode == value || !Enum.IsDefined(value))
-                return;
-            _settings.InterfaceMode = value;
-            _settings.Save();
-            OnPropertyChanged(nameof(InterfaceMode));
-        }
-    }
 
     public string SmvmMenuHotkey
     {
@@ -210,13 +188,6 @@ public sealed class MainViewModel : ViewModelBase
             OnPropertyChanged(propertyName);
             return;
         }
-        if (parsedCandidate is { } reserved && MvmInputBinding.TryParse(_settings.DirectorHotkey, out var director) &&
-            reserved == director)
-        {
-            StatusMessage = $"{candidate} is already assigned to the external Director.";
-            OnPropertyChanged(propertyName);
-            return;
-        }
         assign(candidate);
         _settings.Save();
         OnPropertyChanged(propertyName);
@@ -248,12 +219,6 @@ public sealed class MainViewModel : ViewModelBase
         ["Undo"] = _settings.SmvmUndoHotkey,
         ["Redo"] = _settings.SmvmRedoHotkey,
     };
-
-    public void SetDirector(DirectorWindow director)
-    {
-        _director = director;
-        (OpenDirectorCommand as RelayCommand)?.RaiseCanExecuteChanged();
-    }
 
     public ObservableCollection<ReplayInfo> Replays { get; } = new();
 
@@ -334,36 +299,6 @@ public sealed class MainViewModel : ViewModelBase
                 _settings.ExtraLaunchArguments = _extraArguments;
                 UpdateCommandPreview();
             }
-        }
-    }
-
-    public string DirectorHotkey
-    {
-        get => _directorHotkey;
-        set
-        {
-            var candidate = value?.Trim() ?? string.Empty;
-            if (!MvmInputBinding.TryParse(candidate, out var parsed) || parsed.Kind != InputBindingKind.Keyboard)
-            {
-                StatusMessage = $"{candidate} is not a valid keyboard Director hotkey.";
-                OnPropertyChanged(nameof(DirectorHotkey));
-                return;
-            }
-            candidate = parsed.ToString();
-            var conflict = GetSmvmBindings().FirstOrDefault(pair =>
-                MvmInputBinding.TryParse(pair.Value, out var binding) && binding == parsed);
-            if (!string.IsNullOrEmpty(conflict.Key))
-            {
-                StatusMessage = $"{candidate} is already assigned to {conflict.Key.Replace("Smvm", string.Empty).Replace("Hotkey", string.Empty)}.";
-                OnPropertyChanged(nameof(DirectorHotkey));
-                return;
-            }
-            if (!SetProperty(ref _directorHotkey, candidate))
-                return;
-
-            _settings.DirectorHotkey = _directorHotkey;
-            _settings.Save();
-            StatusMessage = $"Director hotkey set to {_directorHotkey}.";
         }
     }
 
@@ -702,12 +637,6 @@ public sealed class MainViewModel : ViewModelBase
                     _log.Info(confirmed
                         ? $"Playback confirmed by engine: '{gamePath}.dem'"
                         : $"Playback NOT confirmed within timeout: '{gamePath}.dem'");
-
-                    if (confirmed && _director is not null &&
-                        _settings.InterfaceMode is SmvmInterfaceMode.ExternalDirector or SmvmInterfaceMode.BothDeveloper)
-                    {
-                        System.Windows.Application.Current.Dispatcher.Invoke(() => _director.ToggleVisibility());
-                    }
                 },
                 CancellationToken.None,
                 TaskCreationOptions.None,
@@ -738,11 +667,6 @@ public sealed class MainViewModel : ViewModelBase
         _settings.Save();
         StatusMessage = "Searching Steam libraries...";
         Refresh();
-    }
-
-    private void OpenDirector()
-    {
-        _director?.ToggleVisibility();
     }
 
     public void RefreshReplays()

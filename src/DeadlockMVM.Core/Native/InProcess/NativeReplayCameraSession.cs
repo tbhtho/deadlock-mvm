@@ -2052,6 +2052,25 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         UpdateStatus(status);
     }
 
+    /// <summary>Publishes the bounded saved-path picker list for the internal Load UI.</summary>
+    public async Task PublishCampathDocumentsAsync(
+        IReadOnlyList<CampathDocumentInfo> documents,
+        CampathReplayIdentifier? currentReplay,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(documents);
+        var client = _client;
+        if (client?.Connected != true)
+            return;
+        var status = await client.SetCampathDocumentsAsync(
+            documents.Count > InProcessProtocol.MaxCampathDocuments
+                ? documents.Take(InProcessProtocol.MaxCampathDocuments).ToArray()
+                : documents,
+            currentReplay,
+            cancellationToken).ConfigureAwait(false);
+        UpdateStatus(status);
+    }
+
     private void OnStatusChanged() => StatusChanged?.Invoke(this, EventArgs.Empty);
 
     private static bool IsConfirmedReplay(ReplayState replay) =>

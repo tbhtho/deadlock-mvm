@@ -165,13 +165,6 @@
                             <TextBox Style="{StaticResource ReadOnlyCommand}"
                                      Text="{Binding CommandPreview, Mode=OneWay}"
                                      Margin="0,6,0,0" />
-                            <TextBlock Text="Interface mode (restart to apply)"
-                                       Style="{StaticResource SectionLabel}"
-                                       Margin="0,10,0,0" />
-                            <ComboBox Style="{StaticResource DarkComboBox}"
-                                      ItemsSource="{Binding InterfaceModes}"
-                                      SelectedItem="{Binding InterfaceMode, Mode=TwoWay}"
-                                      Margin="0,6,0,0" />
                             <Grid Margin="0,10,0,0">
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="*" />
@@ -208,28 +201,16 @@
                                 <TextBox Grid.Row="6" Grid.Column="1" Style="{StaticResource DarkTextBox}"
                                          Text="{Binding SmvmRollResetHotkey}" Margin="6,0,0,0" />
                             </Grid>
-                            <TextBlock Text="Director hotkey (restart to apply)"
-                                       Style="{StaticResource SectionLabel}"
-                                       Margin="0,10,0,0" />
-                            <TextBox Style="{StaticResource DarkTextBox}"
-                                     Text="{Binding DirectorHotkey, UpdateSourceTrigger=PropertyChanged}"
-                                     Margin="0,6,0,0" />
                             <Grid Margin="0,10,0,0">
     <Grid.ColumnDefinitions>
-        <ColumnDefinition Width="Auto" />
         <ColumnDefinition Width="Auto" />
         <ColumnDefinition Width="Auto" />
     </Grid.ColumnDefinitions>
     <Button Content="Open logs"
             Style="{StaticResource SmallButton}"
             Command="{Binding OpenLogsCommand}" />
-    <Button Content="Open Director"
-            Grid.Column="1"
-            Style="{StaticResource SmallButton}"
-            Command="{Binding OpenDirectorCommand}"
-            Margin="8,0,0,0" />
     <Button Content="Reset detected path"
-            Grid.Column="2"
+            Grid.Column="1"
             Style="{StaticResource SmallButton}"
             Command="{Binding ResetDeadlockPathCommand}"
             Margin="8,0,0,0" />

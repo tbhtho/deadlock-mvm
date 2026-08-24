@@ -1,12 +1,5 @@
 namespace DeadlockMVM.Core.Models;
 
-public enum HotkeyAction
-{
-    CampathAddKeyframe,
-    CampathPlay,
-    CampathStop,
-}
-
 public enum InputBindingKind
 {
     Keyboard,
@@ -145,20 +138,4 @@ public readonly record struct InputBinding(InputBindingKind Kind, uint Code, Inp
         7 => "WheelDown",
         _ => $"Mouse{code}",
     };
-}
-
-public static class HotkeyConflictDetector
-{
-    public static HotkeyAction? FindConflict(
-        IReadOnlyDictionary<HotkeyAction, InputBinding> bindings,
-        HotkeyAction action,
-        InputBinding candidate)
-    {
-        foreach (var pair in bindings)
-        {
-            if (pair.Key != action && pair.Value == candidate)
-                return pair.Key;
-        }
-        return null;
-    }
 }

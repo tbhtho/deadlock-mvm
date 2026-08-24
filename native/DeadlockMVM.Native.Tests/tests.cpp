@@ -74,6 +74,47 @@ void ProtocolTests() {
               popped_action.type == deadlock_mvm::SmvmActionType::toggle_replay_pause,
           "current connection epoch still transfers editor actions");
 
+    const auto ready_capture = deadlock_mvm::SmvmCaptureAvailability{
+        true, true, true, true, true, true, false, false};
+    Check(deadlock_mvm::CaptureRejectionFor(ready_capture) ==
+              deadlock_mvm::SmvmCaptureRejection::none,
+          "capture gate accepts one fresh Free Roam frame");
+    auto rejected_capture = ready_capture;
+    rejected_capture.replay_available = false;
+    Check(deadlock_mvm::CaptureRejectionFor(rejected_capture) ==
+              deadlock_mvm::SmvmCaptureRejection::replay_unavailable,
+          "capture gate reports replay loss precisely");
+    rejected_capture = ready_capture;
+    rejected_capture.free_roam = false;
+    Check(deadlock_mvm::CaptureRejectionFor(rejected_capture) ==
+              deadlock_mvm::SmvmCaptureRejection::not_in_free_roam,
+          "capture gate reports observer-mode loss precisely");
+    rejected_capture = ready_capture;
+    rejected_capture.snapshot_fresh = false;
+    Check(deadlock_mvm::CaptureRejectionFor(rejected_capture) ==
+              deadlock_mvm::SmvmCaptureRejection::snapshot_stale,
+          "capture gate distinguishes a stale editor snapshot");
+    rejected_capture = ready_capture;
+    rejected_capture.camera_readable = false;
+    Check(deadlock_mvm::CaptureRejectionFor(rejected_capture) ==
+              deadlock_mvm::SmvmCaptureRejection::camera_unreadable,
+          "capture gate distinguishes an unreadable camera");
+    rejected_capture = ready_capture;
+    rejected_capture.hook_frame_fresh = false;
+    Check(deadlock_mvm::CaptureRejectionFor(rejected_capture) ==
+              deadlock_mvm::SmvmCaptureRejection::hook_frame_stale,
+          "capture gate distinguishes a stale hook frame");
+    rejected_capture = ready_capture;
+    rejected_capture.campath_owns_camera = true;
+    Check(deadlock_mvm::CaptureRejectionFor(rejected_capture) ==
+              deadlock_mvm::SmvmCaptureRejection::campath_owns_camera,
+          "capture gate reports Campath ownership precisely");
+    rejected_capture = ready_capture;
+    rejected_capture.capture_pending = true;
+    Check(deadlock_mvm::CaptureRejectionFor(rejected_capture) ==
+              deadlock_mvm::SmvmCaptureRejection::capture_already_pending,
+          "capture gate rejects a duplicate pending request");
+
     deadlock_mvm::SmvmInputRoute mouse_route;
     Check(mouse_route.Claim(1u), "first raw mouse route owns the physical press");
     Check(!mouse_route.Claim(2u), "legacy duplicate does not create a second mouse press");
@@ -112,8 +153,8 @@ void ProtocolTests() {
           "sample payload size is fixed");
     Check(ExpectedPayloadSize(MessageType::get_status) == 0, "status request has no payload");
     Check(sizeof(HeartbeatPayload) == 24, "heartbeat carries the replay clock calibration");
-    Check(sizeof(SmvmSnapshotPayload) == 640 && sizeof(StatusPayload) == 264,
-          "SMVM v7 snapshot and status layouts are fixed");
+    Check(sizeof(SmvmSnapshotPayload) == 688 && sizeof(StatusPayload) == 264,
+          "SMVM v8 snapshot and status layouts are fixed");
     Check(ExpectedPayloadSize(MessageType::set_roll_override) == sizeof(RollPayload),
           "roll override payload is one narrowly typed value");
     Check(ValidatePayloadSize(MessageType::prepare_camera_observation, 0),
@@ -131,7 +172,7 @@ void ProtocolTests() {
           "fixed SMVM snapshot payload is accepted");
 
     SmvmSnapshotPayload snapshot{};
-    snapshot.snapshot_version = 2;
+    snapshot.snapshot_version = 4;
     snapshot.current_tick = -1;
     snapshot.total_ticks = -1;
     snapshot.timescale = 1.0;
@@ -140,6 +181,7 @@ void ProtocolTests() {
     snapshot.add_key = static_cast<std::uint32_t>(SmvmInputCode::mouse_middle);
     snapshot.delete_key = 'L';
     snapshot.clean_view_key = 0x79;
+    snapshot.restore_ui_key = 0x78;
     snapshot.roll_left_key = 0;
     snapshot.roll_right_key = 0;
     snapshot.roll_reset_key = 0;
@@ -151,6 +193,9 @@ void ProtocolTests() {
     snapshot.ui_scale = 1.0;
     snapshot.menu_opacity = 1.0;
     snapshot.path_label_scale = 1.0;
+    snapshot.vconsole_port = 29000;
+    snapshot.replay_bar_scale = 1.0;
+    snapshot.replay_bar_opacity = 0.92;
     Check(ValidateSmvmSnapshotPayload(snapshot), "well-formed immutable SMVM snapshot is accepted");
     snapshot.flags = 1u << 31;
     Check(!ValidateSmvmSnapshotPayload(snapshot), "unknown SMVM snapshot flags fail closed");
@@ -176,6 +221,27 @@ void ProtocolTests() {
     Check(!ValidateSmvmSnapshotPayload(snapshot), "camera-readable snapshot requires a valid sample");
     snapshot.camera = CameraSample{1, 2, 3, 4, 5, 0, 70};
     Check(ValidateSmvmSnapshotPayload(snapshot), "camera-readable snapshot accepts typed camera data");
+    snapshot.campath_session = SmvmCampathSession::saved_path;
+    snapshot.flags |= smvm_snapshot_campath_unsaved | smvm_snapshot_campath_recovery_available;
+    Check(ValidateSmvmSnapshotPayload(snapshot), "typed Campath session and workspace flags are accepted");
+    snapshot.campath_session = static_cast<SmvmCampathSession>(3);
+    Check(!ValidateSmvmSnapshotPayload(snapshot), "out-of-range Campath session is rejected");
+    snapshot.campath_session = SmvmCampathSession::no_path;
+    snapshot.saved_document_count = kMaxCampathDocuments + 1;
+    Check(!ValidateSmvmSnapshotPayload(snapshot), "out-of-range saved document count is rejected");
+    snapshot.saved_document_count = 2;
+    snapshot.flags &= ~(smvm_snapshot_campath_unsaved | smvm_snapshot_campath_recovery_available);
+    Check(ValidateSmvmSnapshotPayload(snapshot), "bounded saved document count is accepted");
+
+    Check(sizeof(CampathDocumentEntry) == 144, "Campath document entry layout is fixed");
+    Check(ValidatePayloadSize(MessageType::set_campath_documents,
+                              8 + (3 * sizeof(CampathDocumentEntry))),
+          "bounded Campath document list payload is accepted");
+    Check(!ValidatePayloadSize(MessageType::set_campath_documents,
+                               8 + (kMaxCampathDocuments + 1) * sizeof(CampathDocumentEntry)),
+          "oversized Campath document list payload is rejected");
+    Check(!ValidatePayloadSize(MessageType::set_campath_documents, 8 + 7),
+          "misaligned Campath document list payload is rejected");
 
     CameraSample sample{100, -200, 300, 5, 120, 0, 70};
     Check(ValidateSample(sample), "cinematic sample is accepted");

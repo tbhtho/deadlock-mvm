@@ -55,6 +55,7 @@ constexpr std::size_t kUpdateVtableIndex = 3;
 constexpr std::uint64_t kHeartbeatTimeoutMilliseconds = 1000;
 constexpr std::uint64_t kCameraObservationFreshMilliseconds = 500;
 constexpr std::uint64_t kSmvmSnapshotFreshMilliseconds = 500;
+constexpr std::uint64_t kInternalCaptureTimeoutMilliseconds = 2000;
 constexpr auto kClientModuleWaitTimeout = std::chrono::seconds(30);
 
 using CameraUpdate = void*(__fastcall*)(void* camera);
@@ -411,10 +412,13 @@ struct Backend final {
     std::atomic<std::uint64_t> camera_observed_milliseconds{0};
     std::atomic<bool> smvm_snapshot_available{false};
     std::atomic<std::uint64_t> smvm_snapshot_milliseconds{0};
+    std::atomic<bool> smvm_documents_available{false};
+    std::atomic<std::uint64_t> smvm_documents_milliseconds{0};
     std::atomic<bool> editor_campath_available{false};
     // Zero means no pending capture; otherwise this is action-queue epoch + 1.
     // Keeping request+epoch in one atomic prevents reconnect/new-click races.
     std::atomic<std::uint64_t> internal_capture_epoch_token{0};
+    std::atomic<std::uint64_t> internal_capture_requested_milliseconds{0};
     std::atomic<SmvmRendererBackend> renderer_backend{SmvmRendererBackend::none};
     std::atomic<SmvmRendererError> renderer_error{SmvmRendererError::renderer_not_loaded};
     std::atomic<std::uint32_t> overlay_flags{0};
@@ -435,6 +439,7 @@ struct Backend final {
     AtomicCampath campath{};
     AtomicCampath editor_campath{};
     AtomicPacket<SmvmSnapshotPayload> smvm_snapshot{};
+    AtomicPacket<CampathDocumentsPayload> smvm_documents{};
     SmvmActionQueue smvm_actions{};
     std::uint64_t manual_seen_generation{};
     std::int64_t manual_last_counter{};
@@ -450,6 +455,54 @@ Backend* g_backend = nullptr;
     const auto received_at = backend.smvm_snapshot_milliseconds.load(std::memory_order_acquire);
     return backend.smvm_snapshot_available.load(std::memory_order_acquire) && received_at != 0 &&
            GetTickCount64() - received_at <= kSmvmSnapshotFreshMilliseconds;
+}
+
+[[nodiscard]] bool HasFreshSmvmDocuments(const Backend& backend) noexcept {
+    const auto received_at = backend.smvm_documents_milliseconds.load(std::memory_order_acquire);
+    return backend.smvm_documents_available.load(std::memory_order_acquire) && received_at != 0 &&
+           GetTickCount64() - received_at <= kSmvmSnapshotFreshMilliseconds;
+}
+
+[[nodiscard]] bool CaptureDiagnosticsEnabled(const Backend& backend) noexcept {
+    SmvmSnapshotPayload snapshot{};
+    return backend.smvm_snapshot.Load(snapshot) &&
+           (snapshot.flags & smvm_snapshot_capture_diagnostics) != 0;
+}
+
+[[nodiscard]] bool QueueCaptureDiagnostic(
+    Backend& backend,
+    const SmvmCaptureStage stage,
+    const SmvmCaptureRejection rejection,
+    const std::uint64_t action_generation) noexcept {
+    if (stage != SmvmCaptureStage::capture_rejected && !CaptureDiagnosticsEnabled(backend))
+        return true;
+    const SmvmActionPayload action{
+        SmvmActionType::capture_diagnostic,
+        static_cast<std::int32_t>(stage),
+        static_cast<std::int64_t>(rejection),
+        0.0,
+        {},
+        {}};
+    return backend.smvm_actions.TryPush(action, action_generation);
+}
+
+void RejectPendingCapture(
+    Backend& backend,
+    const SmvmCaptureRejection rejection) noexcept {
+    const auto capture_token =
+        backend.internal_capture_epoch_token.exchange(0, std::memory_order_acq_rel);
+    backend.internal_capture_requested_milliseconds.store(0, std::memory_order_release);
+    if (capture_token != 0)
+        static_cast<void>(QueueCaptureDiagnostic(
+            backend, SmvmCaptureStage::capture_rejected, rejection, capture_token - 1));
+}
+
+void ExpirePendingCapture(Backend& backend) noexcept {
+    const auto requested_at =
+        backend.internal_capture_requested_milliseconds.load(std::memory_order_acquire);
+    if (requested_at == 0 || GetTickCount64() - requested_at <= kInternalCaptureTimeoutMilliseconds)
+        return;
+    RejectPendingCapture(backend, SmvmCaptureRejection::hook_frame_stale);
 }
 
 void RevokeCameraOwnership(Backend& backend, const ErrorCode error) noexcept {
@@ -471,6 +524,7 @@ void RevokeCameraOwnership(Backend& backend, const ErrorCode error) noexcept {
     backend.camera_observed.store(false, std::memory_order_release);
     backend.camera_observed_milliseconds.store(0, std::memory_order_release);
     backend.internal_capture_epoch_token.store(0, std::memory_order_release);
+    backend.internal_capture_requested_milliseconds.store(0, std::memory_order_release);
     const auto existing_error = backend.error.load(std::memory_order_acquire);
     if (backend.state.load(std::memory_order_acquire) != BackendState::failed ||
         existing_error == ErrorCode::none || error == ErrorCode::protocol_error)
@@ -495,6 +549,15 @@ void RevokeCameraOwnership(Backend& backend, const ErrorCode error) noexcept {
            backend->editor_campath.Copy(header, keyframes, capacity);
 }
 
+[[nodiscard]] bool OverlayReadCampathDocuments(
+    void* context,
+    CampathDocumentsPayload& documents) noexcept {
+    auto* backend = static_cast<Backend*>(context);
+    return backend != nullptr && backend->pipe_connected.load(std::memory_order_acquire) &&
+           HasFreshSmvmDocuments(*backend) &&
+           backend->smvm_documents.Load(documents);
+}
+
 [[nodiscard]] bool OverlayQueueAction(void* context, const SmvmActionPayload& action) noexcept {
     auto* backend = static_cast<Backend*>(context);
     const auto action_generation = backend == nullptr ? 0 : backend->smvm_actions.Generation();
@@ -511,15 +574,42 @@ void OverlayRequestCameraCapture(void* context) noexcept {
     const auto observed_at = backend == nullptr
         ? 0
         : backend->camera_observed_milliseconds.load(std::memory_order_acquire);
-    if (backend != nullptr && backend->pipe_connected.load(std::memory_order_acquire) &&
-        backend->replay_active.load(std::memory_order_acquire) &&
-        backend->free_roam.load(std::memory_order_acquire) &&
-        HasFreshSmvmSnapshot(*backend) &&
-        backend->camera_observed.load(std::memory_order_acquire) &&
-        observed_at != 0 && GetTickCount64() - observed_at <= kCameraObservationFreshMilliseconds &&
-        !backend->campath_active.load(std::memory_order_acquire)) {
-        backend->internal_capture_epoch_token.store(action_generation + 1, std::memory_order_release);
+    const auto now = GetTickCount64();
+    const SmvmCaptureAvailability availability{
+        backend != nullptr && backend->pipe_connected.load(std::memory_order_acquire),
+        backend != nullptr && backend->replay_active.load(std::memory_order_acquire),
+        backend != nullptr && backend->free_roam.load(std::memory_order_acquire),
+        backend != nullptr && HasFreshSmvmSnapshot(*backend),
+        backend != nullptr && backend->camera_observed.load(std::memory_order_acquire),
+        observed_at != 0 && now - observed_at <= kCameraObservationFreshMilliseconds,
+        backend != nullptr && backend->campath_active.load(std::memory_order_acquire),
+        backend != nullptr && backend->internal_capture_epoch_token.load(std::memory_order_acquire) != 0,
+    };
+    const auto rejection = CaptureRejectionFor(availability);
+    if (backend == nullptr)
+        return;
+    if (rejection != SmvmCaptureRejection::none) {
+        static_cast<void>(QueueCaptureDiagnostic(
+            *backend, SmvmCaptureStage::capture_rejected, rejection, action_generation));
+        return;
     }
+
+    backend->internal_capture_requested_milliseconds.store(now, std::memory_order_release);
+    auto expected = std::uint64_t{0};
+    if (!backend->internal_capture_epoch_token.compare_exchange_strong(
+            expected, action_generation + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        static_cast<void>(QueueCaptureDiagnostic(
+            *backend,
+            SmvmCaptureStage::capture_rejected,
+            SmvmCaptureRejection::capture_already_pending,
+            action_generation));
+        return;
+    }
+    static_cast<void>(QueueCaptureDiagnostic(
+        *backend,
+        SmvmCaptureStage::native_frame_awaited,
+        SmvmCaptureRejection::none,
+        action_generation));
 }
 
 void OverlayPublishStatus(
@@ -1137,12 +1227,20 @@ void* __fastcall CameraUpdateHook(void* camera) noexcept {
                 const auto capture_token =
                     backend->internal_capture_epoch_token.exchange(0, std::memory_order_acq_rel);
                 if (capture_token != 0) {
+                    backend->internal_capture_requested_milliseconds.store(0, std::memory_order_release);
+                    const auto action_generation = capture_token - 1;
+                    static_cast<void>(QueueCaptureDiagnostic(
+                        *backend,
+                        SmvmCaptureStage::native_frame_captured,
+                        SmvmCaptureRejection::none,
+                        action_generation));
                     const SmvmActionPayload action{
                         SmvmActionType::add_keyframe, -1, tick, 0.0, observed};
-                    const auto action_generation = capture_token - 1;
                     if (!backend->smvm_actions.TryPush(action, action_generation) &&
                         action_generation == backend->smvm_actions.Generation() &&
                         backend->pipe_connected.load(std::memory_order_acquire)) {
+                        backend->internal_capture_requested_milliseconds.store(
+                            GetTickCount64(), std::memory_order_release);
                         auto no_newer_capture = std::uint64_t{0};
                         static_cast<void>(backend->internal_capture_epoch_token.compare_exchange_strong(
                             no_newer_capture, capture_token, std::memory_order_acq_rel));
@@ -1349,6 +1447,7 @@ void* __fastcall CameraUpdateHook(void* camera) noexcept {
 }
 
 [[nodiscard]] StatusPayload BuildStatus(Backend& backend) noexcept {
+    ExpirePendingCapture(backend);
     StatusPayload status{};
     status.state = backend.state.load(std::memory_order_acquire);
     status.error = backend.error.load(std::memory_order_acquire);
@@ -1424,8 +1523,11 @@ void ResetConnectionGate(Backend& backend) noexcept {
     backend.camera_observed_milliseconds.store(0, std::memory_order_release);
     backend.smvm_snapshot_available.store(false, std::memory_order_release);
     backend.smvm_snapshot_milliseconds.store(0, std::memory_order_release);
+    backend.smvm_documents_available.store(false, std::memory_order_release);
+    backend.smvm_documents_milliseconds.store(0, std::memory_order_release);
     backend.editor_campath_available.store(false, std::memory_order_release);
     backend.internal_capture_epoch_token.store(0, std::memory_order_release);
+    backend.internal_capture_requested_milliseconds.store(0, std::memory_order_release);
 }
 
 [[nodiscard]] bool ValidateSmvmSnapshot(const SmvmSnapshotPayload& snapshot) noexcept {
@@ -1655,6 +1757,25 @@ void ResetConnectionGate(Backend& backend) noexcept {
             case MessageType::clear_editor_campath:
                 backend.editor_campath_available.store(false, std::memory_order_release);
                 break;
+            case MessageType::set_campath_documents: {
+                CampathDocumentsPayload documents{};
+                std::memcpy(&documents, payload.data(), header.payload_size);
+                const auto expected_size = sizeof(std::uint32_t) * 2 +
+                    (static_cast<std::size_t>(documents.count) * sizeof(CampathDocumentEntry));
+                if (!hello_received || documents.count > kMaxCampathDocuments ||
+                    expected_size != header.payload_size) {
+                    backend.error.store(ErrorCode::protocol_error, std::memory_order_release);
+                    break;
+                }
+                for (std::uint32_t index = 0; index < documents.count; ++index) {
+                    documents.entries[index].name.back() = '\0';
+                    documents.entries[index].replay_name.back() = '\0';
+                }
+                backend.smvm_documents.Store(documents);
+                backend.smvm_documents_milliseconds.store(GetTickCount64(), std::memory_order_release);
+                backend.smvm_documents_available.store(true, std::memory_order_release);
+                break;
+            }
             case MessageType::get_status:
                 break;
             case MessageType::shutdown:
@@ -1705,6 +1826,7 @@ void ServePipe(Backend& backend) noexcept {
             &backend,
             &OverlayReadSnapshot,
             &OverlayReadEditorPath,
+            &OverlayReadCampathDocuments,
             &OverlayQueueAction,
             &OverlayRequestCameraCapture,
             &OverlayPublishStatus,

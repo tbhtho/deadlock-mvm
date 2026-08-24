@@ -104,6 +104,15 @@ public sealed class NativeReplayCameraClient : IAsyncDisposable
     public Task<InProcessCameraStatus> ClearEditorCampathAsync(CancellationToken cancellationToken = default) =>
         RequestAsync(InProcessMessageType.ClearEditorCampath, Array.Empty<byte>(), cancellationToken);
 
+    public Task<InProcessCameraStatus> SetCampathDocumentsAsync(
+        IReadOnlyList<CampathDocumentInfo> documents,
+        CampathReplayIdentifier? currentReplay,
+        CancellationToken cancellationToken = default) =>
+        RequestAsync(
+            InProcessMessageType.SetCampathDocuments,
+            InProcessProtocol.SerializeCampathDocuments(documents, currentReplay),
+            cancellationToken);
+
     public Task<InProcessCameraStatus> SetCameraSampleAsync(
         CameraSample sample,
         CancellationToken cancellationToken = default) =>

@@ -1,6 +1,5 @@
 namespace DeadlockMVM.Core.Contracts;
 
-using DeadlockMVM.Core.Models;
 using DeadlockMVM.Core.Native.InProcess;
 
 /// <summary>Persists user-configurable launcher settings.</summary>
@@ -16,20 +15,20 @@ public interface IAppSettings
     string SelectedReplayPath { get; set; }
     string SelectedCampathPath { get; set; }
 
+    /// <summary>
+    /// Opt-in: restore the previously saved Campath when a matching replay starts.
+    /// Default OFF — a normal startup always opens a clean, empty workspace.
+    /// </summary>
+    bool RestoreLastWorkspace { get; set; }
+
     /// <summary>TCP port of Deadlock's VConsole2 command channel.</summary>
     int VConsolePort { get; set; }
 
-    /// <summary>Global show/hide hotkey for the Director window (e.g. "Ctrl+Alt+M").</summary>
-    string DirectorHotkey { get; set; }
-
-    /// <summary>Foreground-scoped Campath Add binding (e.g. "Mouse3" or "Ctrl+F6").</summary>
-    string CampathAddHotkey { get; set; }
-
-    SmvmInterfaceMode InterfaceMode { get; set; }
     string SmvmMenuHotkey { get; set; }
     string SmvmAddHotkey { get; set; }
     string SmvmDeleteHotkey { get; set; }
     string SmvmCleanViewHotkey { get; set; }
+    string SmvmRestoreUiHotkey { get; set; }
     bool SmvmCameraInputTakeover { get; set; }
     string SmvmForwardHotkey { get; set; }
     string SmvmBackHotkey { get; set; }
@@ -69,6 +68,10 @@ public interface IAppSettings
     SmvmNotificationAnchor SmvmNotificationAnchor { get; set; }
     double SmvmPathLabelScale { get; set; }
     bool SmvmHidePathWhilePlaying { get; set; }
+    DeadlockUiMode SmvmDeadlockUiMode { get; set; }
+    double SmvmReplayBarScale { get; set; }
+    double SmvmReplayBarOpacity { get; set; }
+    SmvmReplayBarAnchor SmvmReplayBarAnchor { get; set; }
 
     void Load();
 

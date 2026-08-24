@@ -15,17 +15,15 @@ public sealed class AppSettings : IAppSettings
 
         public string SelectedReplayPath { get; set; } = string.Empty;
         public string SelectedCampathPath { get; set; } = string.Empty;
+        public bool RestoreLastWorkspace { get; set; }
 
         public int VConsolePort { get; set; } = DeadlockConstants.DefaultVConsolePort;
 
-        public string DirectorHotkey { get; set; } = "Ctrl+Alt+M";
-
-        public string CampathAddHotkey { get; set; } = "Mouse3";
-        public SmvmInterfaceMode InterfaceMode { get; set; } = SmvmInterfaceMode.InternalSmvm;
         public string SmvmMenuHotkey { get; set; } = "Tab";
         public string SmvmAddHotkey { get; set; } = "Mouse3";
         public string SmvmDeleteHotkey { get; set; } = "L";
         public string SmvmCleanViewHotkey { get; set; } = "F10";
+        public string SmvmRestoreUiHotkey { get; set; } = "F9";
         public bool SmvmCameraInputTakeover { get; set; } = true;
         public string SmvmForwardHotkey { get; set; } = "W";
         public string SmvmBackHotkey { get; set; } = "S";
@@ -65,6 +63,10 @@ public sealed class AppSettings : IAppSettings
         public SmvmNotificationAnchor SmvmNotificationAnchor { get; set; } = SmvmNotificationAnchor.TopRight;
         public double SmvmPathLabelScale { get; set; } = 1;
         public bool SmvmHidePathWhilePlaying { get; set; } = true;
+        public DeadlockUiMode SmvmDeadlockUiMode { get; set; } = DeadlockUiMode.DeadlockUi;
+        public double SmvmReplayBarScale { get; set; } = 1;
+        public double SmvmReplayBarOpacity { get; set; } = 0.92;
+        public SmvmReplayBarAnchor SmvmReplayBarAnchor { get; set; } = SmvmReplayBarAnchor.Bottom;
     }
 
     private readonly string _filePath;
@@ -97,28 +99,16 @@ public sealed class AppSettings : IAppSettings
         set => _document.SelectedCampathPath = value ?? string.Empty;
     }
 
+    public bool RestoreLastWorkspace
+    {
+        get => _document.RestoreLastWorkspace;
+        set => _document.RestoreLastWorkspace = value;
+    }
+
     public int VConsolePort
     {
         get => _document.VConsolePort;
         set => _document.VConsolePort = value > 0 ? value : DeadlockConstants.DefaultVConsolePort;
-    }
-
-    public string DirectorHotkey
-    {
-        get => _document.DirectorHotkey;
-        set => _document.DirectorHotkey = string.IsNullOrWhiteSpace(value) ? "Ctrl+Alt+M" : value;
-    }
-
-    public string CampathAddHotkey
-    {
-        get => _document.CampathAddHotkey;
-        set => _document.CampathAddHotkey = value?.Trim() ?? string.Empty;
-    }
-
-    public SmvmInterfaceMode InterfaceMode
-    {
-        get => Enum.IsDefined(_document.InterfaceMode) ? _document.InterfaceMode : SmvmInterfaceMode.InternalSmvm;
-        set => _document.InterfaceMode = Enum.IsDefined(value) ? value : SmvmInterfaceMode.InternalSmvm;
     }
 
     public string SmvmMenuHotkey
@@ -143,6 +133,12 @@ public sealed class AppSettings : IAppSettings
     {
         get => _document.SmvmCleanViewHotkey;
         set => _document.SmvmCleanViewHotkey = value?.Trim() ?? string.Empty;
+    }
+
+    public string SmvmRestoreUiHotkey
+    {
+        get => _document.SmvmRestoreUiHotkey;
+        set => _document.SmvmRestoreUiHotkey = NormalizeSlotBinding(122, value, "F9");
     }
 
     public bool SmvmCameraInputTakeover
@@ -383,6 +379,38 @@ public sealed class AppSettings : IAppSettings
         set => _document.SmvmHidePathWhilePlaying = value;
     }
 
+    public DeadlockUiMode SmvmDeadlockUiMode
+    {
+        get => _document.SmvmDeadlockUiMode is DeadlockUiMode.DeadlockUi or DeadlockUiMode.SmvmReplayUi
+            ? _document.SmvmDeadlockUiMode
+            : DeadlockUiMode.DeadlockUi;
+        set => _document.SmvmDeadlockUiMode = value is DeadlockUiMode.DeadlockUi or DeadlockUiMode.SmvmReplayUi
+            ? value
+            : DeadlockUiMode.DeadlockUi;
+    }
+
+    public double SmvmReplayBarScale
+    {
+        get => ClampFinite(_document.SmvmReplayBarScale, 0.75, 2, 1);
+        set => _document.SmvmReplayBarScale = ClampFinite(value, 0.75, 2, 1);
+    }
+
+    public double SmvmReplayBarOpacity
+    {
+        get => ClampFinite(_document.SmvmReplayBarOpacity, 0.35, 1, 0.92);
+        set => _document.SmvmReplayBarOpacity = ClampFinite(value, 0.35, 1, 0.92);
+    }
+
+    public SmvmReplayBarAnchor SmvmReplayBarAnchor
+    {
+        get => Enum.IsDefined(_document.SmvmReplayBarAnchor)
+            ? _document.SmvmReplayBarAnchor
+            : SmvmReplayBarAnchor.Bottom;
+        set => _document.SmvmReplayBarAnchor = Enum.IsDefined(value)
+            ? value
+            : SmvmReplayBarAnchor.Bottom;
+    }
+
     public void Load()
     {
         try
@@ -430,6 +458,7 @@ public sealed class AppSettings : IAppSettings
         _document.SmvmRollLeftHotkey = NormalizeSlotBinding(108, _document.SmvmRollLeftHotkey, "Q");
         _document.SmvmRollRightHotkey = NormalizeSlotBinding(109, _document.SmvmRollRightHotkey, "E");
         _document.SmvmRollResetHotkey = NormalizeSlotBinding(110, _document.SmvmRollResetHotkey, "R");
+        _document.SmvmRestoreUiHotkey = NormalizeSlotBinding(122, _document.SmvmRestoreUiHotkey, "F9");
     }
 
     private static string NormalizeSlotBinding(int slot, string? value, string fallback)

@@ -36,4 +36,10 @@ public sealed class CampathProject
     public CampathPath ToPath() => new(Keyframes, InterpolationMode, EasingMode);
 }
 
-public sealed record CampathDocumentInfo(string Name, string FilePath, CampathReplayIdentifier ReplayIdentifier);
+public sealed record CampathDocumentInfo(
+    string Name,
+    string FilePath,
+    CampathReplayIdentifier ReplayIdentifier,
+    int KeyframeCount = 0,
+    DateTime? ModifiedUtc = null,
+    bool IsDraft = false);

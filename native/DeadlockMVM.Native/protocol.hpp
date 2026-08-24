@@ -8,7 +8,7 @@
 namespace deadlock_mvm {
 
 constexpr std::uint32_t kProtocolMagic = 0x4D564D43; // "CMVM" little-endian
-constexpr std::uint16_t kProtocolVersion = 7;
+constexpr std::uint16_t kProtocolVersion = 8;
 constexpr std::size_t kMaxCampathKeyframes = 128;
 constexpr double kMinFov = 5.0;
 constexpr double kMaxFov = 170.0;
@@ -31,6 +31,7 @@ enum class MessageType : std::uint16_t {
     set_roll_override = 14,
     enable_manual_camera = 15,
     disable_manual_camera = 16,
+    set_campath_documents = 17,
     status = 100,
 };
 
@@ -113,6 +114,34 @@ enum SmvmCapabilities : std::uint32_t {
     smvm_capability_campath_self_test = 1u << 4,
 };
 
+enum class DeadlockUiMode : std::uint32_t {
+    deadlock_ui = 0,
+    smvm_replay_ui = 1,
+    clean_footage = 2,
+    death_notices_only = 3,
+};
+
+enum DeadlockUiCapabilities : std::uint32_t {
+    deadlock_ui_capability_hide_panorama = 1u << 0,
+    deadlock_ui_capability_restore_panorama = 1u << 1,
+    deadlock_ui_capability_smvm_replay_ui = 1u << 2,
+    deadlock_ui_capability_clean_footage = 1u << 3,
+};
+
+enum class DeadlockUiError : std::uint32_t {
+    none = 0,
+    replay_unavailable = 1,
+    command_channel_unavailable = 2,
+    unsupported_mode = 3,
+    apply_failed = 4,
+    restore_failed = 5,
+};
+
+enum class SmvmReplayBarAnchor : std::uint32_t {
+    bottom = 0,
+    top = 1,
+};
+
 enum class SmvmMenuAnchor : std::uint32_t {
     left = 0,
     right = 1,
@@ -193,6 +222,16 @@ enum SmvmSnapshotFlags : std::uint32_t {
     smvm_snapshot_show_minimal_pill = 1u << 19,
     smvm_snapshot_notifications = 1u << 20,
     smvm_snapshot_hide_path_while_playing = 1u << 21,
+    smvm_snapshot_campath_unsaved = 1u << 22,
+    smvm_snapshot_campath_recovery_available = 1u << 23,
+    smvm_snapshot_restore_workspace = 1u << 24,
+    smvm_snapshot_capture_diagnostics = 1u << 25,
+};
+
+enum class SmvmCampathSession : std::uint32_t {
+    no_path = 0,
+    draft_path = 1,
+    saved_path = 2,
 };
 
 enum class SmvmInputCode : std::uint32_t {
@@ -203,6 +242,66 @@ enum class SmvmInputCode : std::uint32_t {
     wheel_up = 0x1004,
     wheel_down = 0x1005,
 };
+
+enum class SmvmCaptureStage : std::uint32_t {
+    none = 0,
+    input_observed = 1,
+    binding_matched = 2,
+    capture_requested = 3,
+    native_frame_awaited = 4,
+    native_frame_captured = 5,
+    managed_action_returned = 6,
+    draft_created = 7,
+    keyframe_added = 8,
+    capture_rejected = 9,
+};
+
+enum class SmvmCaptureRejection : std::uint32_t {
+    none = 0,
+    replay_unavailable = 1,
+    not_in_free_roam = 2,
+    camera_unreadable = 3,
+    native_backend_unavailable = 4,
+    campath_owns_camera = 5,
+    snapshot_stale = 6,
+    hook_frame_stale = 7,
+    capture_already_pending = 8,
+    connection_epoch_changed = 9,
+    invalid_sample = 10,
+    unknown = 11,
+};
+
+struct SmvmCaptureAvailability final {
+    bool native_backend_available;
+    bool replay_available;
+    bool free_roam;
+    bool snapshot_fresh;
+    bool camera_readable;
+    bool hook_frame_fresh;
+    bool campath_owns_camera;
+    bool capture_pending;
+};
+
+[[nodiscard]] constexpr SmvmCaptureRejection CaptureRejectionFor(
+    const SmvmCaptureAvailability& availability) noexcept {
+    if (!availability.native_backend_available)
+        return SmvmCaptureRejection::native_backend_unavailable;
+    if (!availability.replay_available)
+        return SmvmCaptureRejection::replay_unavailable;
+    if (!availability.free_roam)
+        return SmvmCaptureRejection::not_in_free_roam;
+    if (!availability.snapshot_fresh)
+        return SmvmCaptureRejection::snapshot_stale;
+    if (!availability.camera_readable)
+        return SmvmCaptureRejection::camera_unreadable;
+    if (!availability.hook_frame_fresh)
+        return SmvmCaptureRejection::hook_frame_stale;
+    if (availability.campath_owns_camera)
+        return SmvmCaptureRejection::campath_owns_camera;
+    if (availability.capture_pending)
+        return SmvmCaptureRejection::capture_already_pending;
+    return SmvmCaptureRejection::none;
+}
 
 constexpr std::uint32_t kSmvmInputBaseMask = 0x0000FFFFu;
 constexpr std::uint32_t kSmvmInputModifierMask = 0x000F0000u;
@@ -261,6 +360,22 @@ enum class SmvmActionType : std::uint32_t {
     reset_bindings = 50,
     toggle_minimal_pill = 51,
     toggle_hide_path_while_playing = 52,
+    new_path = 53,
+    save_path_as = 54,
+    load_path = 55,
+    close_path = 56,
+    recover_draft = 57,
+    discard_draft = 58,
+    request_path_list = 59,
+    toggle_restore_workspace = 60,
+    set_path_label_scale = 61,
+    set_notification_anchor = 62,
+    capture_diagnostic = 63,
+    set_deadlock_ui_mode = 64,
+    restore_deadlock_ui = 65,
+    set_replay_bar_scale = 66,
+    set_replay_bar_opacity = 67,
+    set_replay_bar_anchor = 68,
 };
 
 #pragma pack(push, 1)
@@ -367,7 +482,37 @@ struct SmvmSnapshotPayload final {
     SmvmMenuAnchor menu_anchor;
     SmvmNotificationAnchor notification_anchor;
     std::array<char, 80> camera_status;
+    SmvmCampathSession campath_session;
+    std::uint32_t saved_document_count;
+    std::uint32_t restore_ui_key;
+    DeadlockUiMode deadlock_ui_mode;
+    std::uint32_t deadlock_ui_capabilities;
+    DeadlockUiError deadlock_ui_error;
+    std::uint32_t vconsole_port;
+    double replay_bar_scale;
+    double replay_bar_opacity;
+    SmvmReplayBarAnchor replay_bar_anchor;
 };
+
+constexpr std::size_t kMaxCampathDocuments = 32;
+constexpr std::uint32_t kCampathDocumentDraft = 1u << 0;
+constexpr std::uint32_t kCampathDocumentMatchesReplay = 1u << 1;
+
+#pragma pack(push, 1)
+struct CampathDocumentEntry final {
+    std::array<char, 64> name;
+    std::array<char, 64> replay_name;
+    std::uint32_t keyframe_count;
+    std::int64_t modified_utc_ticks;
+    std::uint32_t flags;
+};
+
+struct CampathDocumentsPayload final {
+    std::uint32_t count;
+    std::uint32_t reserved;
+    std::array<CampathDocumentEntry, kMaxCampathDocuments> entries;
+};
+#pragma pack(pop)
 
 struct SmvmActionPayload final {
     SmvmActionType type;
@@ -402,9 +547,10 @@ static_assert(sizeof(CameraSample) == 56);
 static_assert(sizeof(RollPayload) == 8);
 static_assert(sizeof(CampathKeyframe) == 64);
 static_assert(sizeof(CampathPayloadHeader) == 16);
-static_assert(sizeof(SmvmSnapshotPayload) == 640);
+static_assert(sizeof(SmvmSnapshotPayload) == 688);
 static_assert(sizeof(SmvmActionPayload) == 144);
 static_assert(sizeof(StatusPayload) == 264);
+static_assert(sizeof(CampathDocumentEntry) == 144);
 
 constexpr std::size_t kMaxMessageBytes =
     sizeof(CampathPayloadHeader) + (sizeof(CampathKeyframe) * kMaxCampathKeyframes);
@@ -427,6 +573,7 @@ constexpr std::size_t kMaxMessageBytes =
         case MessageType::set_roll_override:
         case MessageType::enable_manual_camera:
         case MessageType::disable_manual_camera:
+        case MessageType::set_campath_documents:
         case MessageType::status:
             return true;
     }
@@ -491,12 +638,26 @@ constexpr std::size_t kMaxMessageBytes =
         smvm_snapshot_fov_inverted | smvm_snapshot_manual_camera_requested |
         smvm_snapshot_manual_camera_active | smvm_snapshot_input_takeover | smvm_snapshot_invert_y |
         smvm_snapshot_show_minimal_pill | smvm_snapshot_notifications |
-        smvm_snapshot_hide_path_while_playing;
+        smvm_snapshot_hide_path_while_playing | smvm_snapshot_campath_unsaved |
+        smvm_snapshot_campath_recovery_available | smvm_snapshot_restore_workspace |
+        smvm_snapshot_capture_diagnostics;
     constexpr auto known_capabilities = smvm_capability_manual_camera | smvm_capability_rendered_roll |
         smvm_capability_path_visualization | smvm_capability_camera_self_test |
         smvm_capability_campath_self_test;
-    if (snapshot.snapshot_version != 2 || (snapshot.flags & ~known_flags) != 0 ||
+    constexpr auto known_ui_capabilities = deadlock_ui_capability_hide_panorama |
+        deadlock_ui_capability_restore_panorama | deadlock_ui_capability_smvm_replay_ui |
+        deadlock_ui_capability_clean_footage;
+    if (snapshot.snapshot_version != 4 || (snapshot.flags & ~known_flags) != 0 ||
         (snapshot.capabilities & ~known_capabilities) != 0 ||
+        snapshot.deadlock_ui_mode > DeadlockUiMode::death_notices_only ||
+        snapshot.deadlock_ui_error > DeadlockUiError::restore_failed ||
+        (snapshot.deadlock_ui_capabilities & ~known_ui_capabilities) != 0 ||
+        snapshot.vconsole_port == 0 || snapshot.vconsole_port > 65535 ||
+        !std::isfinite(snapshot.replay_bar_scale) ||
+        snapshot.replay_bar_scale < 0.75 || snapshot.replay_bar_scale > 2.0 ||
+        !std::isfinite(snapshot.replay_bar_opacity) ||
+        snapshot.replay_bar_opacity < 0.35 || snapshot.replay_bar_opacity > 1.0 ||
+        snapshot.replay_bar_anchor > SmvmReplayBarAnchor::top ||
         snapshot.current_tick < -1 || snapshot.total_ticks < -1 ||
         snapshot.keyframe_count > kMaxCampathKeyframes ||
         snapshot.playback_state > max_playback_state || snapshot.start_failure > max_start_failure ||
@@ -504,6 +665,7 @@ constexpr std::size_t kMaxMessageBytes =
         !std::isfinite(snapshot.fov_step) || snapshot.fov_step < 0.05 || snapshot.fov_step > 30.0 ||
         !ValidateSmvmInput(snapshot.menu_key) || !ValidateSmvmInput(snapshot.add_key) ||
         !ValidateSmvmInput(snapshot.delete_key) || !ValidateSmvmInput(snapshot.clean_view_key) ||
+        !ValidateSmvmKeyboardInput(snapshot.restore_ui_key) ||
         !ValidateSmvmKeyboardInput(snapshot.roll_left_key) ||
         !ValidateSmvmKeyboardInput(snapshot.roll_right_key) ||
         !ValidateSmvmKeyboardInput(snapshot.roll_reset_key) ||
@@ -522,6 +684,8 @@ constexpr std::size_t kMaxMessageBytes =
         !ValidateSmvmInput(snapshot.show_labels_key) ||
         snapshot.camera_availability > CameraAvailability::protocol_mismatch ||
         snapshot.camera_ownership > CameraOwnership::smvm_campath ||
+        snapshot.campath_session > SmvmCampathSession::saved_path ||
+        snapshot.saved_document_count > kMaxCampathDocuments ||
         snapshot.menu_anchor > SmvmMenuAnchor::right ||
         snapshot.notification_anchor > SmvmNotificationAnchor::bottom_right ||
         !std::isfinite(snapshot.movement_speed) || snapshot.movement_speed < 1.0 ||
@@ -596,6 +760,7 @@ constexpr std::size_t kMaxMessageBytes =
         case MessageType::set_roll_override: return sizeof(RollPayload);
         case MessageType::set_campath: return kMaxMessageBytes + 1;
         case MessageType::set_editor_campath: return kMaxMessageBytes + 1;
+        case MessageType::set_campath_documents: return kMaxMessageBytes + 1;
         case MessageType::update_smvm_snapshot: return sizeof(SmvmSnapshotPayload);
         case MessageType::enable_override:
         case MessageType::disable_override:
@@ -619,6 +784,11 @@ constexpr std::size_t kMaxMessageBytes =
         return payload_size >= sizeof(CampathPayloadHeader) + (minimum_count * sizeof(CampathKeyframe)) &&
                payload_size <= kMaxMessageBytes &&
                (payload_size - sizeof(CampathPayloadHeader)) % sizeof(CampathKeyframe) == 0;
+    }
+    if (type == MessageType::set_campath_documents) {
+        return payload_size >= 8 &&
+               payload_size <= 8 + (kMaxCampathDocuments * sizeof(CampathDocumentEntry)) &&
+               (payload_size - 8) % sizeof(CampathDocumentEntry) == 0;
     }
     return payload_size == ExpectedPayloadSize(type);
 }

@@ -21,6 +21,7 @@ internal enum InProcessMessageType : ushort
     SetRollOverride = 14,
     EnableManualCamera = 15,
     DisableManualCamera = 16,
+    SetCampathDocuments = 17,
     Status = 100,
 }
 
@@ -111,6 +112,40 @@ public enum SmvmSnapshotFlags : uint
     ShowMinimalPill = 1 << 19,
     Notifications = 1 << 20,
     HidePathWhilePlaying = 1 << 21,
+    CampathUnsaved = 1 << 22,
+    CampathRecoveryAvailable = 1 << 23,
+    RestoreWorkspace = 1 << 24,
+    CaptureDiagnostics = 1 << 25,
+}
+
+public enum SmvmCaptureStage : uint
+{
+    None = 0,
+    InputObserved = 1,
+    BindingMatched = 2,
+    CaptureRequested = 3,
+    NativeFrameAwaited = 4,
+    NativeFrameCaptured = 5,
+    ManagedActionReturned = 6,
+    DraftCreated = 7,
+    KeyframeAdded = 8,
+    CaptureRejected = 9,
+}
+
+public enum SmvmCaptureRejection : uint
+{
+    None = 0,
+    ReplayUnavailable = 1,
+    NotInFreeRoam = 2,
+    CameraUnreadable = 3,
+    NativeBackendUnavailable = 4,
+    CampathOwnsCamera = 5,
+    SnapshotStale = 6,
+    HookFrameStale = 7,
+    CaptureAlreadyPending = 8,
+    ConnectionEpochChanged = 9,
+    InvalidSample = 10,
+    Unknown = 11,
 }
 
 [Flags]
@@ -138,6 +173,40 @@ public enum SmvmNotificationAnchor : uint
     BottomRight = 3,
 }
 
+public enum DeadlockUiMode : uint
+{
+    DeadlockUi = 0,
+    SmvmReplayUi = 1,
+    CleanFootage = 2,
+    DeathNoticesOnly = 3,
+}
+
+[Flags]
+public enum DeadlockUiCapabilities : uint
+{
+    None = 0,
+    HidePanorama = 1 << 0,
+    RestorePanorama = 1 << 1,
+    SmvmReplayUi = 1 << 2,
+    CleanFootage = 1 << 3,
+}
+
+public enum DeadlockUiError : uint
+{
+    None = 0,
+    ReplayUnavailable = 1,
+    CommandChannelUnavailable = 2,
+    UnsupportedMode = 3,
+    ApplyFailed = 4,
+    RestoreFailed = 5,
+}
+
+public enum SmvmReplayBarAnchor : uint
+{
+    Bottom = 0,
+    Top = 1,
+}
+
 public static class SmvmInputCode
 {
     private const uint BaseMask = 0x0000FFFF;
@@ -153,8 +222,8 @@ public static class SmvmInputCode
     public const uint WheelDown = 0x1005;
 
     public static bool IsBindingAllowedForSlot(int slot, InputBinding binding) =>
-        slot is >= 100 and <= 121 && binding.IsValid && Encode(binding) != None &&
-        (slot is < 100 or > 110 || binding.Kind == InputBindingKind.Keyboard);
+        slot is >= 100 and <= 122 && binding.IsValid && Encode(binding) != None &&
+        (slot is >= 111 and <= 121 || binding.Kind == InputBindingKind.Keyboard);
 
     public static uint Encode(InputBinding binding)
     {
@@ -272,6 +341,22 @@ public enum SmvmActionType : uint
     ResetBindings = 50,
     ToggleMinimalPill = 51,
     ToggleHidePathWhilePlaying = 52,
+    NewPath = 53,
+    SavePathAs = 54,
+    LoadPath = 55,
+    ClosePath = 56,
+    RecoverDraft = 57,
+    DiscardDraft = 58,
+    RequestPathList = 59,
+    ToggleRestoreWorkspace = 60,
+    SetPathLabelScale = 61,
+    SetNotificationAnchor = 62,
+    CaptureDiagnostic = 63,
+    SetDeadlockUiMode = 64,
+    RestoreDeadlockUi = 65,
+    SetReplayBarScale = 66,
+    SetReplayBarOpacity = 67,
+    SetReplayBarAnchor = 68,
 }
 
 public sealed record SmvmAction(
@@ -339,7 +424,17 @@ public sealed record SmvmSnapshot(
     string ReplayName,
     string PathName,
     string Status,
-    string CameraStatus);
+    string CameraStatus,
+    CampathSessionState CampathSession,
+    int SavedDocumentCount,
+    uint RestoreUiKey,
+    DeadlockUiMode DeadlockUiMode,
+    DeadlockUiCapabilities DeadlockUiCapabilities,
+    DeadlockUiError DeadlockUiError,
+    int VConsolePort,
+    double ReplayBarScale,
+    double ReplayBarOpacity,
+    SmvmReplayBarAnchor ReplayBarAnchor);
 
 [Flags]
 public enum InProcessStatusFlags : uint
@@ -389,13 +484,15 @@ public sealed record InProcessCameraStatus(
 internal static class InProcessProtocol
 {
     public const uint Magic = 0x4D564D43;
-    public const ushort Version = 7;
+    public const ushort Version = 8;
     public const int HeaderSize = 20;
     public const int StatusSize = 264;
-    public const int SmvmSnapshotSize = 640;
+    public const int SmvmSnapshotSize = 688;
     public const int CameraSampleSize = 56;
     public const int CampathKeyframeSize = 64;
     public const int CampathHeaderSize = 16;
+    public const int CampathDocumentEntrySize = 144;
+    public const int MaxCampathDocuments = 32;
     public const int MaxPayloadSize = CampathHeaderSize + (CampathKeyframeSize * CampathPath.MaxKeyframes);
 
     public static byte[] CreateMessage(InProcessMessageType type, ulong sequence, ReadOnlySpan<byte> payload)
@@ -526,7 +623,7 @@ internal static class InProcessProtocol
     {
         ArgumentNullException.ThrowIfNull(snapshot);
         var payload = new byte[SmvmSnapshotSize];
-        BinaryPrimitives.WriteUInt32LittleEndian(payload, 2);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload, 4);
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(4), (uint)snapshot.Flags);
         BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(8), snapshot.CurrentTick);
         BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(16), snapshot.TotalTicks);
@@ -587,6 +684,51 @@ internal static class InProcessProtocol
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(552), (uint)snapshot.MenuAnchor);
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(556), (uint)snapshot.NotificationAnchor);
         WriteUtf8(payload.AsSpan(560, 80), snapshot.CameraStatus);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(640), (uint)snapshot.CampathSession);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(644),
+            checked((uint)Math.Clamp(snapshot.SavedDocumentCount, 0, MaxCampathDocuments)));
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(648), snapshot.RestoreUiKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(652), (uint)snapshot.DeadlockUiMode);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(656), (uint)snapshot.DeadlockUiCapabilities);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(660), (uint)snapshot.DeadlockUiError);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(664), checked((uint)snapshot.VConsolePort));
+        WriteDouble(payload, 668, snapshot.ReplayBarScale);
+        WriteDouble(payload, 676, snapshot.ReplayBarOpacity);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(684), (uint)snapshot.ReplayBarAnchor);
+        return payload;
+    }
+
+    /// <summary>
+    /// Serializes the bounded saved-path picker list (message SetCampathDocuments).
+    /// Entry layout: name[64], replay[64], keyframe count u32, modified UTC ticks i64, flags u32.
+    /// </summary>
+    public static byte[] SerializeCampathDocuments(
+        IReadOnlyList<CampathDocumentInfo> documents,
+        CampathReplayIdentifier? currentReplay)
+    {
+        ArgumentNullException.ThrowIfNull(documents);
+        if (documents.Count > MaxCampathDocuments)
+            throw new ArgumentOutOfRangeException(nameof(documents));
+
+        var payload = new byte[8 + (documents.Count * CampathDocumentEntrySize)];
+        BinaryPrimitives.WriteUInt32LittleEndian(payload, (uint)documents.Count);
+        for (var index = 0; index < documents.Count; index++)
+        {
+            var document = documents[index];
+            var offset = 8 + (index * CampathDocumentEntrySize);
+            WriteUtf8(payload.AsSpan(offset, 64), document.Name);
+            WriteUtf8(payload.AsSpan(offset + 64, 64), document.ReplayIdentifier.ReplayName);
+            BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(offset + 128),
+                checked((uint)Math.Max(document.KeyframeCount, 0)));
+            BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(offset + 136),
+                document.ModifiedUtc?.Ticks ?? 0);
+            var flags = 0u;
+            if (document.IsDraft)
+                flags |= 1u;
+            if (currentReplay is not null && document.ReplayIdentifier.Matches(currentReplay))
+                flags |= 2u;
+            BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(offset + 140), flags);
+        }
         return payload;
     }
 
@@ -637,6 +779,14 @@ internal static class InProcessProtocol
             throw new InvalidDataException("Native status contains a non-finite SMVM action value.");
         if (actionType == SmvmActionType.AddKeyframe && (actionTick < 0 || !actionCamera.IsValid))
             throw new InvalidDataException("Native status contains an invalid camera-capture action.");
+        if (actionType == SmvmActionType.CaptureDiagnostic)
+        {
+            var stage = (SmvmCaptureStage)BinaryPrimitives.ReadInt32LittleEndian(payload[124..]);
+            var rejection = (SmvmCaptureRejection)actionTick;
+            if (!Enum.IsDefined(stage) || stage == SmvmCaptureStage.None || !Enum.IsDefined(rejection) ||
+                (stage == SmvmCaptureStage.CaptureRejected) != (rejection != SmvmCaptureRejection.None))
+                throw new InvalidDataException("Native status contains an invalid capture diagnostic.");
+        }
         return new InProcessCameraStatus(
             state,
             error,

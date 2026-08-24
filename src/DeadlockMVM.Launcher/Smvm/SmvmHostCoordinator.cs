@@ -5,7 +5,7 @@ using DeadlockMVM.Core.Models;
 using DeadlockMVM.Core.Native.InProcess;
 using DeadlockMVM.Core.Services;
 
-namespace DeadlockMVM.Launcher.Director;
+namespace DeadlockMVM.Launcher.Smvm;
 
 /// <summary>
 /// Bridges the in-process SMVM renderer to the existing managed sources of
@@ -22,7 +22,10 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         int SelectedIndex,
         CampathInterpolationMode Interpolation,
         CampathEasingMode Easing,
-        CampathEndBehavior EndBehavior);
+        CampathEndBehavior EndBehavior,
+        CampathSessionState Session,
+        bool RecoveryAvailable,
+        int SavedDocumentCount);
 
     private readonly ICameraService _camera;
     private readonly ReplayController _controller;
@@ -30,11 +33,13 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
     private readonly CampathViewModel _campath;
     private readonly IAppSettings _settings;
     private readonly ILogService _log;
+    private readonly DeadlockUiController _deadlockUi;
     private readonly Dispatcher _dispatcher;
     private readonly SemaphoreSlim _actionGate = new(1, 1);
     private readonly SemaphoreSlim _pathPublishGate = new(1, 1);
     private readonly CancellationTokenSource _stop = new();
     private readonly object _editorGate = new();
+    private readonly bool _captureDiagnosticsEnabled;
     private EditorSnapshot _editor;
     private int _editorRevision;
     private int _publishedRevision = -1;
@@ -56,7 +61,11 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         _campath = campath;
         _settings = settings;
         _log = log;
+        _deadlockUi = new DeadlockUiController(controller, log);
         _dispatcher = dispatcher;
+        var captureTrace = Environment.GetEnvironmentVariable("DEADLOCKMVM_CAPTURE_TRACE");
+        _captureDiagnosticsEnabled = string.Equals(captureTrace, "1", StringComparison.OrdinalIgnoreCase) ||
+                                     string.Equals(captureTrace, "true", StringComparison.OrdinalIgnoreCase);
         _editor = ReadEditorSnapshot();
         _native.SmvmSnapshotProvider = CreateSnapshot;
         _native.SmvmActionReceived += OnActionReceived;
@@ -94,7 +103,31 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         _dispatcher.BeginInvoke(RefreshEditorSnapshot);
 
     private void OnReplayStateChanged(object? sender, ReplayState state) =>
-        _dispatcher.BeginInvoke(RefreshEditorSnapshot);
+        _dispatcher.BeginInvoke(() =>
+        {
+            RefreshEditorSnapshot();
+            SynchronizeDeadlockUi(state);
+        });
+
+    private void SynchronizeDeadlockUi(ReplayState replay)
+    {
+        var replayActive = IsReplayActive(replay);
+        if (!replayActive)
+        {
+            if (_deadlockUi.State.Mode != DeadlockUiMode.DeadlockUi)
+                _deadlockUi.Restore();
+            return;
+        }
+
+        var preferred = _settings.SmvmDeadlockUiMode;
+        if (_deadlockUi.State.Mode == DeadlockUiMode.DeadlockUi && preferred == DeadlockUiMode.SmvmReplayUi)
+            _deadlockUi.Apply(preferred, replayActive: true);
+    }
+
+    private static bool IsReplayActive(ReplayState replay) =>
+        replay.Connected && !string.IsNullOrWhiteSpace(replay.ReplayName) &&
+        replay.CurrentTick is not null &&
+        (replay.TotalTicks is null || replay.CurrentTick < replay.TotalTicks);
 
     private EditorSnapshot ReadEditorSnapshot()
     {
@@ -106,7 +139,10 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
             _campath.SelectedKeyframe is { } selected ? Array.IndexOf(keys, selected) : -1,
             _campath.InterpolationMode,
             _campath.EasingMode,
-            _campath.EndBehavior);
+            _campath.EndBehavior,
+            _campath.SessionState,
+            _campath.RecoveryAvailable,
+            _campath.SavedCampaths.Count);
     }
 
     private void RefreshEditorSnapshot()
@@ -131,10 +167,9 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         var replay = _controller.State;
         var native = _native.Status;
         var playback = _native.CampathStatus;
-        var internalEnabled = _settings.InterfaceMode is SmvmInterfaceMode.InternalSmvm or SmvmInterfaceMode.BothDeveloper;
-        var replayActive = replay.Connected && !string.IsNullOrWhiteSpace(replay.ReplayName) &&
-                           replay.CurrentTick is not null &&
-                           (replay.TotalTicks is null || replay.CurrentTick < replay.TotalTicks);
+        var internalEnabled = true; // The internal SMVM editor is the only editor.
+        var replayActive = IsReplayActive(replay);
+        var deadlockUi = _deadlockUi.State;
         var ownership = ResolveCameraOwnership(replayActive, native);
         var availability = ResolveCameraAvailability(
             internalEnabled, replayActive, replay, native, playback, ownership);
@@ -176,6 +211,10 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         if (_settings.SmvmShowMinimalPill) flags |= SmvmSnapshotFlags.ShowMinimalPill;
         if (_settings.SmvmNotificationsEnabled) flags |= SmvmSnapshotFlags.Notifications;
         if (_settings.SmvmHidePathWhilePlaying) flags |= SmvmSnapshotFlags.HidePathWhilePlaying;
+        if (editor.Session == CampathSessionState.DraftPath) flags |= SmvmSnapshotFlags.CampathUnsaved;
+        if (editor.RecoveryAvailable) flags |= SmvmSnapshotFlags.CampathRecoveryAvailable;
+        if (_settings.RestoreLastWorkspace) flags |= SmvmSnapshotFlags.RestoreWorkspace;
+        if (_captureDiagnosticsEnabled) flags |= SmvmSnapshotFlags.CaptureDiagnostics;
 
         return new SmvmSnapshot(
             flags,
@@ -234,7 +273,17 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
             _native.SelfTestStatus.Stage is SmvmSelfTestStage.Completed or SmvmSelfTestStage.Failed or SmvmSelfTestStage.Cancelled
                 ? _native.SelfTestStatus.Detail
                 : !string.IsNullOrWhiteSpace(editor.Status) ? editor.Status : _native.Message,
-            DescribeCameraAvailability(availability));
+            DescribeCameraAvailability(availability),
+            editor.Session,
+            editor.SavedDocumentCount,
+            SmvmInputCode.ParseForSlotOrDefault(122, _settings.SmvmRestoreUiHotkey, "F9"),
+            deadlockUi.Mode,
+            deadlockUi.Capabilities,
+            deadlockUi.Error,
+            _settings.VConsolePort,
+            _settings.SmvmReplayBarScale,
+            _settings.SmvmReplayBarOpacity,
+            _settings.SmvmReplayBarAnchor);
     }
 
     private CameraOwnership ResolveCameraOwnership(bool replayActive, InProcessCameraStatus? native)
@@ -298,26 +347,8 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         return CameraAvailability.Ready;
     }
 
-    private SmvmCapabilities ResolveCapabilities(bool internalEnabled, InProcessCameraStatus? native)
-    {
-        if (!internalEnabled || !_native.Connected || native?.RendererBackend != SmvmRendererBackend.D3D11 ||
-            !native.OverlayFlags.HasFlag(SmvmOverlayFlags.Ready))
-            return SmvmCapabilities.None;
-
-        var capabilities = SmvmCapabilities.PathVisualization;
-        if (native.Flags.HasFlag(InProcessStatusFlags.Resolved) &&
-            native.Flags.HasFlag(InProcessStatusFlags.HookInstalled))
-        {
-            capabilities |= SmvmCapabilities.ManualCamera;
-            if (!_native.SelfTestStatus.IsRunning)
-                capabilities |= SmvmCapabilities.CameraSelfTest | SmvmCapabilities.CampathSelfTest;
-        }
-
-        // Rendered roll remains unadvertised until this exact native build is
-        // proven visually in the published application. The bounded self-tests
-        // stay available so that live acceptance can produce that proof.
-        return capabilities;
-    }
+    private SmvmCapabilities ResolveCapabilities(bool internalEnabled, InProcessCameraStatus? native) =>
+        SmvmCapabilityResolver.Resolve(internalEnabled, _native.Connected, native, _native.SelfTestStatus.IsRunning);
 
     private static bool IsReplaySeeking(CampathPlaybackState state) =>
         state is CampathPlaybackState.SeekingToStart or CampathPlaybackState.WaitingForLandedTick or
@@ -446,6 +477,38 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
     {
         switch (action.Type)
         {
+            case SmvmActionType.CaptureDiagnostic:
+            {
+                var stage = (SmvmCaptureStage)action.Index;
+                var rejection = (SmvmCaptureRejection)action.Tick;
+                TraceCapture(stage, rejection);
+                if (stage == SmvmCaptureStage.CaptureRejected)
+                    _campath.ReportCaptureRejection(rejection);
+                break;
+            }
+            case SmvmActionType.SetDeadlockUiMode:
+                ApplyDeadlockUiMode((DeadlockUiMode)action.Index);
+                break;
+            case SmvmActionType.RestoreDeadlockUi:
+                _settings.SmvmDeadlockUiMode = DeadlockUiMode.DeadlockUi;
+                _settings.Save();
+                _deadlockUi.Restore(force: true);
+                break;
+            case SmvmActionType.SetReplayBarScale:
+                _settings.SmvmReplayBarScale = action.Value;
+                _settings.Save();
+                break;
+            case SmvmActionType.SetReplayBarOpacity:
+                _settings.SmvmReplayBarOpacity = action.Value;
+                _settings.Save();
+                break;
+            case SmvmActionType.SetReplayBarAnchor:
+                if (Enum.IsDefined((SmvmReplayBarAnchor)action.Index))
+                {
+                    _settings.SmvmReplayBarAnchor = (SmvmReplayBarAnchor)action.Index;
+                    _settings.Save();
+                }
+                break;
             case SmvmActionType.ToggleReplayPause:
                 _controller.TogglePause();
                 break;
@@ -494,7 +557,23 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                 break;
             case SmvmActionType.AddKeyframe:
                 if (action.Tick >= 0 && action.Camera.IsValid)
+                {
+                    TraceCapture(
+                        SmvmCaptureStage.ManagedActionReturned,
+                        detail: $"tick={action.Tick}, camera=({action.Camera.X:F3}, {action.Camera.Y:F3}, {action.Camera.Z:F3}), " +
+                                $"rot=({action.Camera.Pitch:F3}, {action.Camera.Yaw:F3}, {action.Camera.Roll:F3}), fov={action.Camera.Fov:F3}");
+                    var priorSession = _campath.SessionState;
+                    var priorCount = _campath.Keyframes.Count;
                     _campath.AddAuthoritativeKeyframe(new CampathKeyframe(action.Tick, action.Camera));
+                    if (priorSession == CampathSessionState.NoPath &&
+                        _campath.SessionState == CampathSessionState.DraftPath)
+                        TraceCapture(SmvmCaptureStage.DraftCreated);
+                    if (_campath.Keyframes.Count > priorCount ||
+                        _campath.Keyframes.Any(keyframe => keyframe.DemoTick == action.Tick))
+                        TraceCapture(
+                            SmvmCaptureStage.KeyframeAdded,
+                            detail: $"count={_campath.Keyframes.Count}, tick={action.Tick}");
+                }
                 break;
             case SmvmActionType.DeleteKeyframe:
                 _campath.DeleteKeyframe(action.Index);
@@ -574,6 +653,42 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                 break;
             case SmvmActionType.LoadNextPath:
                 _campath.LoadNextMatching();
+                break;
+            case SmvmActionType.NewPath:
+                _campath.NewPath();
+                break;
+            case SmvmActionType.SavePathAs:
+                _campath.SaveAs(action.Text);
+                break;
+            case SmvmActionType.LoadPath:
+                _campath.LoadPathByIndex(action.Index);
+                break;
+            case SmvmActionType.ClosePath:
+                _campath.ClosePath();
+                break;
+            case SmvmActionType.RecoverDraft:
+                _campath.RecoverDraft();
+                break;
+            case SmvmActionType.DiscardDraft:
+                _campath.DiscardDraft();
+                break;
+            case SmvmActionType.RequestPathList:
+                _ = PublishDocumentsAsync();
+                break;
+            case SmvmActionType.ToggleRestoreWorkspace:
+                _settings.RestoreLastWorkspace = !_settings.RestoreLastWorkspace;
+                _settings.Save();
+                break;
+            case SmvmActionType.SetPathLabelScale:
+                _settings.SmvmPathLabelScale = Math.Clamp(action.Value, 0.5, 2.0);
+                _settings.Save();
+                break;
+            case SmvmActionType.SetNotificationAnchor:
+                if (Enum.IsDefined((SmvmNotificationAnchor)action.Index))
+                {
+                    _settings.SmvmNotificationAnchor = (SmvmNotificationAnchor)action.Index;
+                    _settings.Save();
+                }
                 break;
             case SmvmActionType.SetRoll:
                 if (!_native.CampathPlaying)
@@ -668,6 +783,40 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         }
     }
 
+    private void TraceCapture(
+        SmvmCaptureStage stage,
+        SmvmCaptureRejection rejection = SmvmCaptureRejection.None,
+        string? detail = null)
+    {
+        if (!_captureDiagnosticsEnabled && stage != SmvmCaptureStage.CaptureRejected)
+            return;
+        var message = $"SMVM capture: stage={stage}";
+        if (rejection != SmvmCaptureRejection.None)
+            message += $", rejection={rejection}";
+        if (!string.IsNullOrWhiteSpace(detail))
+            message += $", {detail}";
+        if (stage == SmvmCaptureStage.CaptureRejected)
+            _log.Warn(message);
+        else
+            _log.Info(message);
+    }
+
+    private void ApplyDeadlockUiMode(DeadlockUiMode mode)
+    {
+        var replayActive = IsReplayActive(_controller.State);
+        if (!_deadlockUi.Apply(mode, replayActive))
+            return;
+
+        // Clean Footage is deliberately transient. A fresh replay never starts
+        // with both native UI stacks hidden; it returns to the user's normal or
+        // custom replay UI preference.
+        if (mode is DeadlockUiMode.DeadlockUi or DeadlockUiMode.SmvmReplayUi)
+        {
+            _settings.SmvmDeadlockUiMode = mode;
+            _settings.Save();
+        }
+    }
+
     private async Task ExecuteReplaySeekAsync(int tick)
     {
         Interlocked.Exchange(ref _replaySeekInFlight, 1);
@@ -681,12 +830,35 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         }
     }
 
+    /// <summary>Publishes the explicit Load picker list (saved paths + recoverable draft).</summary>
+    private async Task PublishDocumentsAsync()
+    {
+        try
+        {
+            var replay = _controller.State;
+            CampathReplayIdentifier? identifier =
+                replay.Connected && !string.IsNullOrWhiteSpace(replay.ReplayName) && replay.CurrentTick is not null
+                    ? new CampathReplayIdentifier(replay.ReplayName, replay.TotalTicks)
+                    : null;
+            await _native.PublishCampathDocumentsAsync(
+                _campath.GetDocuments(), identifier, _stop.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (_stop.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex) when (ex is IOException or InvalidOperationException)
+        {
+            _log.Warn($"SMVM path-list synchronization deferred: {ex.Message}");
+        }
+    }
+
     private void ResetSmvmBindings()
     {
         _settings.SmvmMenuHotkey = "Tab";
         _settings.SmvmAddHotkey = "Mouse3";
         _settings.SmvmDeleteHotkey = "L";
         _settings.SmvmCleanViewHotkey = "F10";
+        _settings.SmvmRestoreUiHotkey = "F9";
         _settings.SmvmForwardHotkey = "W";
         _settings.SmvmBackHotkey = "S";
         _settings.SmvmLeftHotkey = "A";
@@ -709,7 +881,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
 
     private void SetSmvmBinding(int index, double rawValue)
     {
-        if (index is < 100 or > 121)
+        if (index is < 100 or > 122)
         {
             _log.Warn($"SMVM binding rejected: unsupported slot {index}.");
             return;
@@ -737,7 +909,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         }
 
         var canonical = binding.ToString();
-        foreach (var otherIndex in Enumerable.Range(100, 22))
+        foreach (var otherIndex in Enumerable.Range(100, 23))
         {
             if (otherIndex == index ||
                 !InputBinding.TryParse(ReadSmvmBinding(otherIndex), out var existing) ||
@@ -745,12 +917,6 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                 continue;
 
             _log.Warn($"SMVM binding rejected: {canonical} is assigned to {DescribeSmvmBinding(otherIndex)}.");
-            return;
-        }
-
-        if (InputBinding.TryParse(_settings.DirectorHotkey, out var director) && director == binding)
-        {
-            _log.Warn($"SMVM binding rejected: {canonical} is assigned to Director.");
             return;
         }
 
@@ -783,6 +949,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         119 => _settings.SmvmRedoHotkey,
         120 => _settings.SmvmShowPathHotkey,
         121 => _settings.SmvmShowCamerasHotkey,
+        122 => _settings.SmvmRestoreUiHotkey,
         _ => string.Empty,
     };
 
@@ -812,6 +979,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
             case 119: _settings.SmvmRedoHotkey = value; break;
             case 120: _settings.SmvmShowPathHotkey = value; break;
             case 121: _settings.SmvmShowCamerasHotkey = value; break;
+            case 122: _settings.SmvmRestoreUiHotkey = value; break;
         }
     }
 
@@ -839,11 +1007,13 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         119 => "Redo",
         120 => "Show Path",
         121 => "Show Cameras",
+        122 => "Restore Deadlock UI",
         _ => $"Slot {index}",
     };
 
     public async ValueTask DisposeAsync()
     {
+        _deadlockUi.Restore(force: true);
         _native.SmvmActionReceived -= OnActionReceived;
         _native.StatusChanged -= OnNativeStatusChanged;
         _native.SmvmSnapshotProvider = null;

@@ -18,6 +18,16 @@ public sealed class CampathStore
     public CampathStore(string? directory = null) =>
         _directory = directory ?? AppPaths.CampathsDirectory;
 
+    /// <summary>Recovery location for the unsaved draft; never listed as a saved path.</summary>
+    public string DraftFilePath => Path.Combine(_directory, "draft.campath.json");
+
+    /// <summary>
+    /// Session sentinel for the draft. It exists only while a session owns the
+    /// draft: a clean application exit removes it, so a lock still present at
+    /// startup means the previous session ended abnormally.
+    /// </summary>
+    public string DraftLockFilePath => Path.Combine(_directory, "draft.lock");
+
     public string Save(CampathProject project, string? existingPath = null)
     {
         ArgumentNullException.ThrowIfNull(project);
@@ -72,10 +82,17 @@ public sealed class CampathStore
         var results = new List<CampathDocumentInfo>();
         foreach (var path in Directory.EnumerateFiles(_directory, "*.campath.json", SearchOption.TopDirectoryOnly))
         {
+            if (string.Equals(path, DraftFilePath, StringComparison.OrdinalIgnoreCase))
+                continue; // The recovery draft is never offered as a normal saved path.
             try
             {
                 var project = Load(path);
-                results.Add(new CampathDocumentInfo(project.Name, path, project.ReplayIdentifier));
+                results.Add(new CampathDocumentInfo(
+                    project.Name,
+                    path,
+                    project.ReplayIdentifier,
+                    project.Keyframes.Count,
+                    File.GetLastWriteTimeUtc(path)));
             }
             catch (InvalidDataException)
             {
@@ -83,6 +100,84 @@ public sealed class CampathStore
             }
         }
         return results.OrderBy(item => item.Name, StringComparer.OrdinalIgnoreCase).ToArray();
+    }
+
+    /// <summary>Persists the unsaved working draft and marks this session as its owner.</summary>
+    public void SaveDraft(CampathProject project)
+    {
+        ArgumentNullException.ThrowIfNull(project);
+        Validate(project);
+        Directory.CreateDirectory(_directory);
+        var temporary = DraftFilePath + ".tmp";
+        File.WriteAllText(temporary, JsonSerializer.Serialize(project, JsonOptions), new UTF8Encoding(false));
+        File.Move(temporary, DraftFilePath, true);
+        MarkDraftActive();
+    }
+
+    /// <summary>Records that the current (live) session owns the on-disk draft.</summary>
+    public void MarkDraftActive()
+    {
+        Directory.CreateDirectory(_directory);
+        File.WriteAllText(
+            DraftLockFilePath,
+            $"{Environment.ProcessId} {DateTime.UtcNow:O}",
+            new UTF8Encoding(false));
+    }
+
+    /// <summary>Removes the draft and its sentinel (draft saved, closed, or discarded).</summary>
+    public void DeleteDraft()
+    {
+        TryDelete(DraftLockFilePath);
+        TryDelete(DraftFilePath);
+    }
+
+    /// <summary>
+    /// Clean application shutdown: keeps the draft for explicit recovery but removes
+    /// the sentinel so the next start does not treat it as a crash recovery.
+    /// </summary>
+    public void CompleteCleanShutdown() => TryDelete(DraftLockFilePath);
+
+    /// <summary>True when a draft exists from a session that ended abnormally.</summary>
+    public bool HasAbandonedDraft =>
+        File.Exists(DraftFilePath) && File.Exists(DraftLockFilePath);
+
+    /// <summary>
+    /// Loads the draft when it exists and belongs to <paramref name="expectedReplay"/>;
+    /// returns null when there is no usable draft. Never throws for a missing draft.
+    /// </summary>
+    public CampathProject? TryLoadDraft(CampathReplayIdentifier expectedReplay)
+    {
+        ArgumentNullException.ThrowIfNull(expectedReplay);
+        if (!File.Exists(DraftFilePath))
+            return null;
+        try
+        {
+            return Load(DraftFilePath, expectedReplay);
+        }
+        catch (InvalidDataException)
+        {
+            return null; // Corrupt or foreign-replay draft: leave it on disk, do not offer it.
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+    }
+
+    private static void TryDelete(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+                File.Delete(path);
+        }
+        catch (IOException)
+        {
+            // A lingering sentinel only causes one extra recovery prompt; never fail closed here.
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
     }
 
     public static string SanitizeName(string name)

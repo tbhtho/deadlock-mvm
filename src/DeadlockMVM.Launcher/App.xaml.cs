@@ -6,7 +6,7 @@ using DeadlockMVM.Core.Models;
 using DeadlockMVM.Core.Native;
 using DeadlockMVM.Core.Native.InProcess;
 using DeadlockMVM.Core.Services;
-using DeadlockMVM.Launcher.Director;
+using DeadlockMVM.Launcher.Smvm;
 using DeadlockMVM.Launcher.ViewModels;
 
 namespace DeadlockMVM.Launcher;
@@ -65,23 +65,33 @@ public partial class App : System.Windows.Application
 
             var viewModel = new MainViewModel(steam, process, launcher, log, settings, replayService);
 
-            // Director window (hidden initially; shown on playback confirm or hotkey)
-            var director = new DirectorWindow(camera, controller, nativeSession, settings, log);
+            // Internal SMVM editor: campath model, in-game menu pointer
+            // forwarding, and the VConsole auto-connect loop.
+            var pointerForwarder = new SmvmPointerForwarder(
+                Dispatcher,
+                () => nativeSession.Status?.OverlayFlags.HasFlag(SmvmOverlayFlags.MenuOpen) == true,
+                PointerTraceEnabled() ? message => log.Info(message) : null);
+            if (!pointerForwarder.IsAvailable)
+                log.Warn($"SMVM: menu pointer observer unavailable (error {pointerForwarder.LastError}).");
+            var campath = new CampathViewModel(camera, controller, nativeSession, settings, log);
+            var connection = new VConsoleConnectionService(controller, settings.VConsolePort, log, Dispatcher);
             var smvm = new SmvmHostCoordinator(
                 camera,
                 controller,
                 nativeSession,
-                director.ViewModel.Campath,
+                campath,
                 settings,
                 log,
                 Dispatcher);
-            viewModel.SetDirector(director);
+            connection.Start();
 
             var window = new MainWindow { DataContext = viewModel };
             window.Closed += async (_, _) =>
             {
                 await smvm.DisposeAsync();
-                director.Close();
+                campath.Shutdown();
+                pointerForwarder.Dispose();
+                connection.Dispose();
                 await nativeSession.DisposeAsync();
                 controller.Dispose();
                 settings.Save();
@@ -123,4 +133,12 @@ public partial class App : System.Windows.Application
         _singleInstanceMutex = null;
         base.OnExit(e);
     }
+
+    // Per-pointer-event traces are dev diagnostics; they stay out of the normal
+    // Release log unless explicitly requested via the environment.
+    private static bool PointerTraceEnabled() =>
+        string.Equals(
+            Environment.GetEnvironmentVariable("DEADLOCKMVM_POINTER_TRACE"),
+            "1",
+            StringComparison.Ordinal);
 }

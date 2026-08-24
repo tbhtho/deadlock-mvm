@@ -8,7 +8,7 @@ using DeadlockMVM.Core.Native.InProcess;
 using DeadlockMVM.Core.Services;
 using DeadlockMVM.Launcher.ViewModels;
 
-namespace DeadlockMVM.Launcher.Director;
+namespace DeadlockMVM.Launcher.Smvm;
 
 /// <summary>Compact replay-tick Campath editor; capture and playback are deliberately separate.</summary>
 public sealed class CampathViewModel : INotifyPropertyChanged
@@ -25,17 +25,16 @@ public sealed class CampathViewModel : INotifyPropertyChanged
     private readonly NativeReplayCameraSession _native;
     private readonly PassiveCampathCapture _capture;
     private readonly IAppSettings _settings;
-    private readonly IHotkeyService _hotkeys;
     private readonly CampathStore _store;
     private readonly ILogService _log;
     private readonly System.Windows.Threading.Dispatcher? _dispatcher;
     private CampathKeyframe? _selectedKeyframe;
     private CampathDocumentInfo? _selectedDocument;
     private string _status = "Fly in Free Roam and add camera keyframes.";
-    private string _pathName = "Untitled Campath";
+    private string _pathName = "Untitled Path";
     private string? _currentFilePath;
-    private string _addHotkeyDisplay = "—";
-    private bool _capturingHotkey;
+    private bool _isDraft;
+    private bool _recoveryAvailable;
     private bool _suppressAutosave;
     private bool _operationInFlight;
     private DateTime _clearConfirmationDeadline;
@@ -52,7 +51,6 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         ReplayController controller,
         NativeReplayCameraSession native,
         IAppSettings settings,
-        IHotkeyService hotkeys,
         ILogService log,
         CampathStore? store = null)
     {
@@ -63,14 +61,13 @@ public sealed class CampathViewModel : INotifyPropertyChanged
             native.CaptureCurrentCameraAsync,
             () => new ReplayPlaybackConfiguration(controller.State.IsPaused, controller.State.Timescale));
         _settings = settings;
-        _hotkeys = hotkeys;
         _log = log;
         _store = store ?? new CampathStore();
         _dispatcher = System.Windows.Threading.Dispatcher.FromThread(Thread.CurrentThread);
 
         Keyframes = [];
         SavedCampaths = [];
-        AddCommand = new RelayCommand(() => _ = AddAsync(false), CanAdd);
+        AddCommand = new RelayCommand(() => _ = AddAsync(), CanAdd);
         UpdateCommand = new RelayCommand(() => _ = UpdateAsync(), () => SelectedKeyframe is not null && CanCapture());
         DeleteCommand = new RelayCommand(DeleteSelected, () => SelectedKeyframe is not null && CanEditPath);
         ClearCommand = new RelayCommand(Clear, () => Keyframes.Count > 0 && CanEditPath);
@@ -82,15 +79,10 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         RedoCommand = new RelayCommand(Redo, () => _redo.Count > 0 && CanEditPath);
         SaveCommand = new RelayCommand(Save, () => Keyframes.Count > 0 && CurrentReplayIdentifier() is not null && CanEditPath);
         LoadCommand = new RelayCommand(Load, () => SelectedDocument is not null && CurrentReplayIdentifier() is not null && CanEditPath);
-        CaptureHotkeyCommand = new RelayCommand(BeginHotkeyCapture, () => !_capturingHotkey && _hotkeys.IsAvailable);
-        ClearHotkeyCommand = new RelayCommand(ClearHotkey, () => _addHotkeyDisplay != "—");
 
         _native.StatusChanged += OnNativeStatusChanged;
         _native.CampathStateChanged += OnCampathStateChanged;
         _controller.StateChanged += OnReplayStateChanged;
-        _hotkeys.BindingTriggered += OnHotkeyTriggered;
-        _hotkeys.BindingCaptured += OnBindingCaptured;
-        RegisterSavedHotkey();
         RefreshDocuments();
     }
 
@@ -128,13 +120,29 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         get => _pathName;
         set
         {
-            var clean = string.IsNullOrWhiteSpace(value) ? "Untitled Campath" : value.Trim();
+            var clean = string.IsNullOrWhiteSpace(value) ? "Untitled Path" : value.Trim();
             if (PathCameraOwned || !SetProperty(ref _pathName, clean))
                 return;
             Autosave();
             OnEditorStateChanged();
         }
     }
+
+    /// <summary>Current workspace session; a normal startup is always <see cref="CampathSessionState.NoPath"/>.</summary>
+    public CampathSessionState SessionState =>
+        _currentFilePath is not null ? CampathSessionState.SavedPath :
+        _isDraft ? CampathSessionState.DraftPath :
+        CampathSessionState.NoPath;
+
+    /// <summary>True while an abandoned on-disk draft from an abnormal shutdown can be recovered.</summary>
+    public bool RecoveryAvailable
+    {
+        get => _recoveryAvailable;
+        private set => SetProperty(ref _recoveryAvailable, value);
+    }
+
+    /// <summary>True when the draft holds unsaved keyframes that a New/Load/Close would discard.</summary>
+    public bool HasUnsavedWork => SessionState == CampathSessionState.DraftPath && Keyframes.Count > 0;
 
     public CampathInterpolationMode InterpolationMode
     {
@@ -195,7 +203,6 @@ public sealed class CampathViewModel : INotifyPropertyChanged
     public bool PathCameraOwned => _native.CampathCameraOwned;
     public bool CanEditPath => !PathCameraOwned && !_operationInFlight;
     public string KeyframeCount => $"{Keyframes.Count} / {CampathPath.MaxKeyframes}";
-    public string AddHotkeyDisplay => _capturingHotkey ? "PRESS A KEY…" : _addHotkeyDisplay;
 
     public ICommand AddCommand { get; }
     public ICommand UpdateCommand { get; }
@@ -209,10 +216,27 @@ public sealed class CampathViewModel : INotifyPropertyChanged
     public ICommand RedoCommand { get; }
     public ICommand SaveCommand { get; }
     public ICommand LoadCommand { get; }
-    public ICommand CaptureHotkeyCommand { get; }
-    public ICommand ClearHotkeyCommand { get; }
 
     public event EventHandler? EditorStateChanged;
+
+    public void ReportCaptureRejection(SmvmCaptureRejection rejection)
+    {
+        Status = rejection switch
+        {
+            SmvmCaptureRejection.ReplayUnavailable => "Keyframe capture rejected: replay playback is unavailable.",
+            SmvmCaptureRejection.NotInFreeRoam => "Keyframe capture rejected: switch to Free Camera and reacquire Manual Camera.",
+            SmvmCaptureRejection.CameraUnreadable => "Keyframe capture rejected: the rendered camera is not readable.",
+            SmvmCaptureRejection.NativeBackendUnavailable => "Keyframe capture rejected: the native camera backend is unavailable.",
+            SmvmCaptureRejection.CampathOwnsCamera => "Keyframe capture rejected: stop Campath playback first.",
+            SmvmCaptureRejection.SnapshotStale => "Keyframe capture rejected: the editor snapshot is stale.",
+            SmvmCaptureRejection.HookFrameStale => "Keyframe capture rejected: no fresh camera hook frame arrived.",
+            SmvmCaptureRejection.CaptureAlreadyPending => "Keyframe capture rejected: another capture is already pending.",
+            SmvmCaptureRejection.ConnectionEpochChanged => "Keyframe capture rejected: the native connection changed.",
+            SmvmCaptureRejection.InvalidSample => "Keyframe capture rejected: the camera sample was invalid.",
+            _ => "Keyframe capture rejected for an unclassified native reason. Check Advanced diagnostics.",
+        };
+        OnEditorStateChanged();
+    }
 
     // At capacity we still allow one passive capture: the authoritative native
     // tick may replace an existing key. AddAuthoritativeKeyframe rejects only a
@@ -228,7 +252,7 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         PathCameraOwned,
         _operationInFlight));
 
-    private async Task AddAsync(bool fromHotkey)
+    private async Task AddAsync()
     {
         if (!CanAdd())
         {
@@ -241,7 +265,7 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         var keyframe = await CaptureAsync().ConfigureAwait(true);
         if (keyframe is null)
             return;
-        AddAuthoritativeKeyframe(keyframe, fromHotkey);
+        AddAuthoritativeKeyframe(keyframe, fromHotkey: false);
     }
 
     /// <summary>Adds an exact camera-hook sample without recapturing through the external UI.</summary>
@@ -259,10 +283,15 @@ public sealed class CampathViewModel : INotifyPropertyChanged
             return;
         }
         PushHistory();
+        var startedDraft = SessionState == CampathSessionState.NoPath;
+        if (startedDraft)
+            _isDraft = true; // First keyframe with no path loaded creates an Untitled draft.
         var replaced = CampathKeyframeEditor.Upsert(Keyframes, keyframe);
         SelectedKeyframe = keyframe;
         Status = !replaced
-            ? $"Keyframe {Keyframes.IndexOf(keyframe) + 1} added at tick {keyframe.DemoTick}."
+            ? startedDraft
+                ? $"Draft created — keyframe 1 added at tick {keyframe.DemoTick}."
+                : $"Keyframe {Keyframes.IndexOf(keyframe) + 1} added at tick {keyframe.DemoTick}."
             : $"Keyframe at tick {keyframe.DemoTick} updated.";
         _log.Info($"Campath: {Status}{(fromHotkey ? " (hotkey)" : string.Empty)}");
         OnCollectionChanged();
@@ -538,99 +567,18 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         }
     }
 
-    private void BeginHotkeyCapture()
-    {
-        if (!_hotkeys.IsAvailable)
-        {
-            Status = "Hotkey capture is unavailable; restart the Director to retry input hooks.";
-            return;
-        }
-        _capturingHotkey = true;
-        OnPropertyChanged(nameof(AddHotkeyDisplay));
-        _hotkeys.BeginCapture(HotkeyAction.CampathAddKeyframe);
-        Status = "Press a keyboard key, modifier combination, Mouse3/4/5, or mouse wheel. Escape cancels.";
-        RaiseCommandStates();
-    }
-
-    private void ClearHotkey()
-    {
-        if (_capturingHotkey)
-        {
-            _hotkeys.CancelCapture();
-            _capturingHotkey = false;
-        }
-        _hotkeys.Unregister(HotkeyAction.CampathAddKeyframe);
-        _settings.CampathAddHotkey = string.Empty;
-        _settings.Save();
-        _addHotkeyDisplay = "—";
-        OnPropertyChanged(nameof(AddHotkeyDisplay));
-        Status = "Add Keyframe hotkey unbound.";
-        RaiseCommandStates();
-    }
-
-    private void RegisterSavedHotkey()
-    {
-        if (_settings.InterfaceMode != SmvmInterfaceMode.ExternalDirector)
-        {
-            _hotkeys.Unregister(HotkeyAction.CampathAddKeyframe);
-            _addHotkeyDisplay = "INTERNAL";
-            return;
-        }
-        if (!DeadlockMVM.Core.Models.InputBinding.TryParse(_settings.CampathAddHotkey, out var binding))
-        {
-            _addHotkeyDisplay = "—";
-            return;
-        }
-        if (_hotkeys.TryRegister(HotkeyAction.CampathAddKeyframe, binding, out var error))
-            _addHotkeyDisplay = binding.ToString();
-        else
-        {
-            _addHotkeyDisplay = "—";
-            Status = error ?? "Add Keyframe hotkey could not be registered.";
-        }
-    }
-
-    private void OnHotkeyTriggered(object? sender, HotkeyTriggeredEventArgs args)
-    {
-        if (_settings.InterfaceMode == SmvmInterfaceMode.ExternalDirector &&
-            args.Action == HotkeyAction.CampathAddKeyframe)
-            _ = AddAsync(true);
-    }
-
-    private void OnBindingCaptured(object? sender, BindingCapturedEventArgs args)
-    {
-        if (args.Action != HotkeyAction.CampathAddKeyframe)
-            return;
-        _capturingHotkey = false;
-        if (args.Cancelled || args.Binding is not { } binding)
-        {
-            Status = "Hotkey capture cancelled.";
-        }
-        else if (_hotkeys.TryRegister(args.Action, binding, out var error))
-        {
-            _settings.CampathAddHotkey = binding.ToString();
-            _settings.Save();
-            _addHotkeyDisplay = binding.ToString();
-            Status = $"Add Keyframe bound to {_addHotkeyDisplay}.";
-        }
-        else
-        {
-            Status = error ?? "That hotkey is unavailable.";
-        }
-        OnPropertyChanged(nameof(AddHotkeyDisplay));
-        RaiseCommandStates();
-    }
-
     private void Save()
         => SaveCore(true);
 
-    private void SaveCore(bool reportStatus)
+    private void SaveCore(bool reportStatus, bool forceNewFile = false)
     {
         try
         {
             if (CurrentReplayIdentifier() is null)
                 throw new InvalidOperationException("A confirmed replay is required before saving a Campath.");
-            _currentFilePath = _store.Save(CreateProject(), _currentFilePath);
+            _currentFilePath = _store.Save(CreateProject(), forceNewFile ? null : _currentFilePath);
+            _isDraft = false;
+            _store.DeleteDraft();
             _settings.SelectedCampathPath = _currentFilePath;
             _settings.Save();
             if (reportStatus)
@@ -647,8 +595,22 @@ public sealed class CampathViewModel : INotifyPropertyChanged
     private void Autosave()
     {
         if (_suppressAutosave || CurrentReplayIdentifier() is null ||
-            (Keyframes.Count == 0 && _currentFilePath is null))
+            (Keyframes.Count == 0 && _currentFilePath is null && !_isDraft))
             return;
+        if (SessionState == CampathSessionState.DraftPath)
+        {
+            // Drafts autosave only to the recovery file — never to a named path,
+            // never to the recent/restore-last setting.
+            try
+            {
+                _store.SaveDraft(CreateProject());
+            }
+            catch (Exception ex) when (ex is IOException or InvalidDataException or InvalidOperationException)
+            {
+                _log.Warn($"Campath draft autosave failed: {ex.Message}");
+            }
+            return;
+        }
         SaveCore(false);
     }
 
@@ -671,6 +633,15 @@ public sealed class CampathViewModel : INotifyPropertyChanged
     {
         if (SelectedDocument is not { } document || !CanEditPath)
             return;
+        LoadDocument(document);
+    }
+
+    /// <summary>Explicitly loads a saved document (or the recovery draft when IsDraft is set).</summary>
+    public void LoadDocument(CampathDocumentInfo document)
+    {
+        ArgumentNullException.ThrowIfNull(document);
+        if (!CanEditPath)
+            return;
         var replay = CurrentReplayIdentifier();
         if (replay is null)
         {
@@ -679,7 +650,10 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         }
         try
         {
-            var project = _store.Load(document.FilePath, replay);
+            var project = document.IsDraft
+                ? _store.TryLoadDraft(replay) ??
+                  throw new InvalidDataException("The unsaved draft is no longer available for this replay.")
+                : _store.Load(document.FilePath, replay);
             _suppressAutosave = true;
             Keyframes.Clear();
             foreach (var keyframe in project.Keyframes.OrderBy(keyframe => keyframe.DemoTick))
@@ -688,12 +662,27 @@ public sealed class CampathViewModel : INotifyPropertyChanged
             InterpolationMode = project.InterpolationMode;
             EasingMode = project.EasingMode;
             EndBehavior = project.EndBehavior;
-            _currentFilePath = document.FilePath;
-            _settings.SelectedCampathPath = _currentFilePath;
-            _settings.Save();
+            if (document.IsDraft)
+            {
+                // Loading the draft resumes the unsaved draft session.
+                _currentFilePath = null;
+                _isDraft = true;
+                _store.MarkDraftActive();
+                RecoveryAvailable = false;
+            }
+            else
+            {
+                _currentFilePath = document.FilePath;
+                _isDraft = false;
+                _store.DeleteDraft();
+                _settings.SelectedCampathPath = _currentFilePath;
+                _settings.Save();
+            }
             SelectedKeyframe = Keyframes.FirstOrDefault();
             ClearHistory();
-            Status = $"Loaded {project.Name} ({Keyframes.Count} keyframes).";
+            Status = document.IsDraft
+                ? $"Recovered draft {project.Name} ({Keyframes.Count} keyframes, unsaved)."
+                : $"Loaded {project.Name} ({Keyframes.Count} keyframes).";
             OnCollectionChanged();
         }
         catch (Exception ex) when (ex is IOException or InvalidDataException)
@@ -706,6 +695,122 @@ public sealed class CampathViewModel : INotifyPropertyChanged
             _suppressAutosave = false;
         }
     }
+
+    /// <summary>Creates a clean, empty draft. Never loads old keyframes.</summary>
+    public void NewPath()
+    {
+        if (!CanEditPath)
+            return;
+        _suppressAutosave = true;
+        Keyframes.Clear();
+        SelectedKeyframe = null;
+        _currentFilePath = null;
+        _pathName = "Untitled Path";
+        OnPropertyChanged(nameof(PathName));
+        _suppressAutosave = false;
+        _isDraft = true;
+        _store.DeleteDraft();
+        ClearHistory();
+        Status = "New draft created. Move the camera and press Mouse3 to add keyframes.";
+        OnCollectionChanged();
+        OnEditorStateChanged();
+    }
+
+    /// <summary>Saves the draft under a new explicit name, creating a new file.</summary>
+    public void SaveAs(string? name)
+    {
+        if (!CanEditPath || CurrentReplayIdentifier() is null)
+        {
+            Status = "A confirmed replay is required before saving a Campath.";
+            return;
+        }
+        if (!string.IsNullOrWhiteSpace(name))
+        {
+            _pathName = name.Trim();
+            OnPropertyChanged(nameof(PathName));
+        }
+        SaveCore(true, forceNewFile: true);
+        OnEditorStateChanged();
+    }
+
+    /// <summary>Unloads the current path and returns to NoPath. Saved files stay on disk.</summary>
+    public void ClosePath()
+    {
+        if (!CanEditPath)
+            return;
+        _suppressAutosave = true;
+        Keyframes.Clear();
+        SelectedKeyframe = null;
+        _currentFilePath = null;
+        _pathName = "Untitled Path";
+        OnPropertyChanged(nameof(PathName));
+        _suppressAutosave = false;
+        _isDraft = false;
+        _store.DeleteDraft();
+        _settings.SelectedCampathPath = string.Empty;
+        _settings.Save();
+        ClearHistory();
+        Status = "Path closed.";
+        OnCollectionChanged();
+        OnEditorStateChanged();
+    }
+
+    /// <summary>Recovers the abandoned on-disk draft after an abnormal shutdown.</summary>
+    public void RecoverDraft()
+    {
+        if (!CanEditPath)
+            return;
+        var replay = CurrentReplayIdentifier();
+        if (replay is null)
+        {
+            Status = "A confirmed replay is required before recovering a Campath draft.";
+            return;
+        }
+        RecoveryAvailable = false;
+        LoadDocument(new CampathDocumentInfo(
+            "Untitled Path", _store.DraftFilePath, replay, IsDraft: true));
+    }
+
+    /// <summary>Permanently discards the abandoned on-disk draft.</summary>
+    public void DiscardDraft()
+    {
+        _store.DeleteDraft();
+        RecoveryAvailable = false;
+        Status = "Unsaved draft discarded.";
+        OnEditorStateChanged();
+    }
+
+    /// <summary>The picker list: recovery draft first (when present), then saved paths newest first.</summary>
+    public IReadOnlyList<CampathDocumentInfo> GetDocuments()
+    {
+        var replay = CurrentReplayIdentifier();
+        var documents = new List<CampathDocumentInfo>();
+        if (replay is not null && _store.TryLoadDraft(replay) is { } draft &&
+            SessionState != CampathSessionState.DraftPath)
+        {
+            documents.Add(new CampathDocumentInfo(
+                $"{draft.Name} (unsaved draft)",
+                _store.DraftFilePath,
+                draft.ReplayIdentifier,
+                draft.Keyframes.Count,
+                File.GetLastWriteTimeUtc(_store.DraftFilePath),
+                IsDraft: true));
+        }
+        documents.AddRange(SavedCampaths
+            .OrderByDescending(document => document.ModifiedUtc ?? DateTime.MinValue));
+        return documents;
+    }
+
+    /// <summary>Loads the picker-list entry at <paramref name="index"/> (same order as GetDocuments).</summary>
+    public void LoadPathByIndex(int index)
+    {
+        var documents = GetDocuments();
+        if (index >= 0 && index < documents.Count)
+            LoadDocument(documents[index]);
+    }
+
+    /// <summary>Clean application shutdown: the draft stays recoverable but is not flagged as crashed.</summary>
+    public void Shutdown() => _store.CompleteCleanShutdown();
 
     private void RefreshDocuments()
     {
@@ -761,16 +866,18 @@ public sealed class CampathViewModel : INotifyPropertyChanged
                 Keyframes.Clear();
                 SelectedKeyframe = null;
                 _currentFilePath = null;
-                _pathName = "Untitled Campath";
+                _isDraft = false;
+                _pathName = "Untitled Path";
                 OnPropertyChanged(nameof(PathName));
                 _suppressAutosave = false;
                 ClearHistory();
+                RecoveryAvailable = false;
                 Status = "Replay changed; load a matching Campath or start a new path.";
                 OnCollectionChanged();
             }
             RefreshDocuments();
             if (!changedBetweenReplays)
-                TryRestoreSelectedCampath();
+                EvaluateStartupWorkspace(currentReplay);
         }
         else if (currentReplay is not null && _lastReplayIdentifier is not null &&
                  _lastReplayIdentifier.TotalTicks is null && currentReplay.TotalTicks is not null)
@@ -785,6 +892,26 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         _undo.Clear();
         _redo.Clear();
         RaiseCommandStates();
+    }
+
+    /// <summary>
+    /// Runs once when a replay is first confirmed. The default workspace is
+    /// always clean: no path is loaded unless the user opted into
+    /// "Restore last workspace". An abandoned draft from an abnormal shutdown is
+    /// only surfaced as an explicit recovery choice, never silently restored.
+    /// </summary>
+    private void EvaluateStartupWorkspace(CampathReplayIdentifier replay)
+    {
+        if (Keyframes.Count > 0 || SessionState != CampathSessionState.NoPath)
+            return;
+        if (_settings.RestoreLastWorkspace)
+        {
+            TryRestoreSelectedCampath();
+            return;
+        }
+        RecoveryAvailable = _store.HasAbandonedDraft && _store.TryLoadDraft(replay) is not null;
+        if (RecoveryAvailable)
+            Status = "An unsaved Campath draft from a previous session can be recovered.";
     }
 
     private void TryRestoreSelectedCampath()
@@ -832,8 +959,6 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         (RedoCommand as RelayCommand)?.RaiseCanExecuteChanged();
         (SaveCommand as RelayCommand)?.RaiseCanExecuteChanged();
         (LoadCommand as RelayCommand)?.RaiseCanExecuteChanged();
-        (CaptureHotkeyCommand as RelayCommand)?.RaiseCanExecuteChanged();
-        (ClearHotkeyCommand as RelayCommand)?.RaiseCanExecuteChanged();
     }
 
     private void SetOnUi(Action action)
