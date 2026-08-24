@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -11,12 +12,78 @@ namespace DeadlockMVM.Launcher;
 
 public partial class MainWindow : Window
 {
+    private readonly LauncherWindowLifecycle _launcherLifecycle = new();
+
     public MainWindow()
     {
         InitializeComponent();
+        DataContextChanged += MainWindow_DataContextChanged;
     }
 
     private MainViewModel? ViewModel => DataContext as MainViewModel;
+
+    private void MainWindow_DataContextChanged(object sender, DependencyPropertyChangedEventArgs e)
+    {
+        if (e.OldValue is MainViewModel previous)
+            Unsubscribe(previous);
+        if (e.NewValue is MainViewModel current)
+            Subscribe(current);
+    }
+
+    private void Subscribe(MainViewModel viewModel)
+    {
+        viewModel.LaunchCompleted += ViewModel_LaunchCompleted;
+        viewModel.DeadlockRunningChanged += ViewModel_DeadlockRunningChanged;
+        viewModel.LauncherVisibilityPreferenceChanged += ViewModel_LauncherVisibilityPreferenceChanged;
+    }
+
+    private void Unsubscribe(MainViewModel viewModel)
+    {
+        viewModel.LaunchCompleted -= ViewModel_LaunchCompleted;
+        viewModel.DeadlockRunningChanged -= ViewModel_DeadlockRunningChanged;
+        viewModel.LauncherVisibilityPreferenceChanged -= ViewModel_LauncherVisibilityPreferenceChanged;
+    }
+
+    private void ViewModel_LaunchCompleted(object? sender, bool success)
+    {
+        if (success)
+            _launcherLifecycle.ArmSuccessfulLaunch(DateTime.UtcNow);
+        else
+            _launcherLifecycle.CancelLaunch();
+        ApplyLauncherLifecycle();
+    }
+
+    private void ViewModel_DeadlockRunningChanged(object? sender, bool running) =>
+        ApplyLauncherLifecycle();
+
+    private void ViewModel_LauncherVisibilityPreferenceChanged(object? sender, EventArgs e) =>
+        ApplyLauncherLifecycle();
+
+    private void ApplyLauncherLifecycle()
+    {
+        var viewModel = ViewModel;
+        if (viewModel is null)
+            return;
+
+        switch (_launcherLifecycle.Observe(
+                    viewModel.DeadlockRunning,
+                    viewModel.HideLauncherWhileDeadlockRunning,
+                    DateTime.UtcNow))
+        {
+            case LauncherWindowAction.Hide:
+                ShowInTaskbar = false;
+                Hide();
+                viewModel.NotifyLauncherHidden();
+                break;
+            case LauncherWindowAction.Restore:
+                ShowInTaskbar = true;
+                Show();
+                WindowState = WindowState.Normal;
+                viewModel.RestoreAfterDeadlockExit();
+                Activate();
+                break;
+        }
+    }
 
     private void TitleBar_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
@@ -34,6 +101,33 @@ public partial class MainWindow : Window
     private void CloseButton_Click(object sender, RoutedEventArgs e)
     {
         Close();
+    }
+
+    protected override void OnClosing(CancelEventArgs e)
+    {
+        if (ViewModel?.DeadlockRunning == true)
+        {
+            var choice = System.Windows.MessageBox.Show(
+                "Deadlock is still running. Closing Deadlock MVM will disconnect SMVM and stop the managed host. Close anyway?",
+                "Close Deadlock MVM?",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Warning,
+                MessageBoxResult.No);
+            if (choice != MessageBoxResult.Yes)
+            {
+                e.Cancel = true;
+                return;
+            }
+        }
+
+        base.OnClosing(e);
+    }
+
+    protected override void OnClosed(EventArgs e)
+    {
+        if (ViewModel is { } viewModel)
+            Unsubscribe(viewModel);
+        base.OnClosed(e);
     }
 
     private void LocateDeadlockButton_Click(object sender, RoutedEventArgs e)

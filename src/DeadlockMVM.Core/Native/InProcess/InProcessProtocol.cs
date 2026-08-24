@@ -118,6 +118,7 @@ public enum SmvmSnapshotFlags : uint
     CampathRecoveryAvailable = 1 << 23,
     RestoreWorkspace = 1 << 24,
     CaptureDiagnostics = 1 << 25,
+    ShowStatusHud = 1 << 26,
 }
 
 public enum SmvmCaptureStage : uint
@@ -361,6 +362,10 @@ public enum SmvmActionType : uint
     SetReplayBarAnchor = 68,
     CycleReplayInterface = 69,
     ApplyMovieMakerDefaults = 70,
+    ToggleStatusHud = 71,
+    SetStatusHudAnchor = 72,
+    SetStatusHudScale = 73,
+    SetStatusHudOpacity = 74,
 }
 
 public sealed record SmvmAction(
@@ -443,7 +448,10 @@ public sealed record SmvmSnapshot(
     uint ToggleFreeCameraKey,
     uint ReplayPauseKey,
     uint StepBackKey,
-    uint StepForwardKey);
+    uint StepForwardKey,
+    SmvmNotificationAnchor StatusHudAnchor = SmvmNotificationAnchor.TopRight,
+    double StatusHudScale = 1.0,
+    double StatusHudOpacity = 0.92);
 
 [Flags]
 public enum InProcessStatusFlags : uint
@@ -493,10 +501,10 @@ public sealed record InProcessCameraStatus(
 internal static class InProcessProtocol
 {
     public const uint Magic = 0x4D564D43;
-    public const ushort Version = 9;
+    public const ushort Version = 10;
     public const int HeaderSize = 20;
     public const int StatusSize = 264;
-    public const int SmvmSnapshotSize = 712;
+    public const int SmvmSnapshotSize = 728;
     public const int CameraSampleSize = 56;
     public const int CampathKeyframeSize = 64;
     public const int CampathHeaderSize = 16;
@@ -632,7 +640,7 @@ internal static class InProcessProtocol
     {
         ArgumentNullException.ThrowIfNull(snapshot);
         var payload = new byte[SmvmSnapshotSize];
-        BinaryPrimitives.WriteUInt32LittleEndian(payload, 5);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload, 6);
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(4), (uint)snapshot.Flags);
         BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(8), snapshot.CurrentTick);
         BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(16), snapshot.TotalTicks);
@@ -709,6 +717,9 @@ internal static class InProcessProtocol
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(696), snapshot.ReplayPauseKey);
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(700), snapshot.StepBackKey);
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(704), snapshot.StepForwardKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(708), (uint)snapshot.StatusHudAnchor);
+        WriteDouble(payload, 712, snapshot.StatusHudScale);
+        WriteDouble(payload, 720, snapshot.StatusHudOpacity);
         return payload;
     }
 

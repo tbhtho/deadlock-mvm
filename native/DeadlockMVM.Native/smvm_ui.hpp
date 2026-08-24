@@ -82,10 +82,14 @@ struct SmvmUiState final {
     bool replay_scrubbing{};
     bool clean_hint_pending{};
     std::uint64_t clean_hint_until_ms{};
+    bool free_camera_activation_pending{};
+    std::uint64_t free_camera_activation_started_ms{};
+    std::uint64_t free_camera_activation_error_until_ms{};
 };
 
 struct SmvmUiFrameParams final {
     const SmvmSnapshotPayload* snapshot{};
+    const CameraSample* rendered_camera{};
     const CampathPayloadHeader* path_header{};
     const CampathKeyframe* keyframes{};
     bool has_path{};
@@ -96,7 +100,7 @@ struct SmvmUiFrameParams final {
     std::uint32_t frame_microseconds{};
     std::uint32_t overlay_flags{};
     std::uint32_t renderer_error{};
-    std::function<void(const SmvmActionPayload&)> queue_action{};
+    std::function<bool(const SmvmActionPayload&)> queue_action{};
     std::function<void()> request_capture{};
 };
 

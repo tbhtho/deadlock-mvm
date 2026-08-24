@@ -1,8 +1,11 @@
 #include "campath_math.hpp"
 #include "hook_lifecycle.hpp"
 #include "manual_camera_math.hpp"
+#include "manual_mouse_fallback.hpp"
+#include "optimistic_edit.hpp"
 #include "pattern_scan.hpp"
 #include "protocol.hpp"
+#include "render_camera_policy.hpp"
 #include "smvm_action_queue.hpp"
 #include "smvm_input_gate.hpp"
 #include "smvm_input_route.hpp"
@@ -136,6 +139,30 @@ void ProtocolTests() {
               input_state_offset),
           "input gate fails closed when the EnableInput implementation changes");
 
+    float optimistic_value = 70.0F;
+    double optimistic_since = -1.0;
+    deadlock_mvm::MarkOptimisticEdit(
+        90.0F, 10.0F, 170.0F, 1.0, optimistic_value, optimistic_since);
+    Check(optimistic_value == 90.0F && optimistic_since == 1.0,
+          "slider edit publishes one clamped optimistic value");
+    const auto waiting_edit = deadlock_mvm::ReconcileOptimisticEdit(
+        70.0F, 1.05, 2.0, 0.001F, optimistic_value, optimistic_since);
+    Check(waiting_edit == deadlock_mvm::OptimisticEditResult::pending &&
+              optimistic_value == 90.0F,
+          "slider does not snap back while its snapshot acknowledgement is pending");
+    const auto acknowledged_edit = deadlock_mvm::ReconcileOptimisticEdit(
+        90.0F, 1.1, 2.0, 0.001F, optimistic_value, optimistic_since);
+    Check(acknowledged_edit == deadlock_mvm::OptimisticEditResult::acknowledged &&
+              optimistic_since < 0.0,
+          "slider returns to authoritative tracking after acknowledgement");
+    deadlock_mvm::MarkOptimisticEdit(
+        200.0F, 10.0F, 170.0F, 2.0, optimistic_value, optimistic_since);
+    const auto timed_out_edit = deadlock_mvm::ReconcileOptimisticEdit(
+        75.0F, 4.1, 2.0, 0.001F, optimistic_value, optimistic_since);
+    Check(timed_out_edit == deadlock_mvm::OptimisticEditResult::timed_out &&
+              optimistic_value == 75.0F && optimistic_since < 0.0,
+          "slider fails back to the authoritative value after an unacknowledged edit");
+
     using namespace deadlock_mvm;
     const MessageHeader valid{kProtocolMagic, kProtocolVersion, MessageType::get_status, 0, 7};
     Check(ValidateHeader(valid), "valid header is accepted");
@@ -153,8 +180,8 @@ void ProtocolTests() {
           "sample payload size is fixed");
     Check(ExpectedPayloadSize(MessageType::get_status) == 0, "status request has no payload");
     Check(sizeof(HeartbeatPayload) == 24, "heartbeat carries the replay clock calibration");
-    Check(sizeof(SmvmSnapshotPayload) == 712 && sizeof(StatusPayload) == 264,
-          "SMVM v9 snapshot and status layouts are fixed");
+    Check(sizeof(SmvmSnapshotPayload) == 728 && sizeof(StatusPayload) == 264,
+          "SMVM v10 snapshot and status layouts are fixed");
     Check(ExpectedPayloadSize(MessageType::set_roll_override) == sizeof(RollPayload),
           "roll override payload is one narrowly typed value");
     Check(ValidatePayloadSize(MessageType::prepare_camera_observation, 0),
@@ -172,7 +199,7 @@ void ProtocolTests() {
           "fixed SMVM snapshot payload is accepted");
 
     SmvmSnapshotPayload snapshot{};
-    snapshot.snapshot_version = 5;
+    snapshot.snapshot_version = 6;
     snapshot.current_tick = -1;
     snapshot.total_ticks = -1;
     snapshot.timescale = 1.0;
@@ -196,6 +223,9 @@ void ProtocolTests() {
     snapshot.vconsole_port = 29000;
     snapshot.replay_bar_scale = 1.0;
     snapshot.replay_bar_opacity = 0.92;
+    snapshot.status_hud_anchor = SmvmNotificationAnchor::top_right;
+    snapshot.status_hud_scale = 1.0;
+    snapshot.status_hud_opacity = 0.92;
     Check(ValidateSmvmSnapshotPayload(snapshot), "well-formed immutable SMVM snapshot is accepted");
     snapshot.flags = 1u << 31;
     Check(!ValidateSmvmSnapshotPayload(snapshot), "unknown SMVM snapshot flags fail closed");
@@ -232,6 +262,26 @@ void ProtocolTests() {
     snapshot.saved_document_count = 2;
     snapshot.flags &= ~(smvm_snapshot_campath_unsaved | smvm_snapshot_campath_recovery_available);
     Check(ValidateSmvmSnapshotPayload(snapshot), "bounded saved document count is accepted");
+
+    const CameraSample stale_snapshot{1, 2, 3, 4, 5, 0, 70};
+    const CameraSample rendered_frame{10, 20, 30, 12, 140, 27.5, 42.25};
+    const auto selected_frame = SelectRenderCamera(stale_snapshot, rendered_frame, true);
+    Check(selected_frame.fov == 42.25 && selected_frame.roll == 27.5 &&
+              selected_frame.x == 10 && selected_frame.yaw == 140,
+          "world projection and HUD select the same final rendered FOV/roll camera frame");
+    const auto fallback_frame = SelectRenderCamera(stale_snapshot, {}, false);
+    Check(fallback_frame.fov == 70 && fallback_frame.roll == 0 && fallback_frame.x == 1,
+          "world projection and HUD fall back to the immutable snapshot together");
+
+    Check(!ResolveLegacyMouseDelta(false, 0, 0, 120, 80, false).accepted,
+          "first legacy mouse event seeds without jumping the camera");
+    Check(!ResolveLegacyMouseDelta(true, 100, 100, 110, 94, true).accepted,
+          "recent raw relative input always wins over the legacy fallback");
+    const auto legacy_delta = ResolveLegacyMouseDelta(true, 100, 100, 110, 94, false);
+    Check(legacy_delta.accepted && legacy_delta.x == 10 && legacy_delta.y == -6,
+          "bounded legacy mouse motion remains available when raw SDL packets are absent");
+    Check(!ResolveLegacyMouseDelta(true, 100, 100, 900, 100, false).accepted,
+          "absolute cursor warps cannot jump the fallback camera");
 
     Check(sizeof(CampathDocumentEntry) == 144, "Campath document entry layout is fixed");
     Check(ValidatePayloadSize(MessageType::set_campath_documents,

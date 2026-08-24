@@ -15,6 +15,7 @@ public sealed class AppSettings : IAppSettings
 
         public string SelectedReplayPath { get; set; } = string.Empty;
         public string SelectedCampathPath { get; set; } = string.Empty;
+        public bool HideLauncherWhileDeadlockRunning { get; set; } = true;
         public bool RestoreLastWorkspace { get; set; }
 
         public int VConsolePort { get; set; } = DeadlockConstants.DefaultVConsolePort;
@@ -73,6 +74,10 @@ public sealed class AppSettings : IAppSettings
         public double SmvmReplayBarScale { get; set; } = 1;
         public double SmvmReplayBarOpacity { get; set; } = 0.92;
         public SmvmReplayBarAnchor SmvmReplayBarAnchor { get; set; } = SmvmReplayBarAnchor.Bottom;
+        public bool SmvmShowStatusHud { get; set; } = true;
+        public SmvmNotificationAnchor SmvmStatusHudAnchor { get; set; } = SmvmNotificationAnchor.TopRight;
+        public double SmvmStatusHudScale { get; set; } = 1;
+        public double SmvmStatusHudOpacity { get; set; } = 0.92;
     }
 
     private readonly string _filePath;
@@ -103,6 +108,12 @@ public sealed class AppSettings : IAppSettings
     {
         get => _document.SelectedCampathPath;
         set => _document.SelectedCampathPath = value ?? string.Empty;
+    }
+
+    public bool HideLauncherWhileDeadlockRunning
+    {
+        get => _document.HideLauncherWhileDeadlockRunning;
+        set => _document.HideLauncherWhileDeadlockRunning = value;
     }
 
     public bool RestoreLastWorkspace
@@ -451,6 +462,34 @@ public sealed class AppSettings : IAppSettings
         set => _document.SmvmReplayBarAnchor = Enum.IsDefined(value)
             ? value
             : SmvmReplayBarAnchor.Bottom;
+    }
+
+    public bool SmvmShowStatusHud
+    {
+        get => _document.SmvmShowStatusHud;
+        set => _document.SmvmShowStatusHud = value;
+    }
+
+    public SmvmNotificationAnchor SmvmStatusHudAnchor
+    {
+        get => Enum.IsDefined(_document.SmvmStatusHudAnchor)
+            ? _document.SmvmStatusHudAnchor
+            : SmvmNotificationAnchor.TopRight;
+        set => _document.SmvmStatusHudAnchor = Enum.IsDefined(value)
+            ? value
+            : SmvmNotificationAnchor.TopRight;
+    }
+
+    public double SmvmStatusHudScale
+    {
+        get => ClampFinite(_document.SmvmStatusHudScale, 0.75, 1.5, 1);
+        set => _document.SmvmStatusHudScale = ClampFinite(value, 0.75, 1.5, 1);
+    }
+
+    public double SmvmStatusHudOpacity
+    {
+        get => ClampFinite(_document.SmvmStatusHudOpacity, 0.35, 1, 0.92);
+        set => _document.SmvmStatusHudOpacity = ClampFinite(value, 0.35, 1, 0.92);
     }
 
     public void Load()

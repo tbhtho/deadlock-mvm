@@ -215,6 +215,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         if (editor.RecoveryAvailable) flags |= SmvmSnapshotFlags.CampathRecoveryAvailable;
         if (_settings.RestoreLastWorkspace) flags |= SmvmSnapshotFlags.RestoreWorkspace;
         if (_captureDiagnosticsEnabled) flags |= SmvmSnapshotFlags.CaptureDiagnostics;
+        if (_settings.SmvmShowStatusHud) flags |= SmvmSnapshotFlags.ShowStatusHud;
 
         return new SmvmSnapshot(
             flags,
@@ -288,7 +289,10 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
             SmvmInputCode.ParseForSlotOrDefault(124, _settings.SmvmToggleFreeCameraHotkey, "F2"),
             SmvmInputCode.ParseForSlotOrDefault(125, _settings.SmvmReplayPauseHotkey, "RightShift"),
             SmvmInputCode.ParseForSlotOrDefault(127, _settings.SmvmStepBackHotkey, string.Empty),
-            SmvmInputCode.ParseForSlotOrDefault(128, _settings.SmvmStepForwardHotkey, string.Empty));
+            SmvmInputCode.ParseForSlotOrDefault(128, _settings.SmvmStepForwardHotkey, string.Empty),
+            _settings.SmvmStatusHudAnchor,
+            _settings.SmvmStatusHudScale,
+            _settings.SmvmStatusHudOpacity);
     }
 
     private CameraOwnership ResolveCameraOwnership(bool replayActive, InProcessCameraStatus? native)
@@ -524,6 +528,25 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                     _settings.Save();
                 }
                 break;
+            case SmvmActionType.ToggleStatusHud:
+                _settings.SmvmShowStatusHud = !_settings.SmvmShowStatusHud;
+                _settings.Save();
+                break;
+            case SmvmActionType.SetStatusHudAnchor:
+                if (Enum.IsDefined((SmvmNotificationAnchor)action.Index))
+                {
+                    _settings.SmvmStatusHudAnchor = (SmvmNotificationAnchor)action.Index;
+                    _settings.Save();
+                }
+                break;
+            case SmvmActionType.SetStatusHudScale:
+                _settings.SmvmStatusHudScale = action.Value;
+                _settings.Save();
+                break;
+            case SmvmActionType.SetStatusHudOpacity:
+                _settings.SmvmStatusHudOpacity = action.Value;
+                _settings.Save();
+                break;
             case SmvmActionType.ToggleReplayPause:
                 _controller.TogglePause();
                 break;
@@ -543,18 +566,22 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                     await ExecuteReplaySeekAsync(nextTick + 1).ConfigureAwait(true);
                 break;
             case SmvmActionType.FreeRoam:
-                await _camera.EnterFreeRoamAsync(_stop.Token).ConfigureAwait(true);
+                await EnterSmvmFreeCameraAsync().ConfigureAwait(true);
                 break;
             case SmvmActionType.PreviousPlayer:
+                await DisableManualCameraIfOwnedAsync().ConfigureAwait(true);
                 _camera.SelectPrevPlayer();
                 break;
             case SmvmActionType.NextPlayer:
+                await DisableManualCameraIfOwnedAsync().ConfigureAwait(true);
                 _camera.SelectNextPlayer();
                 break;
             case SmvmActionType.InEye:
+                await DisableManualCameraIfOwnedAsync().ConfigureAwait(true);
                 _camera.SelectInEye();
                 break;
             case SmvmActionType.Chase:
+                await DisableManualCameraIfOwnedAsync().ConfigureAwait(true);
                 _camera.SelectChase();
                 break;
             case SmvmActionType.SetFov:
@@ -768,7 +795,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
             case SmvmActionType.ToggleManualCamera:
                 if (_native.ManualCameraDesired || _native.ManualCameraActive)
                 {
-                    await _native.DisableManualCameraAsync(_stop.Token).ConfigureAwait(true);
+                    await DisableManualCameraIfOwnedAsync().ConfigureAwait(true);
                 }
                 else
                 {
@@ -781,12 +808,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                 }
                 break;
             case SmvmActionType.ReacquireCamera:
-                if (_native.CampathPlaying)
-                    throw new InvalidOperationException("Stop Campath before reacquiring SMVM Free Camera.");
-                if (_native.ManualCameraDesired || _native.ManualCameraActive)
-                    await _native.DisableManualCameraAsync(_stop.Token).ConfigureAwait(true);
-                await _camera.EnterFreeRoamAsync(_stop.Token).ConfigureAwait(true);
-                await _native.EnableManualCameraAsync(_stop.Token).ConfigureAwait(true);
+                await EnterSmvmFreeCameraAsync().ConfigureAwait(true);
                 break;
             case SmvmActionType.CameraSelfTest:
                 await _native.RunCameraSelfTestAsync(_stop.Token).ConfigureAwait(true);
@@ -800,6 +822,21 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                     _stop.Token).ConfigureAwait(true);
                 break;
         }
+    }
+
+    private async Task DisableManualCameraIfOwnedAsync()
+    {
+        if (_native.ManualCameraDesired || _native.ManualCameraActive)
+            await _native.DisableManualCameraAsync(_stop.Token).ConfigureAwait(true);
+    }
+
+    private async Task EnterSmvmFreeCameraAsync()
+    {
+        if (_native.CampathPlaying)
+            throw new InvalidOperationException("Stop Campath before reacquiring SMVM Free Camera.");
+        await DisableManualCameraIfOwnedAsync().ConfigureAwait(true);
+        await _camera.EnterFreeRoamAsync(_stop.Token).ConfigureAwait(true);
+        await _native.EnableManualCameraAsync(_stop.Token).ConfigureAwait(true);
     }
 
     private void TraceCapture(

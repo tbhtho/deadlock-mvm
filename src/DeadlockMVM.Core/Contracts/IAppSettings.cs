@@ -15,6 +15,9 @@ public interface IAppSettings
     string SelectedReplayPath { get; set; }
     string SelectedCampathPath { get; set; }
 
+    /// <summary>Hide only the WPF shell while Deadlock is running; the managed host remains alive.</summary>
+    bool HideLauncherWhileDeadlockRunning { get; set; }
+
     /// <summary>
     /// Opt-in: restore the previously saved Campath when a matching replay starts.
     /// Default OFF — a normal startup always opens a clean, empty workspace.
@@ -78,6 +81,10 @@ public interface IAppSettings
     double SmvmReplayBarScale { get; set; }
     double SmvmReplayBarOpacity { get; set; }
     SmvmReplayBarAnchor SmvmReplayBarAnchor { get; set; }
+    bool SmvmShowStatusHud { get; set; }
+    SmvmNotificationAnchor SmvmStatusHudAnchor { get; set; }
+    double SmvmStatusHudScale { get; set; }
+    double SmvmStatusHudOpacity { get; set; }
 
     void Load();
 

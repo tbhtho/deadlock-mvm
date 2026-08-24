@@ -538,6 +538,20 @@ void RevokeCameraOwnership(Backend& backend, const ErrorCode error) noexcept {
            backend->smvm_snapshot.Load(snapshot);
 }
 
+[[nodiscard]] bool OverlayReadRenderedCamera(void* context, CameraSample& camera) noexcept {
+    auto* backend = static_cast<Backend*>(context);
+    if (backend == nullptr || !backend->pipe_connected.load(std::memory_order_acquire) ||
+        !backend->camera_observed.load(std::memory_order_acquire))
+        return false;
+    const auto observed_at = backend->camera_observed_milliseconds.load(std::memory_order_acquire);
+    if (observed_at == 0 || GetTickCount64() - observed_at > kCameraObservationFreshMilliseconds)
+        return false;
+    std::int64_t ignored_tick{};
+    std::uint64_t ignored_sequence{};
+    return backend->observed_frame.Load(camera, ignored_tick, ignored_sequence) &&
+           ValidateSample(camera);
+}
+
 [[nodiscard]] bool OverlayReadEditorPath(
     void* context,
     CampathPayloadHeader& header,
@@ -1841,6 +1855,7 @@ void ServePipe(Backend& backend) noexcept {
         const SmvmOverlayCallbacks callbacks{
             &backend,
             &OverlayReadSnapshot,
+            &OverlayReadRenderedCamera,
             &OverlayReadEditorPath,
             &OverlayReadCampathDocuments,
             &OverlayQueueAction,

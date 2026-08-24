@@ -43,6 +43,10 @@ public sealed class MainViewModel : ViewModelBase
     private string _replayDirectoryPath = string.Empty;
     private string _replayStatusText = "Deadlock installation not found.";
 
+    public event EventHandler<bool>? LaunchCompleted;
+    public event EventHandler<bool>? DeadlockRunningChanged;
+    public event EventHandler? LauncherVisibilityPreferenceChanged;
+
     public MainViewModel(
         ISteamService steam,
         IProcessMonitor process,
@@ -243,7 +247,25 @@ public sealed class MainViewModel : ViewModelBase
     public bool DeadlockRunning
     {
         get => _deadlockRunning;
-        private set => SetProperty(ref _deadlockRunning, value);
+        private set
+        {
+            if (SetProperty(ref _deadlockRunning, value))
+                DeadlockRunningChanged?.Invoke(this, value);
+        }
+    }
+
+    public bool HideLauncherWhileDeadlockRunning
+    {
+        get => _settings.HideLauncherWhileDeadlockRunning;
+        set
+        {
+            if (_settings.HideLauncherWhileDeadlockRunning == value)
+                return;
+            _settings.HideLauncherWhileDeadlockRunning = value;
+            _settings.Save();
+            OnPropertyChanged();
+            LauncherVisibilityPreferenceChanged?.Invoke(this, EventArgs.Empty);
+        }
     }
 
     public string SteamStatusText
@@ -532,6 +554,17 @@ public sealed class MainViewModel : ViewModelBase
         }
 
         IsLaunching = false;
+        LaunchCompleted?.Invoke(this, result.Success);
+    }
+
+    public void NotifyLauncherHidden() =>
+        _log.Info("Launcher window hidden while Deadlock runs; managed SMVM host remains active.");
+
+    public void RestoreAfterDeadlockExit()
+    {
+        Refresh();
+        StatusMessage = "Deadlock closed. Launcher restored.";
+        _log.Info("Deadlock exited; launcher window restored and replay state refreshed.");
     }
 
     private string? ResolveSteamExecutable()

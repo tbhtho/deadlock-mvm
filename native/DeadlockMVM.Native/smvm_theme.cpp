@@ -1,4 +1,5 @@
 #include "smvm_theme.hpp"
+#include "optimistic_edit.hpp"
 
 #include <algorithm>
 #include <array>
@@ -370,20 +371,32 @@ bool SliderInput(
         ? ImGui::CalcTextSize(label).x + ImGui::GetStyle().ItemSpacing.x
         : 0.0F;
     ImGui::SetNextItemWidth(field_width);
-    // The widget edits a state-storage copy while it is active; once inactive
-    // the copy resyncs to the authoritative snapshot value.
-    const auto field_id = ImGui::GetID("##field");
-    auto value = storage->GetFloat(field_id, current);
+    // The numeric field and track share one optimistic value. Retain it after
+    // release until the authoritative managed snapshot acknowledges the edit;
+    // this prevents a visible snap-back during the IPC round trip.
+    const auto value_id = ImGui::GetID("##edit_value");
+    const auto pending_id = ImGui::GetID("##edit_pending_since");
+    const auto initialized_id = ImGui::GetID("##edit_initialized");
+    auto value = storage->GetFloat(value_id, current);
+    auto pending_since = static_cast<double>(storage->GetFloat(pending_id, -1.0F));
+    if (storage->GetInt(initialized_id, 0) == 0) {
+        value = current;
+        pending_since = -1.0;
+        storage->SetInt(initialized_id, 1);
+    }
+    constexpr auto kPendingTimeoutSeconds = 2.0;
+    const auto epsilon = std::max(0.0005F, (maximum - minimum) * 0.00001F);
+    static_cast<void>(ReconcileOptimisticEdit(
+        current, ImGui::GetTime(), kPendingTimeoutSeconds, epsilon, value, pending_since));
+    storage->SetFloat(value_id, value);
+    storage->SetFloat(pending_id, static_cast<float>(pending_since));
+
+    auto edited = false;
     ImGui::PushFont(g_fonts.mono);
     ImGui::InputFloat("##field", &value, 0.0F, 0.0F, format);
     ImGui::PopFont();
     if (ImGui::IsItemEdited()) {
-        value = std::clamp(value, minimum, maximum);
-        storage->SetFloat(field_id, value);
-        out_value = value;
-        changed = true;
-    } else if (!ImGui::IsItemActive()) {
-        storage->SetFloat(field_id, current);
+        edited = true;
     }
     ImGui::SameLine();
     // Cap the slider so trailing SameLine content (presets, captions, buttons)
@@ -392,17 +405,16 @@ bool SliderInput(
         std::max(40.0F * g_scale,
                  width - field_width - label_width - ImGui::GetStyle().ItemSpacing.x * 2.0F),
         220.0F * g_scale));
-    const auto slider_id = ImGui::GetID("##slider");
-    value = storage->GetFloat(slider_id, current);
     // The numeric field already shows the exact value; an empty slider format
     // avoids drawing it a second time inside the track.
     ImGui::SliderFloat("##slider", &value, minimum, maximum, "");
-    if (ImGui::IsItemEdited()) {
-        storage->SetFloat(slider_id, value);
+    edited = edited || ImGui::IsItemEdited();
+    if (edited) {
+        MarkOptimisticEdit(value, minimum, maximum, ImGui::GetTime(), value, pending_since);
+        storage->SetFloat(value_id, value);
+        storage->SetFloat(pending_id, static_cast<float>(pending_since));
         out_value = value;
         changed = true;
-    } else if (!ImGui::IsItemActive()) {
-        storage->SetFloat(slider_id, current);
     }
     if (label != nullptr) {
         ImGui::SameLine();

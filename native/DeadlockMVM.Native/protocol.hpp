@@ -8,7 +8,7 @@
 namespace deadlock_mvm {
 
 constexpr std::uint32_t kProtocolMagic = 0x4D564D43; // "CMVM" little-endian
-constexpr std::uint16_t kProtocolVersion = 9;
+constexpr std::uint16_t kProtocolVersion = 10;
 constexpr std::size_t kMaxCampathKeyframes = 128;
 constexpr double kMinFov = 5.0;
 constexpr double kMaxFov = 170.0;
@@ -228,6 +228,7 @@ enum SmvmSnapshotFlags : std::uint32_t {
     smvm_snapshot_campath_recovery_available = 1u << 23,
     smvm_snapshot_restore_workspace = 1u << 24,
     smvm_snapshot_capture_diagnostics = 1u << 25,
+    smvm_snapshot_show_status_hud = 1u << 26,
 };
 
 enum class SmvmCampathSession : std::uint32_t {
@@ -380,6 +381,10 @@ enum class SmvmActionType : std::uint32_t {
     set_replay_bar_anchor = 68,
     cycle_replay_interface = 69,
     apply_movie_maker_defaults = 70,
+    toggle_status_hud = 71,
+    set_status_hud_anchor = 72,
+    set_status_hud_scale = 73,
+    set_status_hud_opacity = 74,
 };
 
 #pragma pack(push, 1)
@@ -501,7 +506,9 @@ struct SmvmSnapshotPayload final {
     std::uint32_t replay_pause_key;
     std::uint32_t step_back_key;
     std::uint32_t step_forward_key;
-    std::uint32_t reserved;
+    SmvmNotificationAnchor status_hud_anchor;
+    double status_hud_scale;
+    double status_hud_opacity;
 };
 
 constexpr std::size_t kMaxCampathDocuments = 32;
@@ -557,7 +564,7 @@ static_assert(sizeof(CameraSample) == 56);
 static_assert(sizeof(RollPayload) == 8);
 static_assert(sizeof(CampathKeyframe) == 64);
 static_assert(sizeof(CampathPayloadHeader) == 16);
-static_assert(sizeof(SmvmSnapshotPayload) == 712);
+static_assert(sizeof(SmvmSnapshotPayload) == 728);
 static_assert(sizeof(SmvmActionPayload) == 144);
 static_assert(sizeof(StatusPayload) == 264);
 static_assert(sizeof(CampathDocumentEntry) == 144);
@@ -650,14 +657,14 @@ constexpr std::size_t kMaxMessageBytes =
         smvm_snapshot_show_minimal_pill | smvm_snapshot_notifications |
         smvm_snapshot_hide_path_while_playing | smvm_snapshot_campath_unsaved |
         smvm_snapshot_campath_recovery_available | smvm_snapshot_restore_workspace |
-        smvm_snapshot_capture_diagnostics;
+        smvm_snapshot_capture_diagnostics | smvm_snapshot_show_status_hud;
     constexpr auto known_capabilities = smvm_capability_manual_camera | smvm_capability_rendered_roll |
         smvm_capability_path_visualization | smvm_capability_camera_self_test |
         smvm_capability_campath_self_test;
     constexpr auto known_ui_capabilities = deadlock_ui_capability_hide_panorama |
         deadlock_ui_capability_restore_panorama | deadlock_ui_capability_smvm_replay_ui |
         deadlock_ui_capability_clean_footage;
-    if (snapshot.snapshot_version != 5 || (snapshot.flags & ~known_flags) != 0 ||
+    if (snapshot.snapshot_version != 6 || (snapshot.flags & ~known_flags) != 0 ||
         (snapshot.capabilities & ~known_capabilities) != 0 ||
         snapshot.deadlock_ui_mode > DeadlockUiMode::death_notices_only ||
         snapshot.deadlock_ui_error > DeadlockUiError::restore_failed ||
@@ -668,6 +675,11 @@ constexpr std::size_t kMaxMessageBytes =
         !std::isfinite(snapshot.replay_bar_opacity) ||
         snapshot.replay_bar_opacity < 0.35 || snapshot.replay_bar_opacity > 1.0 ||
         snapshot.replay_bar_anchor > SmvmReplayBarAnchor::top ||
+        snapshot.status_hud_anchor > SmvmNotificationAnchor::bottom_right ||
+        !std::isfinite(snapshot.status_hud_scale) ||
+        snapshot.status_hud_scale < 0.75 || snapshot.status_hud_scale > 1.5 ||
+        !std::isfinite(snapshot.status_hud_opacity) ||
+        snapshot.status_hud_opacity < 0.35 || snapshot.status_hud_opacity > 1.0 ||
         snapshot.current_tick < -1 || snapshot.total_ticks < -1 ||
         snapshot.keyframe_count > kMaxCampathKeyframes ||
         snapshot.playback_state > max_playback_state || snapshot.start_failure > max_start_failure ||

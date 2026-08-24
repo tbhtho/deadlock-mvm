@@ -150,6 +150,12 @@
                              Text="{Binding ExtraArguments, UpdateSourceTrigger=PropertyChanged}"
                              Margin="0,7,0,0" />
 
+                    <CheckBox Content="Hide launcher while Deadlock is running"
+                              IsChecked="{Binding HideLauncherWhileDeadlockRunning, Mode=TwoWay}"
+                              Foreground="{StaticResource TextMutedBrush}"
+                              Margin="0,10,0,0"
+                              ToolTip="Keeps the SMVM host running in the background and restores this window when Deadlock closes." />
+
                     <Button Content="{Binding PlayButtonText}"
                             Style="{StaticResource LaunchButton}"
                             Command="{Binding LaunchCommand}"

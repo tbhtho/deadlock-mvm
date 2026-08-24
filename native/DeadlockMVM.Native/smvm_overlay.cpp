@@ -1,4 +1,7 @@
 #include "smvm_overlay.hpp"
+
+#include "render_camera_policy.hpp"
+#include "manual_mouse_fallback.hpp"
 #include "smvm_input_route.hpp"
 
 #include "campath_math.hpp"
@@ -239,6 +242,10 @@ struct OverlayState final {
     std::atomic<bool> manual_pointer_requested{false};
     std::atomic<bool> manual_pointer_active{false};
     std::atomic<bool> manual_mouse_observed{false};
+    std::atomic<std::uint64_t> manual_raw_mouse_observed_ms{0};
+    std::atomic<bool> manual_legacy_mouse_seeded{false};
+    std::atomic<std::int32_t> manual_legacy_mouse_x{0};
+    std::atomic<std::int32_t> manual_legacy_mouse_y{0};
     std::array<std::atomic<std::uint8_t>, 256> key_down{};
     std::array<std::atomic<std::uint8_t>, 256> manual_key_routes{};
     std::array<std::atomic<std::uint8_t>, 256> menu_key_routes{};
@@ -1138,20 +1145,21 @@ void BuildCameraMarker(
 void DrawCampathVisualization(
     const SmvmSnapshotPayload& snapshot,
     const CampathPayloadHeader& header,
-    const CampathKeyframe* keys) noexcept {
+    const CampathKeyframe* keys,
+    const CameraSample& view) noexcept {
     if (header.keyframe_count == 0 ||
         (snapshot.flags & (smvm_snapshot_show_path | smvm_snapshot_show_cameras)) == 0)
         return;
     if (!EnsureCampathGeometryCache(header, keys))
         return;
     const auto& cache = g_campath_geometry_cache;
-    const auto view_basis = BasisFromAngles(snapshot.camera);
+    const auto view_basis = BasisFromAngles(view);
     if ((snapshot.flags & smvm_snapshot_show_path) != 0 && header.keyframe_count >= 2) {
         for (std::size_t index = 0; index < cache.path_line_count; ++index)
             DrawWorldLine(
                 cache.path_lines[index].from,
                 cache.path_lines[index].to,
-                snapshot.camera,
+                view,
                 view_basis,
                 kPathLine,
                 2.0F);
@@ -1163,19 +1171,19 @@ void DrawCampathVisualization(
         const auto selected = static_cast<std::int32_t>(index) == snapshot.selected_keyframe;
         const auto color = selected ? kSelectedMarker : kMarker;
         const auto& marker_lines = selected ? marker.selected : marker.regular;
-        DrawWorldLine(marker_lines[0].from, marker_lines[0].to, snapshot.camera, view_basis, color,
+        DrawWorldLine(marker_lines[0].from, marker_lines[0].to, view, view_basis, color,
                       selected ? 2.5F : 1.25F);
 
         if ((snapshot.flags & smvm_snapshot_show_cameras) != 0) {
             for (std::size_t line = 1; line < marker_lines.size(); ++line)
                 DrawWorldLine(marker_lines[line].from, marker_lines[line].to,
-                              snapshot.camera, view_basis, color, selected ? 1.8F : 1.0F);
+                              view, view_basis, color, selected ? 1.8F : 1.0F);
         }
 
         float screen_x = 0.0F;
         float screen_y = 0.0F;
-        if (ProjectCameraPoint(ToCameraSpace(marker.origin, snapshot.camera, view_basis),
-                               snapshot.camera, screen_x, screen_y)) {
+        if (ProjectCameraPoint(ToCameraSpace(marker.origin, view, view_basis),
+                               view, screen_x, screen_y)) {
             const auto radius = selected ? 6.0F : 4.0F;
             AddRect(screen_x - radius, screen_y - radius, radius * 2.0F, radius * 2.0F, color);
             // Labels are screen-space text; they are collected here and drawn
@@ -1486,6 +1494,8 @@ struct SdlMouseApi final {
         }
         state.manual_pointer_active.store(false, std::memory_order_release);
         state.manual_mouse_observed.store(false, std::memory_order_release);
+        state.manual_raw_mouse_observed_ms.store(0, std::memory_order_release);
+        state.manual_legacy_mouse_seeded.store(false, std::memory_order_release);
         return restored;
     }
 
@@ -1523,6 +1533,8 @@ struct SdlMouseApi final {
 
     state.manual_pointer_active.store(true, std::memory_order_release);
     state.manual_mouse_observed.store(false, std::memory_order_release);
+    state.manual_raw_mouse_observed_ms.store(0, std::memory_order_release);
+    state.manual_legacy_mouse_seeded.store(false, std::memory_order_release);
     return true;
 }
 
@@ -1536,6 +1548,8 @@ void SuspendManualPointerForFocusLoss(const HWND window) noexcept {
     if (auto* sdl_window = FindSdlWindowForHwnd(api, window); sdl_window != nullptr)
         static_cast<void>(api.set_relative_mode(sdl_window, false));
     state.manual_mouse_observed.store(false, std::memory_order_release);
+    state.manual_raw_mouse_observed_ms.store(0, std::memory_order_release);
+    state.manual_legacy_mouse_seeded.store(false, std::memory_order_release);
 }
 
 [[nodiscard]] bool SuspendInputSystemOnWindowThread() noexcept;
@@ -2609,6 +2623,8 @@ void RefreshMenuCursorPosition(const HWND window) noexcept {
                 g_overlay.manual_mouse_delta_x.fetch_add(delta_x, std::memory_order_release);
                 g_overlay.manual_mouse_delta_y.fetch_add(delta_y, std::memory_order_release);
                 g_overlay.manual_mouse_observed.store(true, std::memory_order_release);
+                g_overlay.manual_raw_mouse_observed_ms.store(
+                    GetTickCount64(), std::memory_order_release);
                 owns_packet = true;
             }
         }
@@ -3090,10 +3106,34 @@ LRESULT CALLBACK SmvmWindowProcedure(
         return CallWindowProcW(original, window, message, wparam, lparam);
 
     if (message == WM_MOUSEMOVE) {
-        state.mouse_x.store(GET_X_LPARAM(lparam), std::memory_order_relaxed);
-        state.mouse_y.store(GET_Y_LPARAM(lparam), std::memory_order_relaxed);
+        const auto mouse_x = static_cast<std::int32_t>(GET_X_LPARAM(lparam));
+        const auto mouse_y = static_cast<std::int32_t>(GET_Y_LPARAM(lparam));
+        state.mouse_x.store(mouse_x, std::memory_order_relaxed);
+        state.mouse_y.store(mouse_y, std::memory_order_relaxed);
         if (menu_open)
             return 0;
+        if (has_snapshot && CanUseManualCamera(snapshot)) {
+            const auto was_seeded = state.manual_legacy_mouse_seeded.exchange(
+                true, std::memory_order_acq_rel);
+            const auto previous_x = state.manual_legacy_mouse_x.exchange(
+                mouse_x, std::memory_order_acq_rel);
+            const auto previous_y = state.manual_legacy_mouse_y.exchange(
+                mouse_y, std::memory_order_acq_rel);
+            const auto raw_at = state.manual_raw_mouse_observed_ms.load(std::memory_order_acquire);
+            const auto now = GetTickCount64();
+            const auto delta = ResolveLegacyMouseDelta(
+                was_seeded, previous_x, previous_y, mouse_x, mouse_y,
+                raw_at != 0 && now - raw_at <= 50);
+            if (delta.accepted) {
+                state.manual_mouse_delta_x.fetch_add(delta.x, std::memory_order_release);
+                state.manual_mouse_delta_y.fetch_add(delta.y, std::memory_order_release);
+                state.manual_mouse_observed.store(true, std::memory_order_release);
+            }
+            if ((snapshot.flags & smvm_snapshot_input_takeover) != 0)
+                return 0;
+        } else {
+            state.manual_legacy_mouse_seeded.store(false, std::memory_order_release);
+        }
         if (has_snapshot &&
             PointInsideReplayBar(window, snapshot, GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)))
             return 0;
@@ -3519,6 +3559,12 @@ LRESULT CALLBACK SmvmWindowProcedure(
 
     RequestManualPointerState(CanUseManualCamera(snapshot));
 
+    CameraSample rendered_camera{};
+    const auto has_rendered_camera = state.callbacks.read_rendered_camera != nullptr &&
+        state.callbacks.read_rendered_camera(state.callbacks.context, rendered_camera);
+    const auto view_camera = SelectRenderCamera(
+        snapshot.camera, rendered_camera, has_rendered_camera);
+
     CampathPayloadHeader path_header{};
     std::array<CampathKeyframe, kMaxCampathKeyframes> keys{};
     const auto has_path = ReadPath(path_header, keys.data(), keys.size());
@@ -3542,7 +3588,7 @@ LRESULT CALLBACK SmvmWindowProcedure(
             (snapshot.flags & smvm_snapshot_hide_path_while_playing) != 0 &&
             (snapshot.flags & smvm_snapshot_campath_playing) != 0;
         if (has_path && !hide_visualization && (snapshot.flags & smvm_snapshot_camera_readable) != 0)
-            DrawCampathVisualization(snapshot, path_header, keys.data());
+            DrawCampathVisualization(snapshot, path_header, keys.data(), view_camera);
     }
 
     // Toast detection runs every frame (even with the menu closed) so status
@@ -3553,11 +3599,15 @@ LRESULT CALLBACK SmvmWindowProcedure(
         (snapshot.flags & smvm_snapshot_show_minimal_pill) != 0;
     const auto replay_bar_visible = !menu_open &&
         snapshot.deadlock_ui_mode == DeadlockUiMode::smvm_replay_ui;
+    const auto status_hud_visible = !menu_open &&
+        (snapshot.flags & smvm_snapshot_show_status_hud) != 0 &&
+        (snapshot.flags & (smvm_snapshot_manual_camera_active |
+                           smvm_snapshot_campath_playing)) != 0;
     auto toasts_active = false;
     for (const auto& toast : state.ui.toasts)
         toasts_active = toasts_active || toast.active;
-    const auto want_ui = menu_open || replay_bar_visible || pill_visible || toasts_active ||
-        state.world_label_count > 0;
+    const auto want_ui = menu_open || replay_bar_visible || pill_visible || status_hud_visible ||
+        toasts_active || state.world_label_count > 0;
     auto imgui_rendered = false;
     if (!clean_view && want_ui && state.imgui != nullptr &&
         state.ui_ready.load(std::memory_order_acquire)) {
@@ -3591,6 +3641,7 @@ LRESULT CALLBACK SmvmWindowProcedure(
 
         SmvmUiFrameParams params{};
         params.snapshot = &snapshot;
+        params.rendered_camera = &view_camera;
         params.path_header = has_path ? &path_header : nullptr;
         params.keyframes = keys.data();
         params.has_path = has_path;
@@ -3603,8 +3654,7 @@ LRESULT CALLBACK SmvmWindowProcedure(
         params.renderer_error = state.last_renderer_error.load(std::memory_order_acquire);
         params.queue_action = [context = state.callbacks.context,
                                queue = state.callbacks.queue_action](const SmvmActionPayload& action) {
-            if (queue != nullptr)
-                static_cast<void>(queue(context, action));
+            return queue != nullptr && queue(context, action);
         };
         params.request_capture = [context = state.callbacks.context,
                                   capture = state.callbacks.request_camera_capture]() {
@@ -4358,6 +4408,8 @@ void ResetSmvmManualInput() noexcept {
     state.manual_mouse_delta_x.store(0, std::memory_order_release);
     state.manual_mouse_delta_y.store(0, std::memory_order_release);
     state.manual_wheel_delta.store(0, std::memory_order_release);
+    state.manual_raw_mouse_observed_ms.store(0, std::memory_order_release);
+    state.manual_legacy_mouse_seeded.store(false, std::memory_order_release);
     for (auto& key : state.key_down)
         key.store(0, std::memory_order_release);
     for (auto& routes : state.manual_key_routes)
@@ -4390,6 +4442,8 @@ bool StartSmvmOverlay(const HMODULE self_module, const SmvmOverlayCallbacks& cal
     state.manual_pointer_requested.store(false, std::memory_order_release);
     state.manual_pointer_active.store(false, std::memory_order_release);
     state.manual_mouse_observed.store(false, std::memory_order_release);
+    state.manual_raw_mouse_observed_ms.store(0, std::memory_order_release);
+    state.manual_legacy_mouse_seeded.store(false, std::memory_order_release);
     state.manual_relative_mouse_restore_pending = false;
     state.presentation_mode.store(
         static_cast<std::uint32_t>(DeadlockUiMode::deadlock_ui), std::memory_order_release);
