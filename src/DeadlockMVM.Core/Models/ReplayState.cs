@@ -18,6 +18,13 @@ public sealed record ReplayState
     /// <summary>Current demo tick as reported by the engine.</summary>
     public int? CurrentTick { get; init; }
 
+    /// <summary>
+    /// True after Source reports that the demo host has activated. Position
+    /// telemetry can appear while the map is still loading; camera ownership
+    /// must not begin in that provisional window.
+    /// </summary>
+    public bool PlaybackHostActive { get; init; }
+
     /// <summary>Total demo ticks as reported by the engine.</summary>
     public int? TotalTicks { get; init; }
 

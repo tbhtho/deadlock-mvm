@@ -9,7 +9,8 @@ public readonly record struct DemoStartupObservation(
     bool NativeConnected,
     bool ReplayClockReady,
     bool FreeCameraEstablished,
-    bool ReplayTelemetryAuthoritative = true);
+    bool ReplayTelemetryAuthoritative = true,
+    bool PlaybackHostActive = true);
 
 public readonly record struct DemoStartupDirectives(
     int Generation,
@@ -124,7 +125,8 @@ public sealed class DemoStartupPolicy
             }
 
             var enterFreeCamera = false;
-            if (_pauseCompleted && observation.NativeConnected && observation.ReplayClockReady &&
+            if (_pauseCompleted && observation.PlaybackHostActive &&
+                observation.NativeConnected && observation.ReplayClockReady &&
                 !_cameraCompleted && !_cameraAttemptInFlight &&
                 _cameraAttempts < MaxCameraAttempts && now >= _cameraRetryAfter)
             {

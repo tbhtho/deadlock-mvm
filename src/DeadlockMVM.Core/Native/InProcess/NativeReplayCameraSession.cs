@@ -18,6 +18,8 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
     private static readonly TimeSpan SelfTestEmergencyCleanupTimeout = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan AutomaticRecoveryTimeout = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan PausedManualCameraBootstrapDelay = TimeSpan.FromMilliseconds(125);
+    private const string QueuedActionLeaseExpiredMessage =
+        "The queued SMVM action expired before native camera access began.";
     private const int SeekTickTolerance = 2;
     private const int ObservationTickTolerance = 8;
     private readonly ReplayController _controller;
@@ -2163,12 +2165,24 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                     await TryConnectAsync(token).ConfigureAwait(false);
                 else
                 {
-                    await SendHeartbeatAsync(_client, token).ConfigureAwait(false);
-                    if (SmvmSnapshotProvider?.Invoke() is { } snapshot)
+                    try
                     {
-                        using var snapshotLease = BeginSmvmSnapshotPublicationLease(snapshot);
-                        UpdateStatus(await _client.UpdateSmvmSnapshotAsync(snapshot, token)
-                            .ConfigureAwait(false));
+                        await SendHeartbeatAsync(_client, token).ConfigureAwait(false);
+                        if (SmvmSnapshotProvider?.Invoke() is { } snapshot)
+                        {
+                            using var snapshotLease = BeginSmvmSnapshotPublicationLease(snapshot);
+                            UpdateStatus(await _client.UpdateSmvmSnapshotAsync(snapshot, token)
+                                .ConfigureAwait(false));
+                        }
+                    }
+                    catch (Exception ex) when (ShouldRetryMonitorAfterReplayLeaseChange(
+                               ex,
+                               _client?.Connected == true))
+                    {
+                        // Map activation and same-file replay generation changes
+                        // can supersede a fully read request. The pipe framing is
+                        // still healthy; retry with the new lease instead of
+                        // expiring the native snapshot and dropping the UI/input.
                     }
                 }
             },
@@ -2181,6 +2195,15 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         bool clientPresent,
         bool connected) =>
         clientPresent && !connected;
+
+    internal static bool ShouldRetryMonitorAfterReplayLeaseChange(
+        Exception exception,
+        bool clientConnected) =>
+        clientConnected && exception is InvalidOperationException &&
+        string.Equals(
+            exception.Message,
+            QueuedActionLeaseExpiredMessage,
+            StringComparison.Ordinal);
 
     internal static async Task RunMonitorLoopAsync(
         Func<CancellationToken, Task> runIteration,
@@ -2540,8 +2563,7 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             context.ReplayLease is { } replayLease &&
             !_controller.IsReplayCommandLeaseCurrent(replayLease))
         {
-            throw new InvalidOperationException(
-                "The queued SMVM action expired before native camera access began.");
+            throw new InvalidOperationException(QueuedActionLeaseExpiredMessage);
         }
     }
 

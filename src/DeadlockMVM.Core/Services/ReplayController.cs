@@ -541,6 +541,8 @@ public sealed class ReplayController : IReplayPlaybackState, IDisposable
                 Connected = true,
                 IsPaused = update.IsPaused ?? (sessionBoundary ? null : current.IsPaused),
                 CurrentTick = update.CurrentTick ?? current.CurrentTick,
+                PlaybackHostActive = update.PlaybackHostActive ||
+                                     (!sessionBoundary && current.PlaybackHostActive),
                 TotalTicks = update.TotalTicks ?? current.TotalTicks,
                 Timescale = update.Timescale ?? current.Timescale,
                 ReplayName = update.ReplayName ?? current.ReplayName,

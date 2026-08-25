@@ -980,8 +980,8 @@ void MarkRecordingProfileRecoveryActionQueued(const std::uint64_t generation) no
     if (needs_physical_restore)
         ArmEmergencyDeadlockUiRestore(true);
     ReleaseSRWLockExclusive(&state.recording_profile_recovery_lock);
-    if (needs_physical_restore)
-        PumpEmergencyDeadlockUiRestore();
+    // The resident installer thread owns the blocking VConsole inverse. UI,
+    // Present, window-procedure, and pipe threads only arm durable debt.
     // A queue-full or inverse-in-progress result is deferred, not dropped: the
     // generation/target above remains the durable owner intent for Reconcile.
     return true;
@@ -999,7 +999,6 @@ void ArmEmergencyDeadlockUiRestore(const bool hard_restore) noexcept {
 
 void RequestEmergencyDeadlockUiRestore(const bool hard_restore) noexcept {
     ArmEmergencyDeadlockUiRestore(hard_restore);
-    PumpEmergencyDeadlockUiRestore();
 }
 
 void PumpEmergencyDeadlockUiRestore() noexcept {
@@ -1334,9 +1333,6 @@ void ReconcileRecordingProfileRecovery(const SmvmSnapshotPayload& snapshot) noex
     if (request_physical_restore && !physical_restore_already_armed)
         ArmEmergencyDeadlockUiRestore(true);
     ReleaseSRWLockExclusive(&state.recording_profile_recovery_lock);
-
-    if (request_physical_restore)
-        PumpEmergencyDeadlockUiRestore();
 }
 
 void QueueCaptureDiagnostic(
@@ -5022,8 +5018,6 @@ LRESULT CALLBACK SmvmWindowProcedure(
     smvm_ui::ObserveReplaySession(snapshot_read ? &snapshot : nullptr, state.ui);
     if (!snapshot_read)
         NotifySmvmHostDisconnected();
-    if (state.recording_profile_restore_debt.load(std::memory_order_acquire) != 0)
-        PumpEmergencyDeadlockUiRestore();
     if (!snapshot_read || (snapshot.flags & smvm_snapshot_internal_enabled) == 0 ||
         (snapshot.flags & smvm_snapshot_replay_active) == 0) {
         ResetCinematicStartGate(true);
@@ -5789,10 +5783,6 @@ void ObserveSmvmRecordingVisualSnapshot(const SmvmSnapshotPayload& snapshot) noe
     g_overlay.recording_profile_disconnect_restore_guard.store(false, std::memory_order_release);
     ObserveRecordingVisualSnapshotState(snapshot);
     ReconcileRecordingProfileRecovery(snapshot);
-    if ((g_overlay.recording_profile_restore_debt.load(std::memory_order_acquire) &
-         kRecordingProfileHardRestoreDebt) != 0) {
-        PumpEmergencyDeadlockUiRestore();
-    }
 }
 
 void NotifySmvmHostDisconnected() noexcept {
@@ -5802,7 +5792,6 @@ void NotifySmvmHostDisconnected() noexcept {
     // not rotate generations or issue VConsole batches every frame.
     if (state.recording_profile_lease_lost.exchange(true, std::memory_order_acq_rel))
         return;
-    auto restore_required = false;
     AcquireSRWLockExclusive(&state.recording_profile_recovery_lock);
     const auto restore_debt =
         state.recording_profile_restore_debt.load(std::memory_order_acquire);
@@ -5813,10 +5802,10 @@ void NotifySmvmHostDisconnected() noexcept {
             restore_debt != 0,
             (restore_debt & kRecordingProfileHardRestoreDebt) != 0,
             recovery_kind != RecordingProfileRecoveryKind::none)) {
-        restore_required = true;
         state.recording_profile_disconnect_restore_guard.store(true, std::memory_order_release);
         // Establish the hard inverse barrier and the durable post-reconnect
-        // target under one lock before the blocking VConsole batch. A fresh
+        // target under one lock before the resident maintenance thread applies
+        // the VConsole inverse. A fresh
         // snapshot can neither retire an owner target nor queue a forward batch
         // in the gap.
         ArmEmergencyDeadlockUiRestore(true);
@@ -5848,9 +5837,6 @@ void NotifySmvmHostDisconnected() noexcept {
         state.recording_profile_recovery_action_last_attempt_ms.store(0, std::memory_order_relaxed);
     }
     ReleaseSRWLockExclusive(&state.recording_profile_recovery_lock);
-
-    if (restore_required)
-        PumpEmergencyDeadlockUiRestore();
 }
 
 void PumpSmvmOverlayResidentRecovery() noexcept {

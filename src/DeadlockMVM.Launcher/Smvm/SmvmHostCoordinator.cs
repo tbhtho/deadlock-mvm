@@ -504,7 +504,8 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                     _native.Connected,
                     _controller.GameTickOffset is not null,
                     _native.ManualCameraEstablished,
-                    replayTelemetryAuthoritative),
+                    replayTelemetryAuthoritative,
+                    replay.PlaybackHostActive),
                 DateTimeOffset.UtcNow);
         }
 
