@@ -31,12 +31,18 @@ public static class ReplayCommands
     /// <summary>Prints demo header information (total ticks, server start tick, file name).</summary>
     public const string QueryDemoInfo = "demo_info";
 
-    public static IReadOnlyList<double> SpeedPresets { get; } = new[] { 0.10, 0.25, 0.50, 1.00, 2.00, 4.00 };
+    public static IReadOnlyList<string> StartDemoPaused(string gamePath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(gamePath);
+        return ["+playdemo", gamePath, $"+{Pause}"];
+    }
+
+    public static IReadOnlyList<double> SpeedPresets { get; } = new[] { 0.25, 0.50, 1.00, 2.00, 4.00 };
 
     public static string SetTimescale(double speed)
     {
         ValidateSpeed(speed);
-        return string.Create(CultureInfo.InvariantCulture, $"demo_timescale {speed:0.##}");
+        return string.Create(CultureInfo.InvariantCulture, $"host_timescale {speed:0.##}");
     }
 
     public static string GotoTick(int tick)

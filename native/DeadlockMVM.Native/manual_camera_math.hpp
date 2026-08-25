@@ -72,13 +72,13 @@ struct ManualCameraTuning final {
     result.z += distance * ((motion.forward * forward_z) + (motion.right * right_z) + (motion.up * up_z));
 
     // Deadlock's rendered spectator angles turn toward physical right when Yaw
-    // decreases and toward physical up when Pitch increases. Keep that engine
+    // decreases and toward physical up when Pitch decreases. Keep that engine
     // convention here, after both Raw Input and the fallback have normalized to
     // the transport-independent right/up convention.
     result.yaw = NormalizeAngle(result.yaw - (motion.look_right * tuning.mouse_sensitivity));
     const auto pitch_delta = motion.look_up * tuning.mouse_sensitivity *
         (tuning.invert_y ? -1.0 : 1.0);
-    result.pitch = std::clamp(result.pitch + pitch_delta, -89.0, 89.0);
+    result.pitch = std::clamp(result.pitch - pitch_delta, -89.0, 89.0);
     result.roll = motion.reset_roll
         ? 0.0
         : NormalizeAngle(result.roll + (motion.roll * tuning.roll_speed * std::clamp(delta_seconds, 0.0, 0.1)));

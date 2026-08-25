@@ -39,7 +39,6 @@ namespace colors {
     inline constexpr ImU32 kSuccess = Rgba(0x7F, 0xA3, 0x6B);
     inline constexpr ImU32 kWarning = Rgba(0xD9, 0x9A, 0x45);
     inline constexpr ImU32 kError = Rgba(0xC2, 0x5B, 0x4E);
-    inline constexpr ImU32 kShadow = Rgba(0, 0, 0, 70);
 } // namespace colors
 
 [[nodiscard]] constexpr ImVec4 Vec4(const ImU32 color) noexcept {

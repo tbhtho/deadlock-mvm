@@ -36,13 +36,28 @@ struct FreeCameraInputReadiness final {
     bool window_procedure_ready{};
     bool engine_input_ready{};
 
+    [[nodiscard]] constexpr bool KeyboardReady() const noexcept {
+        return keyboard_ready && foreground_ready && window_procedure_ready && engine_input_ready;
+    }
+
     [[nodiscard]] constexpr bool MouseReady() const noexcept {
         return relative_mouse_ready && raw_input_ready && cursor_ready && foreground_ready &&
                window_procedure_ready && engine_input_ready;
     }
 
     [[nodiscard]] constexpr bool FullyReady() const noexcept {
-        return keyboard_ready && MouseReady();
+        return KeyboardReady() && MouseReady();
+    }
+
+    [[nodiscard]] constexpr bool AnyReady() const noexcept {
+        return KeyboardReady() || MouseReady();
+    }
+
+    // Keyboard-only control is deliberately usable (including while paused),
+    // but it is not a successful full acquisition. The overlay keeps a typed,
+    // retryable error visible until the relative mouse route is also ready.
+    [[nodiscard]] constexpr bool PartiallyReady() const noexcept {
+        return AnyReady() && !FullyReady();
     }
 };
 
@@ -72,13 +87,30 @@ struct MouseAcquisitionReset final {
     const bool free_camera_requested,
     const bool free_camera_active,
     const FreeCameraInputReadiness& readiness) noexcept {
-    return !menu_open && free_camera_requested && free_camera_active && readiness.FullyReady();
+    return !menu_open && free_camera_requested && free_camera_active && readiness.AnyReady();
+}
+
+[[nodiscard]] constexpr bool CanConsumeFreeCameraKeyboardInput(
+    const bool menu_open,
+    const bool free_camera_requested,
+    const bool free_camera_active,
+    const FreeCameraInputReadiness& readiness) noexcept {
+    return !menu_open && free_camera_requested && free_camera_active && readiness.KeyboardReady();
+}
+
+[[nodiscard]] constexpr bool CanConsumeFreeCameraMouseInput(
+    const bool menu_open,
+    const bool free_camera_requested,
+    const bool free_camera_active,
+    const FreeCameraInputReadiness& readiness) noexcept {
+    return !menu_open && free_camera_requested && free_camera_active && readiness.MouseReady();
 }
 
 // Pure lifecycle mirror for transition tests. The Win32 implementation owns
 // the actual SDL/Raw Input/cursor work, while this state keeps the invariants
 // explicit: opening always suspends and clears, closing always starts from a
-// fresh acquisition, and input is consumable only after complete readiness.
+// fresh acquisition, and each input channel is consumable only after its own
+// readiness contract is complete.
 struct FreeCameraMenuLifecycle final {
     bool menu_open{};
     bool free_camera_requested{};
@@ -100,7 +132,7 @@ struct FreeCameraMenuLifecycle final {
         menu_open = false;
         mouse = ResetMouseAcquisition();
         readiness = should_reacquire ? acquired_readiness : FreeCameraInputReadiness{};
-        if (readiness.FullyReady())
+        if (readiness.AnyReady())
             ++successful_reacquisitions;
         return CanConsume();
     }
@@ -112,6 +144,22 @@ struct FreeCameraMenuLifecycle final {
 };
 
 constexpr std::uint64_t kFallbackMouseReacquisitionSettleMs = 75;
+constexpr std::uint64_t kManualPointerHealthCheckIntervalMs = 250;
+
+// Deadlock may rebuild its process-wide Raw Input registration when replay
+// transport changes. The cached readiness bits cannot observe that external
+// mutation, so Free Camera periodically validates the live registration and
+// asks the window thread to rebuild the full pointer route when it drifts.
+[[nodiscard]] constexpr bool ShouldRetryManualPointerAcquisition(
+    const bool pointer_requested,
+    const bool menu_open,
+    const bool pointer_active,
+    const bool raw_registration_exact,
+    const std::uint64_t now_ms,
+    const std::uint64_t next_health_check_ms) noexcept {
+    return pointer_requested && !menu_open && now_ms >= next_health_check_ms &&
+           (!pointer_active || !raw_registration_exact);
+}
 
 // Reacquiring SDL relative mode can queue more than one legacy WM_MOUSEMOVE:
 // a baseline, a recenter, and a delayed echo of the pre-recenter coordinate.

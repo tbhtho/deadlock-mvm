@@ -1,5 +1,6 @@
 #include "smvm_ui.hpp"
 
+#include "replay_timeline_policy.hpp"
 #include "smvm_theme.hpp"
 
 #include "imgui.h"
@@ -8,10 +9,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <limits>
 
 namespace deadlock_mvm::smvm_ui {
 namespace {
@@ -19,8 +20,6 @@ namespace {
 // UTF-8 escapes keep the source ASCII-only (the product builds without /utf-8).
 constexpr auto kDegree = "\xC2\xB0";
 constexpr auto kMiddleDot = "\xC2\xB7";
-constexpr auto kEmDash = "\xE2\x80\x94";
-constexpr auto kEllipsis = "\xE2\x80\xA6";
 constexpr auto kTimes = "\xC3\x97";
 
 struct FrameContext final {
@@ -50,7 +49,8 @@ bool QueueAction(
     const std::int32_t index = -1,
     const std::int64_t tick = -1,
     const double value = 0.0,
-    const char* text = nullptr) noexcept {
+    const char* text = nullptr,
+    const bool notify_failure = true) noexcept {
     if (!context.params->queue_action)
         return false;
     SmvmActionPayload action{};
@@ -65,7 +65,7 @@ bool QueueAction(
     }
     const auto queued = context.params->queue_action(action);
     if (!queued) {
-        if (type != SmvmActionType::request_path_list)
+        if (notify_failure && type != SmvmActionType::request_path_list)
             PushLocalToast(*context.state, "SMVM host is reconnecting - try again.");
         return false;
     }
@@ -75,6 +75,21 @@ bool QueueAction(
         context.state->free_camera_activation_error_until_ms = 0;
     }
     return true;
+}
+
+bool QueuePathPlayback(
+    const FrameContext& context,
+    const SmvmActionType playback_action) noexcept {
+    // The simplified product always returns to SMVM Free Camera when a path
+    // finishes. Older saved paths may still carry the legacy hold-final value,
+    // so normalize it without exposing another ownership choice.
+    if (context.snapshot->end_behavior == CampathEndBehavior::hold_final_camera &&
+        !QueueAction(context, SmvmActionType::set_end_behavior, 0)) {
+        return false;
+    }
+    if (playback_action == SmvmActionType::play_from_start)
+        return SmvmArmCinematicStart();
+    return QueueAction(context, playback_action);
 }
 
 void RequestCapture(const FrameContext& context) noexcept {
@@ -149,31 +164,13 @@ void RequestCapture(const FrameContext& context) noexcept {
         "Forward", "Backward", "Left", "Right", "Up", "Down", "Fast", "Precision",
         "Roll Left", "Roll Right", "Reset Roll", "Menu", "Add Keyframe", "Delete Keyframe",
         "Clean Footage", "Play From Start", "Play From Current", "Stop", "Undo", "Redo",
-        "Show Path", "Show Cameras", "Emergency Restore", "Cycle Replay Interface",
-        "Toggle Free Camera", "Replay Play/Pause", "Show Labels", "Replay Step Back",
+        "Show Path", "Show Cameras", "Emergency Exit + Restore", "Cycle Replay Interface",
+        "Enter Free Camera", "Replay Play/Pause", "Show Labels", "Replay Step Back",
         "Replay Step Forward",
     };
     return action >= kSmvmFirstManualBindingAction && action <= kSmvmLastBindingAction
         ? names[static_cast<std::size_t>(action - kSmvmFirstManualBindingAction)]
         : nullptr;
-}
-
-[[nodiscard]] const char* PlaybackStateText(const std::uint32_t state) noexcept {
-    switch (state) {
-        case 1: case 2: return "Preparing";
-        case 3: return "Seeking";
-        case 4: return "Waiting for tick";
-        case 5: return "Free roam";
-        case 6: return "Transferring";
-        case 7: return "Arming camera";
-        case 8: return "Waiting for camera";
-        case 9: return "Playing";
-        case 10: return "Completed";
-        case 11: return "Stopping";
-        case 13: return "Failed";
-        case 14: return "Cancelled";
-        default: return "Stopped";
-    }
 }
 
 [[nodiscard]] const char* DeadlockUiModeText(const DeadlockUiMode mode) noexcept {
@@ -349,40 +346,80 @@ void BindingField(const char* label, const std::uint32_t value, const std::int32
     ImGui::PopID();
 }
 
-void SeekToTickField(const FrameContext& context) noexcept {
+void SeekToTickField(
+    const FrameContext& context,
+    const char* hint = "Tick",
+    const float logical_width = 110.0F,
+    const bool timeline_field = false) noexcept {
     auto& state = *context.state;
     const auto& snapshot = *context.snapshot;
     const auto scale = smvm_theme::GetScale();
+    const auto replay_active = (snapshot.flags & smvm_snapshot_replay_active) != 0;
+    const auto try_pending_seek = [&]() noexcept {
+        const auto now = GetTickCount64();
+        if (!ShouldQueuePendingReplaySeek(
+                state.replay_seek_pending,
+                replay_active,
+                snapshot.current_tick,
+                now,
+                state.replay_seek_retry_at_ms))
+            return;
+        const auto target = ClampReplayTimelineTick(
+            state.replay_seek_target, snapshot.total_ticks);
+        if (QueueAction(
+                context,
+                SmvmActionType::seek_tick,
+                -1,
+                target,
+                0.0,
+                nullptr,
+                false)) {
+            state.replay_seek_pending = false;
+            state.replay_seek_retry_at_ms = 0;
+            return;
+        }
+        // A freshly loaded replay can expose the timeline one or two frames
+        // before the managed action channel is ready. Retain the owner's first
+        // request and retry quietly instead of making them press Go again.
+        state.replay_seek_retry_at_ms = now + 100;
+    };
+    try_pending_seek();
     ImGui::PushID("go_to_tick");
-    ImGui::SetNextItemWidth(110.0F * scale);
-    const auto submit = [&]() noexcept {
-        const auto target = std::strtoll(state.go_to_tick.data(), nullptr, 10);
-        const auto maximum = snapshot.total_ticks > 0
-            ? snapshot.total_ticks
-            : (std::numeric_limits<std::int64_t>::max)();
-        QueueAction(
-            context, SmvmActionType::seek_tick, -1,
-            std::clamp<std::int64_t>(std::max<std::int64_t>(0, target), 0, maximum));
+    ImGui::SetNextItemWidth(logical_width * scale);
+    const auto submit = [&]() noexcept -> bool {
+        if (!replay_active || state.go_to_tick[0] == '\0')
+            return false;
+        state.replay_seek_target = std::strtoll(state.go_to_tick.data(), nullptr, 10);
+        state.replay_seek_pending = true;
+        state.replay_seek_retry_at_ms = 0;
         state.go_to_tick.fill('\0');
+        try_pending_seek();
+        return true;
     };
     ImGui::PushFont(smvm_theme::GetFonts().mono);
     const auto entered = ImGui::InputTextWithHint(
-        "##tick", "Tick", state.go_to_tick.data(), state.go_to_tick.size(),
+        "##tick", hint, state.go_to_tick.data(), state.go_to_tick.size(),
         ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_EnterReturnsTrue);
     ImGui::PopFont();
-    if (entered)
-        submit();
+    if (timeline_field)
+        SmvmSetReplayTickInputActive(ImGui::IsItemActive());
+    smvm_theme::Tooltip("Type an absolute replay tick and press Enter.");
+    if (entered && submit()) {
+        // Move keyboard focus to the following Go button. Enter must finish
+        // text editing so Free Camera input can be reacquired immediately.
+        ImGui::SetKeyboardFocusHere();
+        if (timeline_field)
+            SmvmSetReplayTickInputActive(false);
+    }
     ImGui::SameLine();
-    const auto replay_ready = (snapshot.flags & smvm_snapshot_replay_active) != 0 &&
-        snapshot.current_tick >= 0;
-    if (smvm_theme::Button("Go", replay_ready && state.go_to_tick[0] != '\0'))
-        submit();
+    if (smvm_theme::Button("Go", replay_active && state.go_to_tick[0] != '\0'))
+        static_cast<void>(submit());
     ImGui::PopID();
 }
 
 // --- Pages ------------------------------------------------------------------
 
-void DrawReplayPage(const FrameContext& context) noexcept {
+[[maybe_unused]] void DrawReplayPage(const FrameContext& context) noexcept {
     const auto& snapshot = *context.snapshot;
     const auto scale = smvm_theme::GetScale();
     PageHeader(
@@ -442,10 +479,10 @@ void DrawReplayPage(const FrameContext& context) noexcept {
     }
 }
 
-void DrawCameraPage(const FrameContext& context) noexcept {
+[[maybe_unused]] void DrawCameraPage(const FrameContext& context) noexcept {
     const auto& snapshot = *context.snapshot;
     const auto scale = smvm_theme::GetScale();
-    PageHeader("Camera", nullptr);
+    PageHeader("Camera", "SMVM Free Camera");
 
     const auto camera_readable = (snapshot.flags & smvm_snapshot_camera_readable) != 0;
     const auto camera_ready = camera_readable &&
@@ -453,49 +490,46 @@ void DrawCameraPage(const FrameContext& context) noexcept {
     const auto manual_active = (snapshot.flags & smvm_snapshot_manual_camera_active) != 0;
     const auto replay_active = (snapshot.flags & smvm_snapshot_replay_active) != 0;
     const auto campath_playing = (snapshot.flags & smvm_snapshot_campath_playing) != 0;
-    // Entry itself is what moves Deadlock into Free Roam and gives the native
-    // backend a camera frame to resolve/hook. Requiring ManualCamera capability
-    // here creates a circular gate on fresh replay sessions.
-    const auto mode_available = replay_active && !campath_playing;
+    const auto can_enter = replay_active && !campath_playing;
 
-    if (smvm_theme::BeginSection("Camera Mode")) {
-        constexpr std::array<const char*, 3> modes{"Free Camera", "In Eye", "Chase"};
-        // Free Camera means the complete SMVM manual-camera mode. Ordinary
-        // Deadlock Free Roam is an implementation detail and must never make
-        // this owner-facing control appear active by itself.
-        const auto current = manual_active ? 0 : (snapshot.observer_mode == 3 ? 1 :
-            (snapshot.observer_mode == 6 ? 2 : -1));
-        const auto chosen = smvm_theme::SegmentedControl(
-            "camera_mode", modes.data(), static_cast<int>(modes.size()), current,
-            mode_available);
-        if (chosen != current) {
-            if (chosen == 0) QueueAction(context, SmvmActionType::reacquire_camera);
-            else if (chosen == 1) QueueAction(context, SmvmActionType::in_eye);
-            else if (chosen == 2) QueueAction(context, SmvmActionType::chase);
-        }
-        ImGui::SameLine();
-        if (smvm_theme::Button("Previous", true, ImVec2(84.0F * scale, 0.0F)))
-            QueueAction(context, SmvmActionType::previous_player);
-        ImGui::SameLine();
-        if (smvm_theme::Button("Next", true, ImVec2(70.0F * scale, 0.0F)))
-            QueueAction(context, SmvmActionType::next_player);
-        if (context.params->free_camera_input_error) {
-            ImGui::PushStyleColor(ImGuiCol_Text, smvm_theme::Vec4(smvm_theme::colors::kError));
-            ImGui::TextUnformatted(
-                "Free Camera kept the menu open because relative mouse input was not ready.");
-            ImGui::PopStyleColor();
-            if (smvm_theme::Button("Retry Input", manual_active, ImVec2(108.0F * scale, 0.0F)))
-                SmvmReacquireFreeCameraInput();
-        } else if (context.state->free_camera_activation_pending) {
-            SecondaryText("Starting Free Camera from the current rendered view...");
-        } else if (GetTickCount64() < context.state->free_camera_activation_error_until_ms) {
-            ImGui::PushStyleColor(ImGuiCol_Text, smvm_theme::Vec4(smvm_theme::colors::kError));
-            ImGui::TextUnformatted("Free Camera could not acquire the rendered camera. Try again after the replay settles.");
-            ImGui::PopStyleColor();
-        } else if (manual_active) {
+    // SMVM Free Camera is the only owner-facing camera. Deadlock observer
+    // preparation and native camera ownership remain implementation details in
+    // the managed activation action.
+    if (smvm_theme::BeginSection("Free Camera")) {
+        if (manual_active) {
+            smvm_theme::StatusPill("ACTIVE", smvm_theme::PillKind::success);
+            ImGui::SameLine();
+            SecondaryText("Close the menu to position your shot.");
             SecondaryText(
-                "WASD Move  \xC2\xB7  Mouse Look  \xC2\xB7  Space/Ctrl Vertical  \xC2\xB7  "
-                "Shift Fast  \xC2\xB7  Alt Precision  \xC2\xB7  Q/E Roll  \xC2\xB7  Wheel FOV");
+                "Move  \xC2\xB7  Mouse Look  \xC2\xB7  Vertical  \xC2\xB7  "
+                "Fast / Precision  \xC2\xB7  Roll  \xC2\xB7  Wheel FOV");
+            SecondaryText("With the menu closed, press Escape to exit Free Camera.");
+            if (context.params->free_camera_input_error) {
+                ImGui::PushStyleColor(ImGuiCol_Text, smvm_theme::Vec4(smvm_theme::colors::kError));
+                ImGui::TextUnformatted("Free Camera input needs to be reconnected.");
+                ImGui::PopStyleColor();
+                if (smvm_theme::Button("Try Again", true, ImVec2(96.0F * scale, 0.0F)))
+                    SmvmReacquireFreeCameraInput();
+            }
+        } else if (campath_playing) {
+            smvm_theme::StatusPill("PATH PLAYING", smvm_theme::PillKind::accent);
+            ImGui::SameLine();
+            SecondaryText("Stop the path before positioning another shot.");
+        } else if (context.state->free_camera_activation_pending) {
+            smvm_theme::StatusPill("STARTING", smvm_theme::PillKind::warning);
+            ImGui::SameLine();
+            SecondaryText("Starting from the current view...");
+        } else {
+            if (GetTickCount64() < context.state->free_camera_activation_error_until_ms) {
+                ImGui::PushStyleColor(ImGuiCol_Text, smvm_theme::Vec4(smvm_theme::colors::kError));
+                ImGui::TextUnformatted("Free Camera could not start. Let the replay settle, then try again.");
+                ImGui::PopStyleColor();
+            } else {
+                SecondaryText("Enter once, then stay in Free Camera while you pause, seek, and build a path.");
+            }
+            if (smvm_theme::PrimaryButton(
+                    "Enter Free Camera", can_enter, ImVec2(168.0F * scale, 0.0F)))
+                QueueAction(context, SmvmActionType::reacquire_camera);
         }
         smvm_theme::EndSection();
     }
@@ -505,154 +539,167 @@ void DrawCameraPage(const FrameContext& context) noexcept {
         const auto fov_writable = camera_ready &&
             (snapshot.flags & smvm_snapshot_fov_writable) != 0;
         auto out = 0.0F;
-        if (camera_readable) {
+        if (fov_writable) {
             if (smvm_theme::SliderInput("fov", static_cast<float>(snapshot.camera.fov),
                                         static_cast<float>(kMinFov), static_cast<float>(kMaxFov),
-                                        out, "%.1f", fov_writable, "FOV"))
+                                        out, "%.1f", true, "FOV"))
                 QueueAction(context, SmvmActionType::set_fov, -1, -1, out);
+            ImGui::SameLine(0.0F, 12.0F * scale);
+            constexpr std::array<double, 5> presets{20.0, 30.0, 40.0, 60.0, 90.0};
+            for (std::size_t index = 0; index < presets.size(); ++index) {
+                if (index > 0)
+                    ImGui::SameLine(0.0F, 4.0F * scale);
+                std::array<char, 12> label{};
+                static_cast<void>(
+                    std::snprintf(label.data(), label.size(), "%.0f", presets[index]));
+                ImGui::PushID(static_cast<int>(index));
+                const auto active = std::abs(snapshot.camera.fov - presets[index]) < 0.1;
+                if (active)
+                    ImGui::PushStyleColor(
+                        ImGuiCol_Text, smvm_theme::Vec4(smvm_theme::colors::kAccent));
+                if (smvm_theme::Button(label.data(), true, ImVec2(40.0F * scale, 0.0F)))
+                    QueueAction(context, SmvmActionType::set_fov, -1, -1, presets[index]);
+                if (active)
+                    ImGui::PopStyleColor();
+                ImGui::PopID();
+            }
         } else {
-            smvm_theme::ValueRow("FOV", nullptr, true, false);
-        }
-        if (!fov_writable)
-            smvm_theme::Tooltip("Enter Free Camera to adjust the lens.");
-        ImGui::SameLine(0.0F, 12.0F * scale);
-        constexpr std::array<double, 5> presets{20.0, 30.0, 40.0, 60.0, 90.0};
-        for (std::size_t index = 0; index < presets.size(); ++index) {
-            if (index > 0)
-                ImGui::SameLine(0.0F, 4.0F * scale);
-            std::array<char, 12> label{};
-            static_cast<void>(std::snprintf(label.data(), label.size(), "%.0f", presets[index]));
-            ImGui::PushID(static_cast<int>(index));
-            const auto active = camera_ready && std::abs(snapshot.camera.fov - presets[index]) < 0.1;
-            if (active)
-                ImGui::PushStyleColor(ImGuiCol_Text, smvm_theme::Vec4(smvm_theme::colors::kAccent));
-            if (smvm_theme::Button(label.data(), fov_writable, ImVec2(40.0F * scale, 0.0F)))
-                QueueAction(context, SmvmActionType::set_fov, -1, -1, presets[index]);
-            if (active)
-                ImGui::PopStyleColor();
-            ImGui::PopID();
+            std::array<char, 24> value{};
+            if (camera_readable)
+                static_cast<void>(std::snprintf(
+                    value.data(), value.size(), "%.1f%s", snapshot.camera.fov, kDegree));
+            smvm_theme::ValueRow("FOV", camera_readable ? value.data() : nullptr, true,
+                                 camera_readable);
+            SecondaryText(manual_active
+                ? "Mouse wheel adjusts FOV."
+                : "Enter Free Camera to adjust FOV.");
         }
 
         const auto rendered_roll = (snapshot.capabilities & smvm_capability_rendered_roll) != 0;
         const auto roll_writable = camera_ready && rendered_roll &&
             (snapshot.flags & smvm_snapshot_roll_writable) != 0;
-        if (camera_readable) {
+        if (roll_writable) {
             if (smvm_theme::SliderInput("roll", static_cast<float>(snapshot.camera.roll),
-                                        -45.0F, 45.0F, out, "%.1f", roll_writable, "Roll"))
+                                        -45.0F, 45.0F, out, "%.1f", true, "Roll"))
                 QueueAction(context, SmvmActionType::set_roll, -1, -1, out);
+            ImGui::SameLine(0.0F, 12.0F * scale);
+            if (smvm_theme::Button("Reset Roll", true, ImVec2(100.0F * scale, 0.0F)))
+                QueueAction(context, SmvmActionType::set_roll, -1, -1, 0.0);
         } else {
-            smvm_theme::ValueRow("Roll", nullptr, true, false);
-        }
-        if (!roll_writable)
-            smvm_theme::Tooltip(rendered_roll
-                ? "Enter Free Camera to adjust Roll."
-                : "Rendered Roll is not available in this build.");
-        ImGui::SameLine(0.0F, 12.0F * scale);
-        if (smvm_theme::Button("Reset Roll", roll_writable, ImVec2(100.0F * scale, 0.0F)))
-            QueueAction(context, SmvmActionType::set_roll, -1, -1, 0.0);
-        smvm_theme::EndSection();
-    }
-    ImGui::Spacing();
-
-    if (smvm_theme::BeginSection("Shot")) {
-        if (smvm_theme::Button("Save Camera", camera_ready, ImVec2(130.0F * scale, 0.0F)))
-            QueueAction(context, SmvmActionType::save_camera);
-        ImGui::SameLine();
-        if (smvm_theme::Button("Restore Camera", camera_ready, ImVec2(140.0F * scale, 0.0F)))
-            QueueAction(context, SmvmActionType::restore_camera);
-        smvm_theme::EndSection();
-    }
-    ImGui::Spacing();
-
-    if (ImGui::CollapsingHeader("Live Camera")) {
-        std::array<char, 96> value{};
-        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ImGui::GetStyle().ItemSpacing.x, 3.0F * scale));
-        const auto pair = [&](const char* left_label, const double left,
-                              const char* right_label, const double right) noexcept {
-            value = {};
+            std::array<char, 24> value{};
             if (camera_readable)
-                static_cast<void>(std::snprintf(value.data(), 40, "%.2f", left));
-            ImGui::PushFont(smvm_theme::GetFonts().secondary);
-            ImGui::PushStyleColor(ImGuiCol_Text, smvm_theme::Vec4(smvm_theme::colors::kMuted));
-            ImGui::TextUnformatted(left_label);
-            ImGui::PopStyleColor();
-            ImGui::SameLine(60.0F * scale);
-            ImGui::PushFont(smvm_theme::GetFonts().mono);
-            ImGui::PushStyleColor(ImGuiCol_Text, smvm_theme::Vec4(
-                camera_readable ? smvm_theme::colors::kText : smvm_theme::colors::kDisabledText));
-            ImGui::TextUnformatted(camera_readable ? value.data() : "--");
-            ImGui::PopStyleColor();
-            ImGui::PopFont();
-            ImGui::PopFont();
-            ImGui::SameLine(0.0F, 24.0F * scale);
-            value = {};
-            if (camera_readable)
-                static_cast<void>(std::snprintf(value.data(), 40, "%.2f", right));
-            ImGui::PushFont(smvm_theme::GetFonts().secondary);
-            ImGui::PushStyleColor(ImGuiCol_Text, smvm_theme::Vec4(smvm_theme::colors::kMuted));
-            ImGui::TextUnformatted(right_label);
-            ImGui::PopStyleColor();
-            ImGui::SameLine(0.0F, 0.0F);
-            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 34.0F * scale);
-            ImGui::PushFont(smvm_theme::GetFonts().mono);
-            ImGui::PushStyleColor(ImGuiCol_Text, smvm_theme::Vec4(
-                camera_readable ? smvm_theme::colors::kText : smvm_theme::colors::kDisabledText));
-            ImGui::TextUnformatted(camera_readable ? value.data() : "--");
-            ImGui::PopStyleColor();
-            ImGui::PopFont();
-            ImGui::PopFont();
-        };
-        pair("X", snapshot.camera.x, "Pitch", snapshot.camera.pitch);
-        pair("Y", snapshot.camera.y, "Yaw", snapshot.camera.yaw);
-        pair("Z", snapshot.camera.z, "Roll", snapshot.camera.roll);
-        ImGui::PopStyleVar();
-        if (!camera_readable) {
-            if (snapshot.observer_mode != 4) {
-                SecondaryText("Enter Free Camera to access camera controls.");
-                ImGui::SameLine();
-                if (smvm_theme::Button("Enter Free Camera", true, ImVec2(140.0F * scale, 0.0F)))
-                    QueueAction(context, SmvmActionType::reacquire_camera);
+                static_cast<void>(std::snprintf(
+                    value.data(), value.size(), "%+.1f%s", snapshot.camera.roll, kDegree));
+            smvm_theme::ValueRow("Roll", camera_readable ? value.data() : nullptr, true,
+                                 camera_readable && rendered_roll);
+            if (!rendered_roll) {
+                SecondaryText("Roll is unavailable.");
+            } else if (!manual_active) {
+                SecondaryText("Enter Free Camera to adjust Roll.");
             } else {
-                SecondaryText("Camera is reconnecting\xE2\x80\xA6");
+                SecondaryText("Roll controls are connecting.");
             }
         }
+        smvm_theme::EndSection();
     }
 }
 
-void DrawCampathEmptyState(const FrameContext& context) noexcept {
+void DrawPathWorkflow(
+    const FrameContext& context,
+    const std::uint32_t keyframe_count) noexcept {
+    const auto& snapshot = *context.snapshot;
     const auto scale = smvm_theme::GetScale();
-    smvm_theme::EmptyState(
-        "CREATE YOUR FIRST CINEMATIC",
-        "Build a shot while the replay is playing or paused.");
+    const auto replay_active = (snapshot.flags & smvm_snapshot_replay_active) != 0;
+    const auto pause_known = (snapshot.flags & smvm_snapshot_pause_known) != 0;
+    const auto paused = (snapshot.flags & smvm_snapshot_paused) != 0;
+    const auto manual_active = (snapshot.flags & smvm_snapshot_manual_camera_active) != 0;
+    const auto camera_readable = (snapshot.flags & smvm_snapshot_camera_readable) != 0;
+    const auto playing = (snapshot.flags & smvm_snapshot_campath_playing) != 0;
+    const auto can_enter = replay_active && !playing;
+    const auto can_add = replay_active && pause_known && paused && manual_active &&
+        camera_readable && !playing;
+    const auto can_play = replay_active && manual_active && camera_readable &&
+        keyframe_count >= 2 && !playing;
+
+    if (!smvm_theme::BeginSection("Create a Camera Path"))
+        return;
+    SecondaryText("Pause the replay, position each shot in Free Camera, add keyframes, then play the path.");
     ImGui::Spacing();
-    const auto width = ImGui::GetContentRegionAvail().x;
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0F, (width - 390.0F * scale) * 0.5F));
-    if (smvm_theme::PrimaryButton("Enter Free Camera", true, ImVec2(140.0F * scale, 0.0F)))
-        QueueAction(context, SmvmActionType::reacquire_camera);
-    ImGui::SameLine();
-    if (smvm_theme::PrimaryButton("New Path", true, ImVec2(120.0F * scale, 0.0F))) {
-        if (HasUnsavedCampathWork(*context.snapshot)) {
-            context.state->confirm_action = SmvmConfirmAction::new_path;
-            context.state->confirm_pending = true;
-        } else {
-            QueueAction(context, SmvmActionType::new_path);
+
+    if (ImGui::BeginTable("##path_workflow", 2, ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("##workflow_step", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn(
+            "##workflow_action", ImGuiTableColumnFlags_WidthFixed, 176.0F * scale);
+        const auto begin_step = [](const char* title, const char* detail) noexcept {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::AlignTextToFramePadding();
+            ImGui::PushFont(smvm_theme::GetFonts().section);
+            ImGui::TextUnformatted(title);
+            ImGui::PopFont();
+            SecondaryText(detail);
+            ImGui::TableSetColumnIndex(1);
+        };
+
+        begin_step("1  Pause Replay", paused ? "The scene is frozen." : "Freeze the scene you want to frame.");
+        if (paused) {
+            smvm_theme::StatusPill("PAUSED", smvm_theme::PillKind::success);
+        } else if (smvm_theme::PrimaryButton(
+                       "Pause Replay", replay_active && pause_known,
+                       ImVec2(168.0F * scale, 0.0F))) {
+            QueueAction(context, SmvmActionType::toggle_replay_pause);
         }
+
+        begin_step(
+            "2  Enter Free Camera",
+            manual_active ? "Free Camera stays active while you edit." : "Start from the current rendered view.");
+        if (manual_active) {
+            smvm_theme::StatusPill("ACTIVE", smvm_theme::PillKind::success);
+        } else {
+            const auto enter_clicked = paused
+                ? smvm_theme::PrimaryButton(
+                      "Enter Free Camera", can_enter, ImVec2(168.0F * scale, 0.0F))
+                : smvm_theme::Button(
+                      "Enter Free Camera", can_enter, ImVec2(168.0F * scale, 0.0F));
+            if (enter_clicked)
+                QueueAction(context, SmvmActionType::reacquire_camera);
+        }
+
+        std::array<char, 64> keyframe_detail{};
+        if (keyframe_count == 0) {
+            static_cast<void>(std::snprintf(
+                keyframe_detail.data(), keyframe_detail.size(), "Frame the first shot."));
+        } else {
+            static_cast<void>(std::snprintf(
+                keyframe_detail.data(), keyframe_detail.size(), "%u keyframe%s added.",
+                keyframe_count, keyframe_count == 1 ? "" : "s"));
+        }
+        begin_step("3  Add Keyframes", keyframe_detail.data());
+        const auto add_primary = paused && manual_active && keyframe_count < 2;
+        const auto add_clicked = add_primary
+            ? smvm_theme::PrimaryButton("Add Keyframe", can_add, ImVec2(168.0F * scale, 0.0F))
+            : smvm_theme::Button("Add Keyframe", can_add, ImVec2(168.0F * scale, 0.0F));
+        if (add_clicked)
+            RequestCapture(context);
+        smvm_theme::Tooltip("Adds or replaces the keyframe at the current replay moment.");
+
+        begin_step(
+            "4  Play Path",
+            keyframe_count >= 2 ? "The path is ready to preview." : "Add at least two keyframes.");
+        if (playing) {
+            if (smvm_theme::PrimaryButton("Stop Path", true, ImVec2(168.0F * scale, 0.0F)))
+                QueueAction(context, SmvmActionType::stop_campath);
+        } else if (smvm_theme::PrimaryButton(
+                       "Play Path", can_play, ImVec2(168.0F * scale, 0.0F))) {
+            if (QueuePathPlayback(context, SmvmActionType::play_from_start))
+                SmvmCloseMenu();
+        }
+        ImGui::EndTable();
     }
-    ImGui::SameLine();
-    if (smvm_theme::Button("Load Path", true, ImVec2(120.0F * scale, 0.0F)))
-        context.state->open_load_picker = true;
-    ImGui::Spacing();
-    ImGui::Spacing();
-    SecondaryText("1. Enter Free Camera - F2");
-    SecondaryText("2. Pause or seek to your first moment");
-    SecondaryText("3. Position the camera");
-    SecondaryText("4. Add a keyframe - Mouse3");
-    SecondaryText("5. Move to another moment");
-    SecondaryText("6. Add another keyframe - Mouse3");
-    SecondaryText("7. Play From Start - F3");
+    smvm_theme::EndSection();
 }
 
-void DrawCampathPage(const FrameContext& context) noexcept {
+[[maybe_unused]] void DrawCampathPage(const FrameContext& context) noexcept {
     const auto& snapshot = *context.snapshot;
     auto& state = *context.state;
     const auto scale = smvm_theme::GetScale();
@@ -663,63 +710,50 @@ void DrawCampathPage(const FrameContext& context) noexcept {
         ? path_header->keyframe_count
         : 0;
     const auto has_keys = keyframe_count > 0 && keys != nullptr;
+    const auto manual_active = (snapshot.flags & smvm_snapshot_manual_camera_active) != 0;
+    const auto camera_readable = (snapshot.flags & smvm_snapshot_camera_readable) != 0;
+    const auto replay_active = (snapshot.flags & smvm_snapshot_replay_active) != 0;
+    const auto paused = (snapshot.flags & smvm_snapshot_paused) != 0;
+    const auto pause_known = (snapshot.flags & smvm_snapshot_pause_known) != 0;
+    const auto can_add = replay_active && pause_known && paused && manual_active &&
+        camera_readable && !playing;
+    const auto can_play = replay_active && manual_active && camera_readable && has_keys &&
+        keyframe_count >= 2 && !playing;
+    const auto saved_session = snapshot.campath_session == SmvmCampathSession::saved_path;
+    const auto prepare_save_name = [&]() noexcept {
+        state.save_as_name.fill('\0');
+        const auto* current_name = snapshot.path_name.data();
+        if (current_name[0] == '\0' ||
+            std::strcmp(current_name, "Untitled Path") == 0)
+            return;
+        const auto length = std::min(std::strlen(current_name), state.save_as_name.size() - 1);
+        if (length > 0)
+            std::memcpy(state.save_as_name.data(), current_name, length);
+    };
 
-    // Identity row: name, Unsaved pill, keyframe count.
-    ImGui::PushFont(smvm_theme::GetFonts().page_title);
-    ImGui::TextUnformatted(snapshot.path_name[0] != '\0' ? snapshot.path_name.data()
-                                                         : "Untitled Path");
-    ImGui::PopFont();
-    if ((snapshot.flags & smvm_snapshot_campath_unsaved) != 0) {
-        ImGui::SameLine();
-        smvm_theme::StatusPill("UNSAVED", smvm_theme::PillKind::warning);
-    }
     std::array<char, 32> count_text{};
     static_cast<void>(std::snprintf(count_text.data(), count_text.size(), "%u keyframes",
                                     snapshot.keyframe_count));
-    ImGui::SameLine();
     SecondaryText(count_text.data());
     if (playing) {
-        std::array<char, 48> playback_text{};
-        static_cast<void>(std::snprintf(playback_text.data(), playback_text.size(),
-                                        "Path playing %s %s", kEmDash,
-                                        PlaybackStateText(snapshot.playback_state)));
-        SecondaryText(playback_text.data());
+        ImGui::SameLine();
+        smvm_theme::StatusPill("PLAYING", smvm_theme::PillKind::accent);
     }
 
-    // Workspace actions.
-    if (smvm_theme::Button("New", !playing, ImVec2(64.0F * scale, 0.0F))) {
-        if (HasUnsavedCampathWork(snapshot)) {
-            state.confirm_action = SmvmConfirmAction::new_path;
-            state.confirm_pending = true;
+    if (smvm_theme::Button("Save Path", has_keys && !playing, ImVec2(104.0F * scale, 0.0F))) {
+        if (saved_session) {
+            QueueAction(context, SmvmActionType::save_path);
         } else {
-            QueueAction(context, SmvmActionType::new_path);
+            prepare_save_name();
+            state.open_save_as_modal = true;
         }
     }
     ImGui::SameLine();
-    const auto has_session = snapshot.campath_session != SmvmCampathSession::no_path;
-    if (smvm_theme::Button("Save", has_session && has_keys, ImVec2(64.0F * scale, 0.0F)))
-        QueueAction(context, SmvmActionType::save_path);
-    ImGui::SameLine();
-    if (smvm_theme::Button("Save As", has_keys, ImVec2(84.0F * scale, 0.0F))) {
-        const auto length = std::min(std::strlen(snapshot.path_name.data()),
-                                     state.save_as_name.size() - 1);
-        state.save_as_name.fill('\0');
-        if (length > 0)
-            std::memcpy(state.save_as_name.data(), snapshot.path_name.data(), length);
-        state.open_save_as_modal = true;
-    }
-    ImGui::SameLine();
-    if (smvm_theme::Button("Load", !playing, ImVec2(64.0F * scale, 0.0F)))
+    if (smvm_theme::Button("Open Path", !playing, ImVec2(104.0F * scale, 0.0F)))
         state.open_load_picker = true;
-    ImGui::SameLine();
-    if (smvm_theme::Button("Close", has_session, ImVec2(70.0F * scale, 0.0F))) {
-        if (HasUnsavedCampathWork(snapshot)) {
-            state.confirm_action = SmvmConfirmAction::close_path;
-            state.confirm_pending = true;
-        } else {
-            QueueAction(context, SmvmActionType::close_path);
-        }
-    }
+    ImGui::Spacing();
+
+    DrawPathWorkflow(context, keyframe_count);
     ImGui::Spacing();
 
     // Recovery banner.
@@ -733,7 +767,7 @@ void DrawCampathPage(const FrameContext& context) noexcept {
         ImGui::BeginChild("##recovery", ImVec2(0.0F, 0.0F),
                           ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY);
         ImGui::PushStyleColor(ImGuiCol_Text, smvm_theme::Vec4(smvm_theme::colors::kWarning));
-        ImGui::TextUnformatted("Recover unsaved Campath?");
+        ImGui::TextUnformatted("We found an unfinished path from your last session.");
         ImGui::PopStyleColor();
         ImGui::SameLine(0.0F, 16.0F * scale);
         if (smvm_theme::Button("Recover", true, ImVec2(90.0F * scale, 0.0F)))
@@ -746,113 +780,114 @@ void DrawCampathPage(const FrameContext& context) noexcept {
         ImGui::Spacing();
     }
 
-    if (snapshot.campath_session == SmvmCampathSession::no_path && keyframe_count == 0) {
-        DrawCampathEmptyState(context);
+    if (!has_keys)
         return;
+
+    if (smvm_theme::BeginSection("Keyframes", 242.0F * scale)) {
+        ImGui::BeginChild(
+            "##keyframe_list", ImVec2(0.0F, 0.0F), ImGuiChildFlags_None,
+            ImGuiWindowFlags_None);
+        for (std::uint32_t index = 0; index < keyframe_count; ++index) {
+            const auto& key = keys[index];
+            const auto selected = static_cast<std::int32_t>(index) == snapshot.selected_keyframe;
+            if (smvm_theme::KeyframeRow(static_cast<int>(index), key.demo_tick,
+                                        key.camera.fov, key.camera.roll, selected)) {
+                QueueAction(context, SmvmActionType::select_keyframe,
+                            static_cast<std::int32_t>(index));
+            }
+        }
+        ImGui::EndChild();
+        smvm_theme::EndSection();
     }
 
-    // Keyframe list + selected keyframe panel.
-    const auto columns_height = 218.0F * scale;
-    const auto list_width = std::min(320.0F * scale, ImGui::GetContentRegionAvail().x * 0.52F);
-    if (smvm_theme::BeginSection("Keyframes", columns_height, list_width)) {
-        if (has_keys) {
-            ImGui::BeginChild("##keyframe_list", ImVec2(0.0F, 0.0F), ImGuiChildFlags_None,
-                              ImGuiWindowFlags_None);
-            for (std::uint32_t index = 0; index < keyframe_count; ++index) {
-                const auto& key = keys[index];
-                const auto selected = static_cast<std::int32_t>(index) == snapshot.selected_keyframe;
-                if (smvm_theme::KeyframeRow(static_cast<int>(index), key.demo_tick,
-                                            key.camera.fov, key.camera.roll, selected))
-                    QueueAction(context, SmvmActionType::select_keyframe,
-                                static_cast<std::int32_t>(index));
+    if (ImGui::CollapsingHeader("Keyframe Tools")) {
+        ImGui::Indent(8.0F * scale);
+        if (smvm_theme::BeginSection("Selected Keyframe")) {
+            const auto selection_valid = has_keys && snapshot.selected_keyframe >= 0 &&
+                static_cast<std::uint32_t>(snapshot.selected_keyframe) < keyframe_count;
+            if (selection_valid) {
+                const auto& selected = keys[snapshot.selected_keyframe];
+                std::array<char, 48> value{};
+                static_cast<void>(std::snprintf(value.data(), value.size(), "%lld",
+                                                static_cast<long long>(selected.demo_tick)));
+                smvm_theme::ValueRow("Tick", value.data(), true);
+                value = {};
+                static_cast<void>(std::snprintf(value.data(), value.size(), "%.1f%s",
+                                                selected.camera.fov, kDegree));
+                smvm_theme::ValueRow("FOV", value.data(), true);
+                value = {};
+                static_cast<void>(std::snprintf(value.data(), value.size(), "%.1f%s",
+                                                selected.camera.roll, kDegree));
+                smvm_theme::ValueRow("Roll", value.data(), true);
+                ImGui::Spacing();
+                if (smvm_theme::Button("View Keyframe", true, ImVec2(112.0F * scale, 0.0F)))
+                    QueueAction(context, SmvmActionType::go_to_keyframe, snapshot.selected_keyframe);
+                ImGui::SameLine();
+                if (smvm_theme::Button(
+                        "Replace with Current View", can_add,
+                        ImVec2(188.0F * scale, 0.0F)))
+                    QueueAction(context, SmvmActionType::update_keyframe, snapshot.selected_keyframe);
+                ImGui::SameLine();
+                if (smvm_theme::DangerButton("Delete", !playing, ImVec2(80.0F * scale, 0.0F)))
+                    QueueAction(context, SmvmActionType::delete_keyframe, snapshot.selected_keyframe);
+            } else {
+                SecondaryText("Select a keyframe above to view or change it.");
             }
-            ImGui::EndChild();
-        } else {
-            SecondaryText("No keyframes yet.");
-            SecondaryText("Frame a shot, then add the current camera.");
+            smvm_theme::EndSection();
         }
-        smvm_theme::EndSection();
-    }
-    ImGui::SameLine();
-    if (smvm_theme::BeginSection("Selected Keyframe", columns_height)) {
-        const auto selection_valid = has_keys && snapshot.selected_keyframe >= 0 &&
-            static_cast<std::uint32_t>(snapshot.selected_keyframe) < keyframe_count;
-        if (selection_valid) {
-            const auto& selected = keys[snapshot.selected_keyframe];
-            std::array<char, 48> value{};
-            static_cast<void>(std::snprintf(value.data(), value.size(), "%lld",
-                                            static_cast<long long>(selected.demo_tick)));
-            smvm_theme::ValueRow("Tick", value.data(), true);
-            value = {};
-            static_cast<void>(std::snprintf(value.data(), value.size(), "%.1f%s",
-                                            selected.camera.fov, kDegree));
-            smvm_theme::ValueRow("FOV", value.data(), true);
-            value = {};
-            static_cast<void>(std::snprintf(value.data(), value.size(), "%.1f%s",
-                                            selected.camera.roll, kDegree));
-            smvm_theme::ValueRow("Roll", value.data(), true);
-            ImGui::Spacing();
-            if (smvm_theme::Button("Go To", true, ImVec2(76.0F * scale, 0.0F)))
-                QueueAction(context, SmvmActionType::go_to_keyframe, snapshot.selected_keyframe);
-            ImGui::SameLine();
-            if (smvm_theme::Button("Update", !playing, ImVec2(84.0F * scale, 0.0F)))
-                QueueAction(context, SmvmActionType::update_keyframe, snapshot.selected_keyframe);
-            ImGui::SameLine();
-            if (smvm_theme::DangerButton("Delete", !playing, ImVec2(80.0F * scale, 0.0F)))
-                QueueAction(context, SmvmActionType::delete_keyframe, snapshot.selected_keyframe);
-        } else {
-            SecondaryText("Select a keyframe to inspect it.");
-        }
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::Spacing();
-        if (smvm_theme::PrimaryButton("Add Current Camera", !playing,
-                                      ImVec2(200.0F * scale, 0.0F)))
-            RequestCapture(context);
-        smvm_theme::Tooltip("Adds the live camera as a keyframe (same as Mouse3).");
-        smvm_theme::EndSection();
+        ImGui::Unindent(8.0F * scale);
     }
     ImGui::Spacing();
 
-    if (smvm_theme::BeginSection("Playback")) {
-        const auto editing_enabled = !playing;
-        constexpr std::array<const char*, 2> interpolation_labels{"Linear", "Smooth"};
-        const auto interpolation = smvm_theme::SegmentedControl(
-            "interpolation", interpolation_labels.data(), 2,
-            snapshot.interpolation == CampathInterpolation::smooth ? 1 : 0, editing_enabled);
-        if (interpolation != (snapshot.interpolation == CampathInterpolation::smooth ? 1 : 0))
-            QueueAction(context, SmvmActionType::set_interpolation, interpolation);
-        ImGui::SameLine(0.0F, 20.0F * scale);
-        constexpr std::array<const char*, 4> easing_labels{"Linear", "In", "Out", "In-Out"};
-        const auto easing = smvm_theme::SegmentedControl(
-            "easing", easing_labels.data(), 4,
-            static_cast<int>(snapshot.easing), editing_enabled);
-        if (easing != static_cast<int>(snapshot.easing))
-            QueueAction(context, SmvmActionType::set_easing, easing);
-        ImGui::SameLine(0.0F, 20.0F * scale);
-        constexpr std::array<const char*, 2> end_labels{"Stop & Release", "Hold Final"};
-        const auto end_behavior = smvm_theme::SegmentedControl(
-            "end_behavior", end_labels.data(), 2,
-            snapshot.end_behavior == CampathEndBehavior::hold_final_camera ? 1 : 0,
-            editing_enabled);
-        if (end_behavior != (snapshot.end_behavior == CampathEndBehavior::hold_final_camera ? 1 : 0))
-            QueueAction(context, SmvmActionType::set_end_behavior, end_behavior);
+    if (ImGui::CollapsingHeader("Path Motion")) {
+        ImGui::Indent(8.0F * scale);
+        if (smvm_theme::BeginSection("Path Motion")) {
+            const auto editing_enabled = !playing;
+            constexpr std::array<const char*, 2> interpolation_labels{"Linear", "Smooth"};
+            const auto interpolation = smvm_theme::SegmentedControl(
+                "interpolation", interpolation_labels.data(), 2,
+                snapshot.interpolation == CampathInterpolation::smooth ? 1 : 0, editing_enabled);
+            if (interpolation != (snapshot.interpolation == CampathInterpolation::smooth ? 1 : 0))
+                QueueAction(context, SmvmActionType::set_interpolation, interpolation);
+            ImGui::SameLine(0.0F, 20.0F * scale);
+            constexpr std::array<const char*, 4> easing_labels{"Linear", "In", "Out", "In-Out"};
+            const auto easing = smvm_theme::SegmentedControl(
+                "easing", easing_labels.data(), 4,
+                static_cast<int>(snapshot.easing), editing_enabled);
+            if (easing != static_cast<int>(snapshot.easing))
+                QueueAction(context, SmvmActionType::set_easing, easing);
+            ImGui::Spacing();
+            if (smvm_theme::Button(
+                    "Play From Current", can_play, ImVec2(150.0F * scale, 0.0F)) &&
+                QueuePathPlayback(context, SmvmActionType::play_from_current)) {
+                SmvmCloseMenu();
+            }
+            ImGui::SameLine();
+            SecondaryText("Path playback returns to Free Camera when it finishes.");
+            smvm_theme::EndSection();
+        }
+        ImGui::Unindent(8.0F * scale);
+    }
 
-        ImGui::Spacing();
-        const auto can_play = has_keys && keyframe_count >= 2 && editing_enabled;
-        if (smvm_theme::PrimaryButton("Play From Start", can_play, ImVec2(140.0F * scale, 0.0F)))
-            QueueAction(context, SmvmActionType::play_from_start);
-        ImGui::SameLine();
-        if (smvm_theme::Button("Play From Current", can_play, ImVec2(150.0F * scale, 0.0F)))
-            QueueAction(context, SmvmActionType::play_from_current);
-        ImGui::SameLine();
-        if (smvm_theme::Button("Stop", playing, ImVec2(70.0F * scale, 0.0F)))
-            QueueAction(context, SmvmActionType::stop_campath);
-        smvm_theme::EndSection();
+    if (ImGui::CollapsingHeader("Start Over")) {
+        ImGui::Indent(8.0F * scale);
+        if (smvm_theme::BeginSection("Start Over")) {
+            if (smvm_theme::Button("Start New Path", !playing, ImVec2(124.0F * scale, 0.0F))) {
+                if (HasUnsavedCampathWork(snapshot)) {
+                    state.confirm_action = SmvmConfirmAction::new_path;
+                    state.confirm_pending = true;
+                } else {
+                    QueueAction(context, SmvmActionType::new_path);
+                }
+            }
+            SecondaryText("Adding a keyframe starts the working path automatically.");
+            smvm_theme::EndSection();
+        }
+        ImGui::Unindent(8.0F * scale);
     }
 }
 
-void DrawVisualsPage(const FrameContext& context) noexcept {
+[[maybe_unused]] void DrawVisualsPage(const FrameContext& context) noexcept {
     const auto& snapshot = *context.snapshot;
     PageHeader("Visuals", nullptr);
     ImGui::Spacing();
@@ -885,7 +920,7 @@ void DrawVisualsPage(const FrameContext& context) noexcept {
     }
     ImGui::Spacing();
 
-    if (smvm_theme::BeginSection("Campath Display")) {
+    if (smvm_theme::BeginSection("Path Display")) {
         const auto path_available = (snapshot.capabilities & smvm_capability_path_visualization) != 0;
         if (smvm_theme::Toggle("Show Path", (snapshot.flags & smvm_snapshot_show_path) != 0,
                                path_available))
@@ -929,7 +964,7 @@ void DrawVisualsPage(const FrameContext& context) noexcept {
     }
 }
 
-void DrawCapturePage() noexcept {
+[[maybe_unused]] void DrawCapturePage() noexcept {
     PageHeader("Capture", nullptr);
     ImGui::Spacing();
     smvm_theme::EmptyState(
@@ -940,41 +975,44 @@ void DrawCapturePage() noexcept {
     SecondaryText("Planned: image sequence, resolution, frame rate, audio, render passes.");
 }
 
-void DrawSettingsBindingsTwoColumn(
-    const char* id,
-    const char* const* labels,
-    const std::uint32_t* values,
-    const std::int32_t* actions,
-    const std::size_t count) noexcept {
-    const auto scale = smvm_theme::GetScale();
-    const auto half = (count + 1) / 2;
-    const auto column = [&](const std::size_t begin, const std::size_t end) noexcept {
-        for (auto index = begin; index < end; ++index)
-            BindingField(labels[index], values[index], actions[index]);
-    };
-    ImGui::PushID(id);
-    const auto width = (ImGui::GetContentRegionAvail().x - 12.0F * scale) * 0.5F;
-    ImGui::BeginChild("##left", ImVec2(width, 0.0F), ImGuiChildFlags_AutoResizeY);
-    column(0, half);
-    ImGui::EndChild();
-    ImGui::SameLine();
-    ImGui::BeginChild("##right", ImVec2(0.0F, 0.0F), ImGuiChildFlags_AutoResizeY);
-    column(half, count);
-    ImGui::EndChild();
-    ImGui::PopID();
+void DrawEssentialControls(const FrameContext& context) noexcept {
+    const auto& snapshot = *context.snapshot;
+    if (!smvm_theme::BeginSection("Essential Controls"))
+        return;
+    SecondaryText("SMVM is ready to use. Change a control only when you want to.");
+    SecondaryText("Shortcuts work with the menu closed; on-screen buttons work here.");
+    ImGui::Spacing();
+    BindingField("Open SMVM", snapshot.menu_key, kSmvmFirstEditorBindingAction + 0);
+    BindingField("Pause / Play Replay", snapshot.replay_pause_key, 125);
+    BindingField("Enter Free Camera", snapshot.toggle_free_camera_key, 124);
+    BindingField("Add Keyframe", snapshot.add_key, kSmvmFirstEditorBindingAction + 1);
+    BindingField("Play Path", snapshot.play_start_key, kSmvmFirstEditorBindingAction + 4);
+    BindingField("Stop Path", snapshot.stop_key, kSmvmFirstEditorBindingAction + 6);
+    smvm_theme::EndSection();
 }
 
-void DrawCameraTuningSection(const FrameContext& context, const float width) noexcept {
+void DrawCameraFeelSettings(const FrameContext& context) noexcept {
     const auto& snapshot = *context.snapshot;
-    if (!smvm_theme::BeginSection("Camera Tuning", 0.0F, width))
+    if (!smvm_theme::BeginSection("Camera Feel"))
         return;
     auto out = 0.0F;
     if (smvm_theme::SliderInput("move_speed", static_cast<float>(snapshot.movement_speed),
                                 1.0F, 2000.0F, out, "%.0f", true, "Move Speed"))
         QueueAction(context, SmvmActionType::set_movement_speed, -1, -1, out);
     if (smvm_theme::SliderInput("sensitivity", static_cast<float>(snapshot.mouse_sensitivity),
-                                0.001F, 5.0F, out, "%.3f", true, "Sensitivity"))
+                                0.001F, 5.0F, out, "%.3f", true, "Look Sensitivity"))
         QueueAction(context, SmvmActionType::set_mouse_sensitivity, -1, -1, out);
+    if (smvm_theme::Toggle("Invert Vertical Look",
+                           (snapshot.flags & smvm_snapshot_invert_y) != 0))
+        QueueAction(context, SmvmActionType::toggle_invert_y);
+    smvm_theme::EndSection();
+}
+
+void DrawCameraTuningSection(const FrameContext& context) noexcept {
+    const auto& snapshot = *context.snapshot;
+    if (!smvm_theme::BeginSection("Fine Tuning"))
+        return;
+    auto out = 0.0F;
     if (smvm_theme::SliderInput("smoothing", static_cast<float>(snapshot.smoothing),
                                 0.0F, 0.95F, out, "%.2f", true, "Smoothing"))
         QueueAction(context, SmvmActionType::set_smoothing, -1, -1, out);
@@ -987,19 +1025,12 @@ void DrawCameraTuningSection(const FrameContext& context, const float width) noe
     static_cast<void>(std::snprintf(value.data(), value.size(), "%s%.2f", kTimes,
                                     snapshot.precision_multiplier));
     smvm_theme::ValueRow("Precision", value.data());
-    if (smvm_theme::Toggle("Invert Y", (snapshot.flags & smvm_snapshot_invert_y) != 0))
-        QueueAction(context, SmvmActionType::toggle_invert_y);
-    if (smvm_theme::Toggle("Take Over Camera Input",
-                           (snapshot.flags & smvm_snapshot_input_takeover) != 0))
-        QueueAction(context, SmvmActionType::toggle_input_takeover);
-    smvm_theme::Tooltip("While active, only SMVM-owned bindings are consumed. Focus loss, "
-                        "menu open, and disconnect reset held input.");
     smvm_theme::EndSection();
 }
 
-void DrawLensBindingsSection(const FrameContext& context, const float width) noexcept {
+void DrawLensBindingsSection(const FrameContext& context) noexcept {
     const auto& snapshot = *context.snapshot;
-    if (!smvm_theme::BeginSection("Lens Bindings", 0.0F, width))
+    if (!smvm_theme::BeginSection("Lens Controls"))
         return;
     constexpr std::array<const char*, 3> roll_labels{"Roll Left", "Roll Right", "Reset Roll"};
     const std::array<std::uint32_t, 3> roll_values{
@@ -1018,12 +1049,6 @@ void DrawLensBindingsSection(const FrameContext& context, const float width) noe
 
 void DrawCameraSettings(const FrameContext& context) noexcept {
     const auto& snapshot = *context.snapshot;
-    if (smvm_theme::BeginSection("Free Camera")) {
-        BindingField("Toggle Free Camera", snapshot.toggle_free_camera_key, 124);
-        SecondaryText("F2 enters from the current rendered view and works while paused.");
-        smvm_theme::EndSection();
-    }
-    ImGui::Spacing();
     constexpr std::array<const char*, 8> movement_labels{
         "Forward", "Backward", "Left", "Right", "Up", "Down", "Fast", "Precision"};
     const std::array<std::uint32_t, 8> movement_values{
@@ -1034,58 +1059,43 @@ void DrawCameraSettings(const FrameContext& context) noexcept {
         kSmvmFirstManualBindingAction + 2, kSmvmFirstManualBindingAction + 3,
         kSmvmFirstManualBindingAction + 4, kSmvmFirstManualBindingAction + 5,
         kSmvmFirstManualBindingAction + 6, kSmvmFirstManualBindingAction + 7};
-    if (smvm_theme::BeginSection("Movement Bindings")) {
-        DrawSettingsBindingsTwoColumn("movement", movement_labels.data(), movement_values.data(),
-                                      movement_actions.data(), movement_labels.size());
+    if (smvm_theme::BeginSection("Movement Controls")) {
+        for (std::size_t index = 0; index < movement_labels.size(); ++index)
+            BindingField(movement_labels[index], movement_values[index], movement_actions[index]);
         smvm_theme::EndSection();
     }
     ImGui::Spacing();
-
-    // Tuning and lens bindings share one row so the page fits the shell
-    // without a page scrollbar.
-    {
-        const auto scale = smvm_theme::GetScale();
-        const auto column_width = (ImGui::GetContentRegionAvail().x - 12.0F * scale) * 0.5F;
-        ImGui::BeginGroup();
-        DrawCameraTuningSection(context, column_width);
-        ImGui::EndGroup();
-        ImGui::SameLine(0.0F, 12.0F * scale);
-        ImGui::BeginGroup();
-        DrawLensBindingsSection(context, column_width);
-        ImGui::EndGroup();
-    }
+    DrawCameraTuningSection(context);
+    ImGui::Spacing();
+    DrawLensBindingsSection(context);
 }
 
 void DrawCampathSettings(const FrameContext& context) noexcept {
     const auto& snapshot = *context.snapshot;
-    constexpr std::array<const char*, 10> labels{
-        "Add Keyframe", "Delete Keyframe", "Play From Start", "Play From Current", "Stop",
-        "Undo", "Redo", "Show Path", "Show Cameras", "Show Labels"};
-    const std::array<std::uint32_t, 10> values{
-        snapshot.add_key, snapshot.delete_key, snapshot.play_start_key, snapshot.play_current_key,
-        snapshot.stop_key, snapshot.undo_key, snapshot.redo_key, snapshot.show_path_key,
-        snapshot.show_cameras_key, snapshot.show_labels_key};
-    constexpr std::array<std::int32_t, 10> actions{
-        kSmvmFirstEditorBindingAction + 1, kSmvmFirstEditorBindingAction + 2,
-        kSmvmFirstEditorBindingAction + 4, kSmvmFirstEditorBindingAction + 5,
-        kSmvmFirstEditorBindingAction + 6, kSmvmFirstEditorBindingAction + 7,
-        kSmvmFirstEditorBindingAction + 8, kSmvmFirstEditorBindingAction + 9,
-        kSmvmFirstEditorBindingAction + 10, 126};
-    if (smvm_theme::BeginSection("Editor & Playback Bindings")) {
-        DrawSettingsBindingsTwoColumn("campath_bindings", labels.data(), values.data(),
-                                      actions.data(), labels.size());
-        SecondaryText("Defaults: Mouse3 Add/Update, L Delete, F3 Play From Start, F4 Stop.");
+    constexpr std::array<const char*, 7> labels{
+        "Delete Keyframe", "Play From Current", "Undo", "Redo", "Show Path", "Show Cameras",
+        "Show Labels"};
+    const std::array<std::uint32_t, 7> values{
+        snapshot.delete_key, snapshot.play_current_key, snapshot.undo_key, snapshot.redo_key,
+        snapshot.show_path_key, snapshot.show_cameras_key, snapshot.show_labels_key};
+    constexpr std::array<std::int32_t, 7> actions{
+        kSmvmFirstEditorBindingAction + 2, kSmvmFirstEditorBindingAction + 5,
+        kSmvmFirstEditorBindingAction + 7, kSmvmFirstEditorBindingAction + 8,
+        kSmvmFirstEditorBindingAction + 9, kSmvmFirstEditorBindingAction + 10, 126};
+    if (smvm_theme::BeginSection("Path Shortcuts")) {
+        for (std::size_t index = 0; index < labels.size(); ++index)
+            BindingField(labels[index], values[index], actions[index]);
+        SecondaryText("Optional editing and path-display shortcuts.");
         smvm_theme::EndSection();
     }
 }
 
 void DrawReplaySettings(const FrameContext& context) noexcept {
     const auto& snapshot = *context.snapshot;
-    if (smvm_theme::BeginSection("Replay Bindings")) {
-        BindingField("Play / Pause", snapshot.replay_pause_key, 125);
+    if (smvm_theme::BeginSection("Replay Stepping")) {
         BindingField("Step Back", snapshot.step_back_key, 127);
         BindingField("Step Forward", snapshot.step_forward_key, 128);
-        SecondaryText("Right Shift toggles playback. Precise step keys are optional.");
+        SecondaryText("Precise frame stepping is optional.");
         smvm_theme::EndSection();
     }
 }
@@ -1093,10 +1103,10 @@ void DrawReplaySettings(const FrameContext& context) noexcept {
 void DrawInterfaceSettings(const FrameContext& context) noexcept {
     const auto& snapshot = *context.snapshot;
     if (smvm_theme::BeginSection("Menu")) {
-        BindingField("Open Menu", snapshot.menu_key, kSmvmFirstEditorBindingAction + 0);
-        BindingField("Cycle Replay Interface", snapshot.cycle_ui_key, 123);
+        BindingField("Cycle Replay UI", snapshot.cycle_ui_key, 123);
         BindingField("Clean Footage", snapshot.clean_view_key, kSmvmFirstEditorBindingAction + 3);
-        BindingField("Emergency Restore", snapshot.restore_ui_key, kSmvmFirstEditorBindingAction + 11);
+        BindingField("Emergency Exit + Restore", snapshot.restore_ui_key,
+                     kSmvmFirstEditorBindingAction + 11);
         auto out = 0.0F;
         if (smvm_theme::SliderInput("ui_scale", static_cast<float>(snapshot.ui_scale),
                                     0.75F, 1.5F, out, "%.2f", true, "UI Scale"))
@@ -1127,15 +1137,15 @@ void DrawInterfaceSettings(const FrameContext& context) noexcept {
     ImGui::Spacing();
 
     if (smvm_theme::BeginSection("Binding Presets")) {
-        if (smvm_theme::PrimaryButton("APPLY MOVIE MAKER DEFAULTS", true,
+        if (smvm_theme::PrimaryButton("Restore Recommended Controls", true,
                                       ImVec2(240.0F * smvm_theme::GetScale(), 0.0F)))
             QueueAction(context, SmvmActionType::apply_movie_maker_defaults);
         ImGui::SameLine();
-        if (smvm_theme::Button("RESET ALL BINDINGS", true,
+        if (smvm_theme::Button("Restore Every Default", true,
                                ImVec2(180.0F * smvm_theme::GetScale(), 0.0F)))
             QueueAction(context, SmvmActionType::reset_bindings);
-        SecondaryText("Movie Maker uses F2 / Right Shift / Mouse3 / F3 / F4; Reset also restores F5 and PageUp / PageDown.");
-        SecondaryText("Each preset is checked for conflicts before any binding is changed.");
+        SecondaryText("Recommended controls cover the complete movie-making workflow.");
+        SecondaryText("Presets are checked for conflicts before anything changes.");
         smvm_theme::EndSection();
     }
     ImGui::Spacing();
@@ -1161,7 +1171,7 @@ void DrawInterfaceSettings(const FrameContext& context) noexcept {
             hud_anchor);
         if (picked_hud_anchor != hud_anchor)
             QueueAction(context, SmvmActionType::set_status_hud_anchor, picked_hud_anchor);
-        SecondaryText("Compact camera telemetry appears only during Free Camera or Campath playback.");
+        SecondaryText("Compact camera telemetry appears only during Free Camera or Path playback.");
         ImGui::Spacing();
         if (smvm_theme::Toggle("Minimal SMVM Button",
                                (snapshot.flags & smvm_snapshot_show_minimal_pill) != 0))
@@ -1193,7 +1203,7 @@ void DrawInterfaceSettings(const FrameContext& context) noexcept {
 void DrawStorageSettings(const FrameContext& context) noexcept {
     const auto& snapshot = *context.snapshot;
     if (smvm_theme::BeginSection("Storage")) {
-        smvm_theme::ValueRow("Campath Folder", "%LOCALAPPDATA%\\DeadlockMVM\\campaths", true);
+        smvm_theme::ValueRow("Path Folder", "%LOCALAPPDATA%\\DeadlockMVM\\campaths", true);
         std::array<char, 24> count{};
         static_cast<void>(std::snprintf(count.data(), count.size(), "%u",
                                         snapshot.saved_document_count));
@@ -1201,7 +1211,7 @@ void DrawStorageSettings(const FrameContext& context) noexcept {
         if (smvm_theme::Toggle("Restore last workspace on startup",
                                (snapshot.flags & smvm_snapshot_restore_workspace) != 0))
             QueueAction(context, SmvmActionType::toggle_restore_workspace);
-        smvm_theme::Tooltip("Default off. When off, a startup always opens a clean, empty Campath workspace.");
+        smvm_theme::Tooltip("Default off. When off, SMVM starts with an empty path workspace.");
         smvm_theme::EndSection();
     }
 }
@@ -1211,7 +1221,7 @@ void DrawAdvancedSettings(const FrameContext& context) noexcept {
     const auto& params = *context.params;
     const auto scale = smvm_theme::GetScale();
     if (smvm_theme::BeginSection("Diagnostics")) {
-        smvm_theme::ValueRow("Protocol", "V10", true);
+        smvm_theme::ValueRow("Protocol", "V11", true);
         const auto renderer_error = static_cast<SmvmRendererError>(params.renderer_error);
         std::array<char, 48> renderer{};
         static_cast<void>(std::snprintf(renderer.data(), renderer.size(), "D3D11 %s %s",
@@ -1330,44 +1340,55 @@ void DrawAdvancedSettings(const FrameContext& context) noexcept {
     }
 }
 
-void DrawSettingsPage(const FrameContext& context) noexcept {
-    auto& state = *context.state;
-    PageHeader("Settings", nullptr);
-    ImGui::Spacing();
-    constexpr std::array<const char*, 6> sections{
-        "Camera", "Replay", "Campath", "Interface", "Storage", "Advanced"};
-    const auto chosen = smvm_theme::SegmentedControl(
-        "settings_sections", sections.data(), static_cast<int>(sections.size()),
-        static_cast<int>(state.settings_section));
-    state.settings_section = static_cast<SmvmSettingsSection>(chosen);
+[[maybe_unused]] void DrawSettingsPage(const FrameContext& context) noexcept {
+    const auto scale = smvm_theme::GetScale();
+    PageHeader("Settings", "Ready-to-use defaults");
     ImGui::Spacing();
 
-    switch (state.settings_section) {
-        case SmvmSettingsSection::camera: DrawCameraSettings(context); break;
-        case SmvmSettingsSection::replay: DrawReplaySettings(context); break;
-        case SmvmSettingsSection::campath: DrawCampathSettings(context); break;
-        case SmvmSettingsSection::interface_settings: DrawInterfaceSettings(context); break;
-        case SmvmSettingsSection::storage: DrawStorageSettings(context); break;
-        case SmvmSettingsSection::advanced: DrawAdvancedSettings(context); break;
+    DrawEssentialControls(context);
+    ImGui::Spacing();
+    DrawCameraFeelSettings(context);
+    ImGui::Spacing();
+
+    if (ImGui::CollapsingHeader("More Controls")) {
+        ImGui::Indent(8.0F * scale);
+        DrawCameraSettings(context);
+        ImGui::Spacing();
+        DrawReplaySettings(context);
+        ImGui::Spacing();
+        DrawCampathSettings(context);
+        ImGui::Unindent(8.0F * scale);
+    }
+    if (ImGui::CollapsingHeader("Interface")) {
+        ImGui::Indent(8.0F * scale);
+        DrawInterfaceSettings(context);
+        ImGui::Unindent(8.0F * scale);
+    }
+    if (ImGui::CollapsingHeader("Advanced")) {
+        ImGui::Indent(8.0F * scale);
+        DrawStorageSettings(context);
+        ImGui::Spacing();
+        DrawAdvancedSettings(context);
+        ImGui::Unindent(8.0F * scale);
     }
 }
 
 // --- Modals (rendered at shell level so popup IDs share one stack) ---------
 
-void DrawModals(const FrameContext& context) noexcept {
+[[maybe_unused]] void DrawModals(const FrameContext& context) noexcept {
     auto& state = *context.state;
     const auto scale = smvm_theme::GetScale();
 
     if (state.open_save_as_modal) {
-        ImGui::OpenPopup("Save Campath As");
+        ImGui::OpenPopup("Save Path");
         state.open_save_as_modal = false;
     }
     ImGui::SetNextWindowSizeConstraints(ImVec2(300.0F * scale, 0.0F),
                                         ImVec2(380.0F * scale, 200.0F * scale));
-    if (ImGui::BeginPopupModal("Save Campath As", nullptr,
+    if (ImGui::BeginPopupModal("Save Path", nullptr,
                                ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove)) {
         ImGui::PushFont(smvm_theme::GetFonts().section);
-        ImGui::TextUnformatted("Save Campath As");
+        ImGui::TextUnformatted("Name Your Path");
         ImGui::PopFont();
         ImGui::Spacing();
         ImGui::SetNextItemWidth(-1.0F);
@@ -1376,7 +1397,7 @@ void DrawModals(const FrameContext& context) noexcept {
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::Spacing();
-        if (smvm_theme::PrimaryButton("Save", state.save_as_name[0] != '\0',
+        if (smvm_theme::PrimaryButton("Save Path", state.save_as_name[0] != '\0',
                                       ImVec2(90.0F * scale, 0.0F))) {
             QueueAction(context, SmvmActionType::save_path_as, -1, -1, 0.0,
                         state.save_as_name.data());
@@ -1393,14 +1414,14 @@ void DrawModals(const FrameContext& context) noexcept {
             state.picker_requested_list =
                 QueueAction(context, SmvmActionType::request_path_list);
         }
-        ImGui::OpenPopup("Load Campath");
+        ImGui::OpenPopup("Open Path");
         state.open_load_picker = false;
     }
     auto picker_open = true;
     ImGui::SetNextWindowSize(ImVec2(460.0F * scale, 400.0F * scale), ImGuiCond_Appearing);
-    if (ImGui::BeginPopupModal("Load Campath", &picker_open, ImGuiWindowFlags_NoResize)) {
+    if (ImGui::BeginPopupModal("Open Path", &picker_open, ImGuiWindowFlags_NoResize)) {
         ImGui::PushFont(smvm_theme::GetFonts().section);
-        ImGui::TextUnformatted("Load Campath");
+        ImGui::TextUnformatted("Open a Saved Path");
         ImGui::PopFont();
         ImGui::Spacing();
         const auto* documents = state.documents_valid ? &state.documents : context.params->documents;
@@ -1408,46 +1429,47 @@ void DrawModals(const FrameContext& context) noexcept {
             ? std::min<std::uint32_t>(documents->count,
                                       static_cast<std::uint32_t>(kMaxCampathDocuments))
             : 0u;
+        auto saved_count = 0u;
+        for (std::uint32_t index = 0; index < count; ++index) {
+            if ((documents->entries[index].flags & kCampathDocumentDraft) == 0)
+                ++saved_count;
+        }
         ImGui::BeginChild("##path_list", ImVec2(0.0F, -46.0F * scale), ImGuiChildFlags_Borders);
-        if (count == 0) {
+        if (saved_count == 0) {
             smvm_theme::EmptyState("No saved paths", "Paths you save appear here.");
         } else {
-            // Draft entry first, then saved paths in the order provided.
-            for (std::uint32_t pass = 0; pass < 2; ++pass) {
-                for (std::uint32_t index = 0; index < count; ++index) {
-                    const auto& entry = documents->entries[index];
-                    const auto draft = (entry.flags & kCampathDocumentDraft) != 0;
-                    if ((pass == 0) != draft)
-                        continue;
-                    const auto matches = (entry.flags & kCampathDocumentMatchesReplay) != 0;
-                    std::array<char, 128> label{};
-                    static_cast<void>(std::snprintf(
-                        label.data(), label.size(), "%s%s  %s  %u keyframes%s",
-                        entry.name.data(), draft ? " (unsaved draft)" : "", kMiddleDot,
-                        entry.keyframe_count, matches ? "" : "  \xC2\xB7 other replay"));
-                    ImGui::PushID(static_cast<int>(index));
-                    if (!matches)
-                        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * 0.45F);
-                    if (ImGui::Selectable(label.data(), false, 0, ImVec2(0.0F, 24.0F * scale))) {
-                        if (HasUnsavedCampathWork(*context.snapshot)) {
-                            state.confirm_action = SmvmConfirmAction::load_path;
-                            state.confirm_load_index = static_cast<std::int32_t>(index);
-                            state.confirm_pending = true;
-                        } else {
-                            if (QueueAction(context, SmvmActionType::load_path,
-                                            static_cast<std::int32_t>(index)))
-                                ImGui::CloseCurrentPopup();
-                        }
-                    }
-                    if (matches) {
-                        smvm_theme::Tooltip("Matches the current replay.");
+            for (std::uint32_t index = 0; index < count; ++index) {
+                const auto& entry = documents->entries[index];
+                if ((entry.flags & kCampathDocumentDraft) != 0)
+                    continue;
+                const auto matches = (entry.flags & kCampathDocumentMatchesReplay) != 0;
+                std::array<char, 128> label{};
+                static_cast<void>(std::snprintf(
+                    label.data(), label.size(), "%s  %s  %u keyframes%s",
+                    entry.name.data(), kMiddleDot, entry.keyframe_count,
+                    matches ? "" : "  \xC2\xB7 other replay"));
+                ImGui::PushID(static_cast<int>(index));
+                const auto selectable_flags = matches
+                    ? ImGuiSelectableFlags_None
+                    : ImGuiSelectableFlags_Disabled;
+                if (ImGui::Selectable(
+                        label.data(), false, selectable_flags, ImVec2(0.0F, 24.0F * scale))) {
+                    if (HasUnsavedCampathWork(*context.snapshot)) {
+                        state.confirm_action = SmvmConfirmAction::load_path;
+                        state.confirm_load_index = static_cast<std::int32_t>(index);
+                        state.confirm_pending = true;
                     } else {
-                        smvm_theme::Tooltip("Recorded for a different replay.");
+                        if (QueueAction(context, SmvmActionType::load_path,
+                                        static_cast<std::int32_t>(index)))
+                            ImGui::CloseCurrentPopup();
                     }
-                    if (!matches)
-                        ImGui::PopStyleVar();
-                    ImGui::PopID();
                 }
+                if (matches) {
+                    smvm_theme::Tooltip("Matches the current replay.");
+                } else {
+                    smvm_theme::Tooltip("This path belongs to a different replay.");
+                }
+                ImGui::PopID();
             }
         }
         ImGui::EndChild();
@@ -1459,13 +1481,13 @@ void DrawModals(const FrameContext& context) noexcept {
         state.picker_requested_list = false;
 
     if (state.confirm_pending) {
-        smvm_theme::OpenConfirmation("Discard unsaved Campath?");
+        smvm_theme::OpenConfirmation("Discard current path changes?");
         state.confirm_pending = false;
     }
     const auto confirmed = smvm_theme::ConfirmationModal(
-        "Discard unsaved Campath?",
-        "Discard unsaved Campath?",
-        "Your unsaved keyframes will be lost. Saved path files are kept.",
+        "Discard current path changes?",
+        "Discard current path changes?",
+        "Your current keyframes will be lost. Saved path files are kept.",
         "Discard");
     if (confirmed == smvm_theme::ConfirmResult::confirm) {
         switch (state.confirm_action) {
@@ -1491,30 +1513,6 @@ void DrawModals(const FrameContext& context) noexcept {
 }
 
 // --- Shell ------------------------------------------------------------------
-
-bool NavigationItem(const char* label, const bool selected) noexcept {
-    const auto scale = smvm_theme::GetScale();
-    ImGui::PushID(label);
-    ImGui::PushStyleColor(
-        ImGuiCol_Text,
-        smvm_theme::Vec4(selected ? smvm_theme::colors::kAccent : smvm_theme::colors::kMuted));
-    if (selected) {
-        ImGui::PushStyleColor(ImGuiCol_Header, smvm_theme::Vec4(smvm_theme::colors::kAccentSoft));
-        ImGui::PushStyleColor(ImGuiCol_HeaderHovered,
-                              smvm_theme::Vec4(smvm_theme::Rgba(0xD2, 0xA4, 0x53, 56)));
-    }
-    const auto clicked = ImGui::Selectable(label, selected, 0, ImVec2(0.0F, 34.0F * scale));
-    if (selected) {
-        const auto min = ImGui::GetItemRectMin();
-        const auto max = ImGui::GetItemRectMax();
-        ImGui::GetWindowDrawList()->AddRectFilled(
-            min, ImVec2(min.x + 2.0F * scale, max.y), smvm_theme::colors::kAccent);
-        ImGui::PopStyleColor(2);
-    }
-    ImGui::PopStyleColor();
-    ImGui::PopID();
-    return clicked;
-}
 
 void DrawShell(const FrameContext& context) noexcept {
     const auto& snapshot = *context.snapshot;
@@ -1547,21 +1545,6 @@ void DrawShell(const FrameContext& context) noexcept {
         ImVec2(std::min(640.0F * scale, viewport_width), std::min(440.0F * scale, viewport_height)),
         ImVec2(viewport_width, viewport_height));
 
-    // Light window shadow, drawn from the tracked geometry (one frame behind).
-    if (state.window_positioned) {
-        const auto sx = state.window_x;
-        const auto sy = state.window_y;
-        const auto sw = state.window_w * scale;
-        const auto sh = state.window_h * scale;
-        for (auto layer = 0; layer < 3; ++layer) {
-            const auto grow = static_cast<float>(layer + 1) * 4.0F * scale;
-            background->AddRectFilled(
-                ImVec2(sx - grow, sy - grow + (2.0F * scale)),
-                ImVec2(sx + sw + grow, sy + sh + grow + (2.0F * scale)),
-                smvm_theme::colors::kShadow, 8.0F * scale);
-        }
-    }
-
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, opacity);
     const auto open = ImGui::Begin(
         "##smvm_shell", nullptr,
@@ -1572,97 +1555,38 @@ void DrawShell(const FrameContext& context) noexcept {
         auto position = ImGui::GetWindowPos();
         const auto size = ImGui::GetWindowSize();
 
-        // Header: title, drag region, single status pill, close button.
-        const auto replay_active = (snapshot.flags & smvm_snapshot_replay_active) != 0;
-        const auto paused = (snapshot.flags & smvm_snapshot_paused) != 0;
-        const char* pill_text = "CONNECTING";
-        auto pill_kind = smvm_theme::PillKind::muted;
-        if (replay_active && paused) {
-            pill_text = "PAUSED";
-            pill_kind = smvm_theme::PillKind::warning;
-        } else if (replay_active) {
-            pill_text = "REPLAY ACTIVE";
-            pill_kind = smvm_theme::PillKind::success;
-        }
+        // Blank restart shell: brand, drag region, and close control only.
         ImGui::PushFont(smvm_theme::GetFonts().title);
         ImGui::PushStyleColor(ImGuiCol_Text, smvm_theme::Vec4(smvm_theme::colors::kAccent));
         ImGui::TextUnformatted("SMVM");
         ImGui::PopStyleColor();
         ImGui::PopFont();
         ImGui::SameLine();
-        const auto pill_width = smvm_theme::StatusPillSize(pill_text).x;
         const auto close_width = 30.0F * scale;
-        const auto spacing = ImGui::GetStyle().ItemSpacing.x;
         const auto remaining = ImGui::GetContentRegionAvail().x;
         ImGui::InvisibleButton(
             "##header_drag",
-            ImVec2(std::max(8.0F, remaining - pill_width - close_width - spacing),
-                   22.0F * scale));
+            ImVec2(std::max(8.0F, remaining - close_width), 22.0F * scale));
         if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
             const auto& io = ImGui::GetIO();
             ImGui::SetWindowPos(ImVec2(position.x + io.MouseDelta.x,
                                        position.y + io.MouseDelta.y));
         }
         ImGui::SameLine(0.0F, 0.0F);
-        smvm_theme::StatusPill(pill_text, pill_kind);
-        ImGui::SameLine();
         if (smvm_theme::Button(kTimes, true, ImVec2(close_width, 0.0F)))
             SmvmCloseMenu();
         smvm_theme::Tooltip("Close menu");
         ImGui::Separator();
 
-        // Body: navigation rail + page content.
-        const auto body_height = ImGui::GetContentRegionAvail().y;
-        const auto rail_width = 148.0F * scale;
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0F, 0.0F, 0.0F, 0.0F));
-        ImGui::BeginChild("##nav", ImVec2(rail_width, body_height), ImGuiChildFlags_None);
-        {
-            struct Item final { const char* label; SmvmPage page; };
-            constexpr std::array<Item, 5> items{{
-                {"Replay", SmvmPage::replay},
-                {"Camera", SmvmPage::camera},
-                {"Campath", SmvmPage::campath},
-                {"Visuals", SmvmPage::visuals},
-                {"Capture", SmvmPage::capture},
-            }};
-            for (const auto& item : items) {
-                if (NavigationItem(item.label, state.page == item.page))
-                    state.page = item.page;
-            }
-            const auto rail_height = ImGui::GetWindowHeight();
-            ImGui::SetCursorPosY(std::max(ImGui::GetCursorPosY(),
-                                          rail_height - (34.0F * scale) - (12.0F * scale)));
-            if (NavigationItem("Settings", state.page == SmvmPage::settings))
-                state.page = SmvmPage::settings;
-        }
-        ImGui::EndChild();
-        const auto nav_min = ImGui::GetItemRectMin();
-        const auto nav_max = ImGui::GetItemRectMax();
-        ImGui::GetWindowDrawList()->AddLine(
-            ImVec2(nav_max.x, nav_min.y), ImVec2(nav_max.x, nav_max.y),
-            smvm_theme::colors::kHairline);
-        ImGui::SameLine();
-        // Every page owns its own scroll region. Nested list children consume
-        // the wheel while hovered; otherwise the current page scrolls without
-        // moving the shell or leaking wheel input to Deadlock/manual FOV.
-        ImGui::BeginChild("##content", ImVec2(0.0F, body_height), ImGuiChildFlags_None);
-        ImGui::Dummy(ImVec2(1.0F, 2.0F));
-        ImGui::Indent(8.0F * scale);
-        ImGui::PushID(static_cast<int>(state.page));
-        switch (state.page) {
-            case SmvmPage::replay: DrawReplayPage(context); break;
-            case SmvmPage::camera: DrawCameraPage(context); break;
-            case SmvmPage::campath: DrawCampathPage(context); break;
-            case SmvmPage::visuals: DrawVisualsPage(context); break;
-            case SmvmPage::capture: DrawCapturePage(); break;
-            case SmvmPage::settings: DrawSettingsPage(context); break;
-        }
-        ImGui::PopID();
-        ImGui::Unindent(8.0F * scale);
-        ImGui::EndChild();
-        ImGui::PopStyleColor();
-
-        DrawModals(context);
+        // The owner is restarting the product UI. Keep one empty page and do
+        // not render any of the previous workflow, document, or settings UI.
+        state.page = SmvmPage::campath;
+        state.open_save_as_modal = false;
+        state.open_load_picker = false;
+        state.picker_requested_list = false;
+        state.confirm_pending = false;
+        state.confirm_action = SmvmConfirmAction::none;
+        state.confirm_load_index = -1;
 
         // Clamp fully inside the viewport and remember geometry (logical px).
         position = ImGui::GetWindowPos();
@@ -1820,98 +1744,363 @@ void DrawMinimalPill(const FrameContext& context) noexcept {
         smvm_theme::colors::kText, text.data());
 }
 
-void DrawReplayBar(const FrameContext& context) noexcept {
+void DrawCampathMiniMenu(const FrameContext& context) noexcept {
+    if (context.params->path_header == nullptr || context.params->keyframes == nullptr ||
+        !ShouldShowCampathPlacementList(
+            context.params->has_path,
+            context.params->path_header->keyframe_count))
+        return;
+
+    const auto count = std::min<std::uint32_t>(
+        context.params->path_header->keyframe_count,
+        static_cast<std::uint32_t>(kMaxCampathKeyframes));
+    if (count == 0)
+        return;
+
     const auto& snapshot = *context.snapshot;
-    auto& state = *context.state;
-    const auto scale = static_cast<float>(snapshot.replay_bar_scale);
-    const auto opacity = static_cast<float>(snapshot.replay_bar_opacity);
-    const auto width = std::min(context.params->viewport_width - (48.0F * scale), 980.0F * scale);
-    const auto height = 104.0F * scale;
-    const auto x = (context.params->viewport_width - width) * 0.5F;
-    const auto y = snapshot.replay_bar_anchor == SmvmReplayBarAnchor::top
-        ? 24.0F * scale
-        : context.params->viewport_height - height - (24.0F * scale);
-    // Mask the native replay strip slightly beyond the replacement controls so
-    // responsive resizing cannot leak Deadlock labels around the panel edge.
-    const auto mask_padding = 12.0F * scale;
-    const auto mask_alpha = static_cast<ImU32>(
-        static_cast<float>((smvm_theme::colors::kShell >> 24) & 0xFFu) * opacity);
-    const auto mask_color = (smvm_theme::colors::kShell & 0x00FFFFFFu) | (mask_alpha << 24);
-    auto* background = ImGui::GetBackgroundDrawList();
-    background->AddRectFilled(
-        ImVec2(x - mask_padding, y - mask_padding),
-        ImVec2(x + width + mask_padding, y + height + mask_padding),
-        mask_color, 8.0F * scale);
-    background->AddRect(
-        ImVec2(x - mask_padding, y - mask_padding),
-        ImVec2(x + width + mask_padding, y + height + mask_padding),
-        smvm_theme::colors::kHairline, 8.0F * scale);
+    const auto scale = smvm_theme::GetScale();
+    const auto width = 196.0F * scale;
+    const auto row_height = 24.0F * scale;
+    // Leave a full extra row of breathing room around the list and actions.
+    // The previous base height technically fit the rows but clipped the first
+    // entry once the header, separators, and footer buttons were laid out.
+    const auto base_height = 108.0F * scale;
+    const auto available_height = std::max(
+        106.0F * scale,
+        context.params->viewport_height - (106.0F * scale));
+    auto visible_rows = static_cast<std::uint32_t>(std::max(
+        1.0F,
+        std::floor((available_height - base_height) / row_height)));
+    visible_rows = std::min(visible_rows, count);
+    const auto height = base_height + (visible_rows * row_height);
+    const auto x = 16.0F * scale;
+    const auto centered_y = (context.params->viewport_height - height) * 0.5F;
+    const auto y = std::max(16.0F * scale, centered_y);
+
     ImGui::SetNextWindowPos(ImVec2(x, y), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(width, height), ImGuiCond_Always);
-    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, opacity);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.96F);
+    ImGui::PushStyleVar(
+        ImGuiStyleVar_WindowPadding,
+        ImVec2(12.0F * scale, 9.0F * scale));
+    auto window_flags =
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+        ImGuiWindowFlags_NoSavedSettings;
+    if (!context.params->menu_open)
+        window_flags |= ImGuiWindowFlags_NoInputs;
     const auto open = ImGui::Begin(
-        "##smvm_replay_bar", nullptr,
+        "##smvm_campath_mini_menu",
+        nullptr,
+        window_flags);
+    if (open) {
+        const auto& fonts = smvm_theme::GetFonts();
+        ImGui::PushFont(fonts.section);
+        ImGui::TextColored(smvm_theme::Vec4(smvm_theme::colors::kAccent), "CAMPATHS");
+        ImGui::PopFont();
+
+        std::array<char, 32> count_text{};
+        static_cast<void>(std::snprintf(
+            count_text.data(), count_text.size(), "%u PLACED", count));
+        const auto count_width = ImGui::CalcTextSize(count_text.data()).x;
+        ImGui::SameLine();
+        ImGui::SetCursorPosX(width - (12.0F * scale) - count_width);
+        ImGui::TextColored(smvm_theme::Vec4(smvm_theme::colors::kMuted), "%s", count_text.data());
+        ImGui::Separator();
+
+        const auto list_height = visible_rows * row_height;
+        ImGui::BeginChild(
+            "##campath_rows",
+            ImVec2(0.0F, list_height),
+            false,
+            ImGuiWindowFlags_NoBackground);
+        for (std::uint32_t index = 0; index < count; ++index) {
+            const auto selected = snapshot.selected_keyframe == static_cast<std::int32_t>(index);
+            std::array<char, 32> label{};
+            std::array<char, 32> tick{};
+            static_cast<void>(std::snprintf(label.data(), label.size(), "Campath %u", index + 1));
+            static_cast<void>(std::snprintf(
+                tick.data(), tick.size(), "T %lld",
+                static_cast<long long>(context.params->keyframes[index].demo_tick)));
+            ImGui::PushID(static_cast<int>(index));
+            if (ImGui::Selectable(
+                    "##campath_row",
+                    selected,
+                    ImGuiSelectableFlags_None,
+                    ImVec2(ImGui::GetContentRegionAvail().x, row_height)) &&
+                context.params->menu_open) {
+                QueueAction(
+                    context,
+                    SmvmActionType::select_keyframe,
+                    static_cast<std::int32_t>(index));
+            }
+            const auto row_min = ImGui::GetItemRectMin();
+            const auto row_max = ImGui::GetItemRectMax();
+            auto* draw = ImGui::GetWindowDrawList();
+            const auto text_y = row_min.y + (4.0F * scale);
+            draw->AddText(
+                ImVec2(row_min.x + (4.0F * scale), text_y),
+                selected ? smvm_theme::colors::kAccent : smvm_theme::colors::kText,
+                label.data());
+            const auto tick_width = ImGui::CalcTextSize(tick.data()).x;
+            draw->AddText(
+                ImVec2(row_max.x - tick_width - (4.0F * scale), text_y),
+                smvm_theme::colors::kMuted,
+                tick.data());
+            if (selected && !context.params->menu_open)
+                ImGui::SetScrollHereY(0.5F);
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
+
+        ImGui::Separator();
+        const auto playing = (snapshot.flags & smvm_snapshot_campath_playing) != 0;
+        const auto selected = snapshot.selected_keyframe >= 0 &&
+            snapshot.selected_keyframe < static_cast<std::int32_t>(count);
+        const auto button_width =
+            (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5F;
+        if (smvm_theme::Button(
+                "Delete",
+                context.params->menu_open && selected && !playing,
+                ImVec2(button_width, 0.0F))) {
+            QueueAction(
+                context,
+                SmvmActionType::delete_keyframe,
+                snapshot.selected_keyframe);
+        }
+        ImGui::SameLine();
+        if (smvm_theme::Button(
+                "Clear All",
+                context.params->menu_open && !playing,
+                ImVec2(button_width, 0.0F))) {
+            QueueAction(context, SmvmActionType::clear_path);
+        }
+    }
+    ImGui::End();
+    ImGui::PopStyleVar(2);
+}
+
+void DrawHostTimescaleControls(const FrameContext& context) noexcept {
+    auto& state = *context.state;
+    const auto& snapshot = *context.snapshot;
+    const auto scale = smvm_theme::GetScale();
+    if (!state.host_timescale_initialized) {
+        state.host_timescale_percent = static_cast<float>(
+            HostTimescaleFromPercent(snapshot.timescale * 100.0) * 100.0);
+        state.host_timescale_initialized = true;
+    }
+
+    ImGui::PushFont(smvm_theme::GetFonts().hint);
+    ImGui::TextColored(
+        smvm_theme::Vec4(smvm_theme::colors::kMuted),
+        "HOST TIMESCALE");
+    ImGui::PopFont();
+
+    constexpr std::array<double, 5> presets{0.25, 0.5, 1.0, 2.0, 4.0};
+    constexpr std::array<const char*, 5> labels{"1/4x", "1/2x", "1x", "2x", "4x"};
+    for (std::size_t index = 0; index < presets.size(); ++index) {
+        ImGui::SameLine();
+        const auto active = std::abs(snapshot.timescale - presets[index]) < 0.001;
+        const auto clicked = active
+            ? smvm_theme::PrimaryButton(labels[index], true, ImVec2(42.0F * scale, 0.0F))
+            : smvm_theme::Button(labels[index], true, ImVec2(42.0F * scale, 0.0F));
+        if (clicked && QueueAction(
+                context,
+                SmvmActionType::set_timescale,
+                -1,
+                -1,
+                presets[index])) {
+            state.host_timescale_percent = static_cast<float>(presets[index] * 100.0);
+        }
+    }
+
+    ImGui::SameLine();
+    ImGui::PushFont(smvm_theme::GetFonts().hint);
+    ImGui::TextColored(smvm_theme::Vec4(smvm_theme::colors::kMuted), "CUSTOM");
+    ImGui::PopFont();
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(72.0F * scale);
+    ImGui::PushFont(smvm_theme::GetFonts().mono);
+    const auto entered = ImGui::InputFloat(
+        "##host_timescale_percent",
+        &state.host_timescale_percent,
+        0.0F,
+        0.0F,
+        "%.0f%%",
+        ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::PopFont();
+    smvm_theme::Tooltip("Custom host_timescale percentage (1% to 1000%).");
+    ImGui::SameLine();
+    const auto apply = smvm_theme::Button("Apply", true, ImVec2(52.0F * scale, 0.0F));
+    if (entered || apply) {
+        const auto timescale = HostTimescaleFromPercent(state.host_timescale_percent);
+        state.host_timescale_percent = static_cast<float>(timescale * 100.0);
+        QueueAction(context, SmvmActionType::set_timescale, -1, -1, timescale);
+    }
+}
+
+void DrawCinematicStartPrompt(const FrameContext& context) noexcept {
+    if (!context.params->cinematic_start_ready)
+        return;
+
+    constexpr auto text = "SPACE TO START CINEMATIC";
+    const auto scale = smvm_theme::GetScale();
+    const auto& fonts = smvm_theme::GetFonts();
+    const auto font_size = fonts.title->FontSize * 1.65F;
+    const auto text_size = fonts.title->CalcTextSizeA(font_size, 100000.0F, 0.0F, text);
+    const auto band_height = text_size.y + (36.0F * scale);
+    const auto band_y = (context.params->viewport_height - band_height) * 0.44F;
+    const auto text_position = ImVec2(
+        (context.params->viewport_width - text_size.x) * 0.5F,
+        band_y + ((band_height - text_size.y) * 0.5F));
+    auto* foreground = ImGui::GetForegroundDrawList();
+    foreground->AddRectFilled(
+        ImVec2(0.0F, band_y),
+        ImVec2(context.params->viewport_width, band_y + band_height),
+        smvm_theme::colors::kShell);
+    foreground->AddLine(
+        ImVec2(0.0F, band_y),
+        ImVec2(context.params->viewport_width, band_y),
+        smvm_theme::colors::kHairline,
+        scale);
+    foreground->AddLine(
+        ImVec2(0.0F, band_y + band_height),
+        ImVec2(context.params->viewport_width, band_y + band_height),
+        smvm_theme::colors::kHairline,
+        scale);
+    foreground->AddText(
+        fonts.title,
+        font_size,
+        text_position,
+        smvm_theme::colors::kAccent,
+        text);
+}
+
+void DrawReplayTimeline(const FrameContext& context) noexcept {
+    const auto& snapshot = *context.snapshot;
+    auto& state = *context.state;
+    // The restart timeline has one stable layout. Legacy replay-bar scale,
+    // opacity, and anchor preferences remain protocol-compatible but no longer
+    // reshape this product surface.
+    const auto scale = smvm_theme::GetScale();
+    constexpr auto opacity = 0.96F;
+    const auto geometry = ComputeReplayTimelineGeometry(
+        context.params->viewport_width,
+        context.params->viewport_height,
+        scale,
+        false);
+    ImGui::SetNextWindowPos(ImVec2(geometry.x, geometry.y), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(geometry.width, geometry.height), ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, opacity);
+    auto window_flags =
         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar |
-        ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoSavedSettings);
+        ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoSavedSettings;
+    if (!context.params->menu_open)
+        window_flags |= ImGuiWindowFlags_NoInputs;
+    const auto open = ImGui::Begin(
+        "##smvm_replay_timeline", nullptr, window_flags);
     if (open) {
         const auto paused = (snapshot.flags & smvm_snapshot_paused) != 0;
-        if (smvm_theme::PrimaryButton(paused ? "Play" : "Pause", true, ImVec2(66.0F * scale, 0.0F)))
-            QueueAction(context, SmvmActionType::toggle_replay_pause);
+        const auto pause_known = (snapshot.flags & smvm_snapshot_pause_known) != 0;
+        if (smvm_theme::PrimaryButton(
+                paused ? "Resume" : "Pause",
+                pause_known,
+                ImVec2(72.0F * scale, 0.0F))) {
+            // Index 1 means reach paused state; 0 means reach playing state.
+            // The host keeps -1 as the legacy toggle value.
+            QueueAction(
+                context,
+                SmvmActionType::toggle_replay_pause,
+                DesiredReplayPauseActionIndex(paused));
+        }
+        const auto playing = (snapshot.flags & smvm_snapshot_campath_playing) != 0;
+        const auto can_add_keyframe =
+            (snapshot.flags & smvm_snapshot_camera_readable) != 0 &&
+            (snapshot.flags & smvm_snapshot_manual_camera_requested) != 0 &&
+            (snapshot.flags & smvm_snapshot_manual_camera_active) != 0 &&
+            !playing &&
+            snapshot.observer_mode == 4;
+        const auto offer_cinematic = ShouldOfferPlayCinematic(snapshot.keyframe_count);
+        const auto can_play_cinematic =
+            (snapshot.flags & smvm_snapshot_internal_enabled) != 0 &&
+            (snapshot.flags & smvm_snapshot_replay_active) != 0 &&
+            (snapshot.flags & smvm_snapshot_camera_readable) != 0 &&
+            !playing;
         ImGui::SameLine();
-        if (smvm_theme::Button("-1", snapshot.current_tick > 0, ImVec2(42.0F * scale, 0.0F)))
-            QueueAction(context, SmvmActionType::step_back);
-        ImGui::SameLine();
-        if (smvm_theme::Button("+1", snapshot.current_tick >= 0, ImVec2(42.0F * scale, 0.0F)))
-            QueueAction(context, SmvmActionType::step_forward);
-        constexpr std::array<double, 5> speeds{0.25, 0.5, 1.0, 2.0, 4.0};
-        for (const auto speed : speeds) {
-            ImGui::SameLine();
-            std::array<char, 16> label{};
-            static_cast<void>(std::snprintf(label.data(), label.size(), "%gx", speed));
-            const auto active = std::abs(snapshot.timescale - speed) < 0.001;
-            const auto clicked = active
-                ? smvm_theme::PrimaryButton(label.data(), true, ImVec2(48.0F * scale, 0.0F))
-                : smvm_theme::Button(label.data(), true, ImVec2(48.0F * scale, 0.0F));
-            if (clicked) {
-                if (!active)
-                    QueueAction(context, SmvmActionType::set_timescale, -1, -1, speed);
+        if (offer_cinematic) {
+            if (smvm_theme::PrimaryButton(
+                    playing ? "Stop Cinematic" : "Play Cinematic",
+                    playing || can_play_cinematic,
+                    ImVec2(118.0F * scale, 0.0F))) {
+                if (playing) {
+                    QueueAction(context, SmvmActionType::stop_campath);
+                } else if (QueuePathPlayback(context, SmvmActionType::play_from_start)) {
+                    SmvmCloseMenu();
+                }
             }
+        } else if (smvm_theme::Button(
+                       "Add Keyframe", can_add_keyframe, ImVec2(118.0F * scale, 0.0F))) {
+            RequestCapture(context);
         }
-        ImGui::SameLine();
-        ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), width - (226.0F * scale)));
-        if (smvm_theme::Button("Menu", true, ImVec2(64.0F * scale, 0.0F)))
-            SmvmOpenMenu();
-        ImGui::SameLine();
-        if (smvm_theme::Button("Clean", true, ImVec2(64.0F * scale, 0.0F)))
-        {
-            state.clean_hint_pending = true;
-            state.clean_hint_until_ms = GetTickCount64() + 2400;
-        }
-        ImGui::SameLine();
-        if (smvm_theme::Button("Restore", true, ImVec2(72.0F * scale, 0.0F)))
-            QueueAction(context, SmvmActionType::restore_deadlock_ui);
 
         if (!state.replay_scrubbing)
             state.replay_scrub_tick = std::max<std::int64_t>(snapshot.current_tick, 0);
         const std::int64_t minimum = 0;
         const auto maximum = std::max<std::int64_t>(snapshot.total_ticks, 1);
-        ImGui::SetNextItemWidth(width - (188.0F * scale));
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(std::max(96.0F * scale, geometry.width - (440.0F * scale)));
         if (ImGui::SliderScalar(
                 "##replay_progress", ImGuiDataType_S64, &state.replay_scrub_tick,
                 &minimum, &maximum, "", ImGuiSliderFlags_AlwaysClamp))
             state.replay_scrubbing = true;
+        const auto slider_min = ImGui::GetItemRectMin();
+        const auto slider_max = ImGui::GetItemRectMax();
+        if (context.params->has_path && context.params->path_header != nullptr &&
+            context.params->keyframes != nullptr && snapshot.total_ticks > 0) {
+            const auto count = std::min<std::uint32_t>(
+                context.params->path_header->keyframe_count,
+                static_cast<std::uint32_t>(kMaxCampathKeyframes));
+            auto* draw = ImGui::GetWindowDrawList();
+            for (std::uint32_t index = 0; index < count; ++index) {
+                const auto fraction = std::clamp(
+                    static_cast<double>(context.params->keyframes[index].demo_tick) /
+                        static_cast<double>(snapshot.total_ticks),
+                    0.0,
+                    1.0);
+                const auto marker_x = slider_min.x +
+                    static_cast<float>(fraction) * (slider_max.x - slider_min.x);
+                const auto selected = snapshot.selected_keyframe == static_cast<std::int32_t>(index);
+                draw->AddLine(
+                    ImVec2(marker_x, slider_min.y - (2.0F * scale)),
+                    ImVec2(marker_x, slider_max.y + (2.0F * scale)),
+                    selected ? smvm_theme::colors::kAccent : smvm_theme::colors::kMuted,
+                    selected ? 2.0F * scale : 1.0F * scale);
+            }
+        }
         if (state.replay_scrubbing && ImGui::IsItemDeactivatedAfterEdit()) {
-            QueueAction(context, SmvmActionType::seek_tick, -1, state.replay_scrub_tick);
+            QueueAction(
+                context,
+                SmvmActionType::seek_tick,
+                -1,
+                ClampReplayTimelineTick(state.replay_scrub_tick, snapshot.total_ticks));
             state.replay_scrubbing = false;
         }
         ImGui::SameLine();
-        std::array<char, 64> tick_text{};
+        std::array<char, 32> current_tick_hint{};
         static_cast<void>(std::snprintf(
-            tick_text.data(), tick_text.size(), "%lld / %lld",
-            static_cast<long long>(std::max<std::int64_t>(snapshot.current_tick, 0)),
+            current_tick_hint.data(), current_tick_hint.size(), "%lld",
+            static_cast<long long>(std::max<std::int64_t>(snapshot.current_tick, 0))));
+        SeekToTickField(context, current_tick_hint.data(), 82.0F, true);
+        ImGui::SameLine();
+        std::array<char, 40> total_tick_text{};
+        static_cast<void>(std::snprintf(
+            total_tick_text.data(), total_tick_text.size(), "/ %lld",
             static_cast<long long>(std::max<std::int64_t>(snapshot.total_ticks, 0))));
-        ImGui::TextUnformatted(tick_text.data());
+        ImGui::TextUnformatted(total_tick_text.data());
+
+        DrawHostTimescaleControls(context);
     }
     ImGui::End();
     ImGui::PopStyleVar();
@@ -1939,13 +2128,6 @@ void DrawStatusHud(const FrameContext& context) noexcept {
     auto vertical_position = bottom
         ? context.params->viewport_height - margin
         : margin;
-    if (snapshot.deadlock_ui_mode == DeadlockUiMode::smvm_replay_ui) {
-        const auto replay_clearance = 140.0F * static_cast<float>(snapshot.replay_bar_scale);
-        if (bottom && snapshot.replay_bar_anchor == SmvmReplayBarAnchor::bottom)
-            vertical_position -= replay_clearance;
-        else if (!bottom && snapshot.replay_bar_anchor == SmvmReplayBarAnchor::top)
-            vertical_position += replay_clearance;
-    }
     ImGui::SetNextWindowPos(
         ImVec2(right ? context.params->viewport_width - margin : margin,
                vertical_position),
@@ -1988,7 +2170,7 @@ void DrawStatusHud(const FrameContext& context) noexcept {
                 segment_count > 0 ? segment + 1 : 0, segment_count, kMiddleDot, progress * 100.0,
                 kMiddleDot, camera.fov, kDegree, kMiddleDot, camera.roll, kDegree));
             ImGui::PushFont(smvm_theme::GetFonts().section);
-            ImGui::TextColored(smvm_theme::Vec4(smvm_theme::colors::kAccent), "CAMPATH");
+            ImGui::TextColored(smvm_theme::Vec4(smvm_theme::colors::kAccent), "PATH");
             ImGui::PopFont();
         } else {
             static_cast<void>(std::snprintf(
@@ -2011,6 +2193,7 @@ void DrawStatusHud(const FrameContext& context) noexcept {
 
 void DrawCleanFootageHint(const FrameContext& context) noexcept {
     auto& state = *context.state;
+    const auto& snapshot = *context.snapshot;
     if (!state.clean_hint_pending)
         return;
     const auto now = GetTickCount64();
@@ -2034,9 +2217,17 @@ void DrawCleanFootageHint(const FrameContext& context) noexcept {
     ImGui::PushFont(smvm_theme::GetFonts().section);
     ImGui::TextUnformatted("CLEAN FOOTAGE ENABLED");
     ImGui::PopFont();
-    SecondaryText("F10 - Restore Movie UI");
-    SecondaryText("TAB - Restore and Open Menu");
-    SecondaryText("F9 - Emergency Restore");
+    const auto clean_key = FormatInput(snapshot.clean_view_key);
+    const auto menu_key = FormatInput(snapshot.menu_key);
+    std::array<char, 96> hint{};
+    static_cast<void>(std::snprintf(
+        hint.data(), hint.size(), "%s - Restore Movie UI", clean_key.data()));
+    SecondaryText(hint.data());
+    hint = {};
+    static_cast<void>(std::snprintf(
+        hint.data(), hint.size(), "%s - Restore and Open Menu", menu_key.data()));
+    SecondaryText(hint.data());
+    SecondaryText("F9 - Emergency Exit + Restore");
     ImGui::End();
 }
 
@@ -2045,45 +2236,36 @@ void DrawCleanFootageHint(const FrameContext& context) noexcept {
 void DrawFrame(const SmvmUiFrameParams& params, SmvmUiState& state) noexcept {
     if (params.snapshot == nullptr)
         return;
+    const auto show_timeline = ShouldShowReplayTimeline(
+        (params.snapshot->flags & smvm_snapshot_internal_enabled) != 0,
+        (params.snapshot->flags & smvm_snapshot_replay_active) != 0,
+        params.snapshot->deadlock_ui_mode == DeadlockUiMode::smvm_replay_ui);
+    if ((params.snapshot->flags & smvm_snapshot_replay_active) == 0) {
+        state.replay_seek_pending = false;
+        state.replay_seek_retry_at_ms = 0;
+    }
+    if (!show_timeline || !params.menu_open)
+        SmvmSetReplayTickInputActive(false);
     if (params.documents != nullptr) {
         state.documents = *params.documents;
         state.documents_valid = true;
     }
     FrameContext context{&params, &state, params.snapshot};
-    if (state.free_camera_activation_pending) {
-        const auto now = GetTickCount64();
-        const auto manual_active =
-            (params.snapshot->flags & smvm_snapshot_manual_camera_active) != 0;
-        const auto manual_requested =
-            (params.snapshot->flags & smvm_snapshot_manual_camera_requested) != 0;
-        if (manual_active) {
-            state.free_camera_activation_pending = false;
-            state.free_camera_activation_started_ms = 0;
-            SmvmCloseMenu();
-            return;
-        }
-        if (!manual_requested && now - state.free_camera_activation_started_ms >= 8000) {
-            state.free_camera_activation_pending = false;
-            state.free_camera_activation_started_ms = 0;
-            state.free_camera_activation_error_until_ms = now + 5000;
-        }
+    state.open_save_as_modal = false;
+    state.open_load_picker = false;
+    state.picker_requested_list = false;
+    state.confirm_pending = false;
+    state.confirm_action = SmvmConfirmAction::none;
+    state.clean_hint_pending = false;
+    state.clean_hint_until_ms = 0;
+    state.free_camera_activation_pending = false;
+    state.free_camera_activation_started_ms = 0;
+    state.free_camera_activation_error_until_ms = 0;
+    if (show_timeline) {
+        DrawCampathMiniMenu(context);
+        DrawReplayTimeline(context);
+        DrawCinematicStartPrompt(context);
     }
-    if (params.menu_open) {
-        DrawShell(context);
-    } else if (params.snapshot->deadlock_ui_mode == DeadlockUiMode::smvm_replay_ui) {
-        DrawReplayBar(context);
-    } else {
-        state.open_save_as_modal = false;
-        state.open_load_picker = false;
-        state.picker_requested_list = false;
-        state.confirm_pending = false;
-        state.confirm_action = SmvmConfirmAction::none;
-        DrawMinimalPill(context);
-    }
-    if (!params.menu_open)
-        DrawStatusHud(context);
-    DrawCleanFootageHint(context);
-    DrawToasts(context);
 }
 
 } // namespace deadlock_mvm::smvm_ui

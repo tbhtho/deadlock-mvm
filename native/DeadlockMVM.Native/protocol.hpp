@@ -287,6 +287,8 @@ struct SmvmCaptureAvailability final {
     bool native_backend_available;
     bool replay_available;
     bool free_roam;
+    bool manual_camera_requested;
+    bool manual_camera_active;
     bool snapshot_fresh;
     bool camera_readable;
     bool hook_frame_fresh;
@@ -301,6 +303,8 @@ struct SmvmCaptureAvailability final {
     if (!availability.replay_available)
         return SmvmCaptureRejection::replay_unavailable;
     if (!availability.free_roam)
+        return SmvmCaptureRejection::not_in_free_roam;
+    if (!availability.manual_camera_requested || !availability.manual_camera_active)
         return SmvmCaptureRejection::not_in_free_roam;
     if (!availability.snapshot_fresh)
         return SmvmCaptureRejection::snapshot_stale;

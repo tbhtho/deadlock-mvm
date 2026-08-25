@@ -497,7 +497,7 @@ public sealed class MainViewModel : ViewModelBase
 
         var gameArguments = CommandLine
             .Tokenize(ExtraArguments)
-            .Concat(new[] { "+playdemo", replay.GamePath })
+            .Concat(ReplayCommands.StartDemoPaused(replay.GamePath))
             .ToArray();
         var steamExecutable = ResolveSteamExecutable();
         var launchThroughSteam = steamExecutable is not null;

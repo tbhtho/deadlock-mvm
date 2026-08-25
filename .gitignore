@@ -31,6 +31,12 @@ console.log
 *.log
 *.tmp
 
+## Local task/session exports (not product source)
+ACTION-TASKS.md
+*-export-session_*.md
+previous_chat.md
+session-*.md
+
 ## Live-probe output artifacts
 tools/out/
 

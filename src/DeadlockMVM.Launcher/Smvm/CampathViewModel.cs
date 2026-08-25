@@ -30,7 +30,7 @@ public sealed class CampathViewModel : INotifyPropertyChanged
     private readonly System.Windows.Threading.Dispatcher? _dispatcher;
     private CampathKeyframe? _selectedKeyframe;
     private CampathDocumentInfo? _selectedDocument;
-    private string _status = "Fly in Free Roam and add camera keyframes.";
+    private string _status = "Pause the replay, enter Free Camera, and add your first keyframe.";
     private string _pathName = "Untitled Path";
     private string? _currentFilePath;
     private bool _isDraft;
@@ -38,8 +38,8 @@ public sealed class CampathViewModel : INotifyPropertyChanged
     private bool _suppressAutosave;
     private bool _operationInFlight;
     private DateTime _clearConfirmationDeadline;
-    private CampathInterpolationMode _interpolationMode = CampathInterpolationMode.Linear;
-    private CampathEasingMode _easingMode = CampathEasingMode.Linear;
+    private CampathInterpolationMode _interpolationMode = CampathInterpolationMode.Smooth;
+    private CampathEasingMode _easingMode = CampathEasingMode.EaseInOut;
     private CampathEndBehavior _endBehavior = CampathEndBehavior.StopAndRelease;
     private CampathReplayIdentifier? _lastReplayIdentifier;
     private readonly Stack<EditState> _undo = [];
@@ -223,17 +223,17 @@ public sealed class CampathViewModel : INotifyPropertyChanged
     {
         Status = rejection switch
         {
-            SmvmCaptureRejection.ReplayUnavailable => "Keyframe capture rejected: replay playback is unavailable.",
-            SmvmCaptureRejection.NotInFreeRoam => "Keyframe capture rejected: enter SMVM Free Camera again.",
-            SmvmCaptureRejection.CameraUnreadable => "Keyframe capture rejected: the rendered camera is not readable.",
-            SmvmCaptureRejection.NativeBackendUnavailable => "Keyframe capture rejected: the native camera backend is unavailable.",
-            SmvmCaptureRejection.CampathOwnsCamera => "Keyframe capture rejected: stop Campath playback first.",
-            SmvmCaptureRejection.SnapshotStale => "Keyframe capture rejected: the editor snapshot is stale.",
-            SmvmCaptureRejection.HookFrameStale => "Keyframe capture rejected: no fresh camera hook frame arrived.",
-            SmvmCaptureRejection.CaptureAlreadyPending => "Keyframe capture rejected: another capture is already pending.",
-            SmvmCaptureRejection.ConnectionEpochChanged => "Keyframe capture rejected: the native connection changed.",
-            SmvmCaptureRejection.InvalidSample => "Keyframe capture rejected: the camera sample was invalid.",
-            _ => "Keyframe capture rejected for an unclassified native reason. Check Advanced diagnostics.",
+            SmvmCaptureRejection.ReplayUnavailable => "Start a replay and try again.",
+            SmvmCaptureRejection.NotInFreeRoam => "Enter Free Camera and try again.",
+            SmvmCaptureRejection.CampathOwnsCamera => "Stop the path before changing keyframes.",
+            SmvmCaptureRejection.CaptureAlreadyPending => "Please wait for the current keyframe to finish.",
+            SmvmCaptureRejection.CameraUnreadable or
+            SmvmCaptureRejection.NativeBackendUnavailable or
+            SmvmCaptureRejection.SnapshotStale or
+            SmvmCaptureRejection.HookFrameStale or
+            SmvmCaptureRejection.ConnectionEpochChanged or
+            SmvmCaptureRejection.InvalidSample => "Free Camera is not ready yet. Try again.",
+            _ => "The keyframe could not be added. Try again.",
         };
         OnEditorStateChanged();
     }
@@ -248,7 +248,7 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         !string.IsNullOrWhiteSpace(_controller.State.ReplayName) && _controller.State.CurrentTick is not null,
         _native.Available,
         _controller.State.CurrentTick is not null,
-        _camera.Selection.Mode == SpecCameraMode.FreeRoam,
+        _native.ManualCameraActive,
         PathCameraOwned,
         _operationInFlight));
 
@@ -257,8 +257,8 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         if (!CanAdd())
         {
             Status = PathCameraOwned
-                ? "Add Keyframe is disabled while Campath owns the camera."
-                : "Add Keyframe needs an active replay, Free Roam, and a readable native camera.";
+                ? "Stop the path before adding a keyframe."
+                : "Enter Free Camera and try again.";
             return;
         }
 
@@ -271,15 +271,17 @@ public sealed class CampathViewModel : INotifyPropertyChanged
     /// <summary>Adds an exact camera-hook sample without recapturing through the external UI.</summary>
     public void AddAuthoritativeKeyframe(CampathKeyframe keyframe, bool fromHotkey = true)
     {
-        if (!keyframe.IsValid || PathCameraOwned || _operationInFlight ||
+        if (!keyframe.IsValid || !_native.ManualCameraActive || PathCameraOwned || _operationInFlight ||
             (Keyframes.Count >= CampathPath.MaxKeyframes &&
              Keyframes.All(existing => existing.DemoTick != keyframe.DemoTick)))
         {
             Status = PathCameraOwned
-                ? "Add Keyframe is disabled while Campath owns the camera."
+                ? "Stop the path before adding a keyframe."
                 : Keyframes.Count >= CampathPath.MaxKeyframes
-                    ? $"Campath is limited to {CampathPath.MaxKeyframes} keyframes."
-                    : "The in-process camera sample was invalid or the editor is busy.";
+                    ? $"A path can contain up to {CampathPath.MaxKeyframes} keyframes."
+                    : !_native.ManualCameraActive
+                        ? "Enter Free Camera and try again."
+                        : "The keyframe could not be added. Try again.";
             return;
         }
         PushHistory();
@@ -288,11 +290,7 @@ public sealed class CampathViewModel : INotifyPropertyChanged
             _isDraft = true; // First keyframe with no path loaded creates an Untitled draft.
         var replaced = CampathKeyframeEditor.Upsert(Keyframes, keyframe);
         SelectedKeyframe = keyframe;
-        Status = !replaced
-            ? startedDraft
-                ? $"Draft created — Keyframe added — Tick {keyframe.DemoTick}"
-                : $"Keyframe added — Tick {keyframe.DemoTick}"
-            : $"Keyframe updated — Tick {keyframe.DemoTick}";
+        Status = replaced ? "Keyframe replaced." : "Keyframe added.";
         _log.Info($"Campath: {Status}{(fromHotkey ? " (hotkey)" : string.Empty)}");
         OnCollectionChanged();
         Autosave();
@@ -311,7 +309,7 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         var index = Keyframes.IndexOf(selected);
         if (index < 0 || PathCameraOwned)
         {
-            Status = "The selected keyframe changed while the camera was being captured; update cancelled.";
+            Status = "That keyframe changed before it could be replaced. Try again.";
             return;
         }
 
@@ -319,7 +317,7 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         var updated = new CampathKeyframe(selected.DemoTick, captured.Camera);
         Keyframes[index] = updated;
         SelectedKeyframe = updated;
-        Status = $"Updated camera at tick {updated.DemoTick}; timing kept unchanged.";
+        Status = "Keyframe replaced with the current view.";
         Autosave();
         OnEditorStateChanged();
     }
@@ -330,13 +328,13 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         RaiseCommandStates();
         try
         {
-            Status = "Capturing current camera…";
+            Status = "Adding keyframe...";
             return await _capture.CaptureAsync().ConfigureAwait(true);
         }
         catch (Exception ex)
         {
             _log.Warn($"Campath passive capture failed: {ex.Message}");
-            Status = ex.Message;
+            Status = "The keyframe could not be added. Enter Free Camera and try again.";
             return null;
         }
         finally
@@ -353,13 +351,20 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         try
         {
             var path = new CampathPath(Keyframes, InterpolationMode, EasingMode);
-            await _native.PlayCampathAsync(path, mode, EndBehavior).ConfigureAwait(true);
-            Status = $"Playing {InterpolationMode.ToString().ToUpperInvariant()} path {mode} across {Keyframes.Count} keyframes.";
+            // The owner-facing workflow always returns to Free Camera when the
+            // path finishes. Older saved files may still carry the legacy hold
+            // option, but that implementation detail no longer changes normal
+            // playback behavior.
+            await _native.PlayCampathAsync(
+                path,
+                mode,
+                CampathEndBehavior.StopAndRelease).ConfigureAwait(true);
+            Status = "Playing path.";
         }
         catch (Exception ex)
         {
             _log.Warn($"Campath play failed: {ex.Message}");
-            Status = ex.Message;
+            Status = "The path could not play. Enter Free Camera and try again.";
         }
         finally
         {
@@ -377,12 +382,12 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         try
         {
             await _native.GoToKeyframeAsync(selected).ConfigureAwait(true);
-            Status = $"At keyframe tick {selected.DemoTick}; camera held by MVM.";
+            Status = "Free Camera moved to the selected keyframe.";
         }
         catch (Exception ex)
         {
             _log.Warn($"Campath Go To failed: {ex.Message}");
-            Status = ex.Message;
+            Status = "Free Camera could not move to that keyframe. Try again.";
         }
         finally
         {
@@ -398,12 +403,12 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         try
         {
             await _native.StopCampathAsync().ConfigureAwait(true);
-            Status = "Camera ownership released; replay playback state unchanged.";
+            Status = "Path stopped. Free Camera is ready.";
         }
         catch (Exception ex)
         {
             _log.Warn($"Campath stop failed: {ex.Message}");
-            Status = "Camera release failed; native heartbeat will fail closed.";
+            Status = "The path could not stop cleanly. Try again.";
         }
         finally
         {
@@ -439,7 +444,7 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         PushHistory();
         Keyframes.Clear();
         SelectedKeyframe = null;
-        Status = "Campath cleared.";
+        Status = "Path cleared.";
         OnCollectionChanged();
         Autosave();
         OnEditorStateChanged();
@@ -464,8 +469,16 @@ public sealed class CampathViewModel : INotifyPropertyChanged
 
     public void RequestClear()
     {
-        if (CanEditPath)
-            Clear();
+        if (!CanEditPath || Keyframes.Count == 0)
+            return;
+        _clearConfirmationDeadline = default;
+        PushHistory();
+        Keyframes.Clear();
+        SelectedKeyframe = null;
+        Status = "Path cleared. Undo is available.";
+        OnCollectionChanged();
+        Autosave();
+        OnEditorStateChanged();
     }
 
     public IReadOnlyList<CampathKeyframe> GetKeyframeSnapshot() => Keyframes.ToArray();
@@ -483,14 +496,14 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         var replay = CurrentReplayIdentifier();
         if (replay is null)
         {
-            Status = "A confirmed replay is required before loading a Campath.";
+            Status = "Start a replay before opening a path.";
             return;
         }
         RefreshDocuments();
         var matches = SavedCampaths.Where(document => document.ReplayIdentifier.Matches(replay)).ToArray();
         if (matches.Length == 0)
         {
-            Status = "No saved Campath matches this replay.";
+            Status = "No saved path matches this replay.";
             return;
         }
         var current = Array.FindIndex(matches, document =>
@@ -527,7 +540,7 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         if (_undo.Count == 0 || !CanEditPath)
             return;
         _redo.Push(CaptureEditState());
-        RestoreEditState(_undo.Pop(), "Campath edit undone.");
+        RestoreEditState(_undo.Pop(), "Path edit undone.");
     }
 
     private void Redo()
@@ -535,7 +548,7 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         if (_redo.Count == 0 || !CanEditPath)
             return;
         _undo.Push(CaptureEditState());
-        RestoreEditState(_redo.Pop(), "Campath edit redone.");
+        RestoreEditState(_redo.Pop(), "Path edit redone.");
     }
 
     private void RestoreEditState(EditState state, string message)
@@ -575,7 +588,7 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         try
         {
             if (CurrentReplayIdentifier() is null)
-                throw new InvalidOperationException("A confirmed replay is required before saving a Campath.");
+                throw new InvalidOperationException("Start a replay before saving a path.");
             _currentFilePath = _store.Save(CreateProject(), forceNewFile ? null : _currentFilePath);
             _isDraft = false;
             _store.DeleteDraft();
@@ -617,7 +630,7 @@ public sealed class CampathViewModel : INotifyPropertyChanged
     private CampathProject CreateProject()
     {
         var replay = CurrentReplayIdentifier() ??
-            throw new InvalidOperationException("A confirmed replay is required before saving a Campath.");
+            throw new InvalidOperationException("Start a replay before saving a path.");
         return new CampathProject
         {
             Name = PathName,
@@ -645,22 +658,32 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         var replay = CurrentReplayIdentifier();
         if (replay is null)
         {
-            Status = "A confirmed replay is required before loading a Campath.";
+            Status = "Start a replay before opening a path.";
             return;
         }
         try
         {
             var project = document.IsDraft
                 ? _store.TryLoadDraft(replay) ??
-                  throw new InvalidDataException("The unsaved draft is no longer available for this replay.")
+                  throw new InvalidDataException("The unfinished path is no longer available for this replay.")
                 : _store.Load(document.FilePath, replay);
             _suppressAutosave = true;
             Keyframes.Clear();
             foreach (var keyframe in project.Keyframes.OrderBy(keyframe => keyframe.DemoTick))
                 Keyframes.Add(keyframe);
             PathName = project.Name;
-            InterpolationMode = project.InterpolationMode;
-            EasingMode = project.EasingMode;
+            // The simplified movie workflow has one cinematic path behavior.
+            // Upgrade the old linear/linear default while preserving explicitly
+            // authored non-default combinations from saved documents.
+            var legacyLinearDefaults =
+                project.InterpolationMode == CampathInterpolationMode.Linear &&
+                project.EasingMode == CampathEasingMode.Linear;
+            InterpolationMode = legacyLinearDefaults
+                ? CampathInterpolationMode.Smooth
+                : project.InterpolationMode;
+            EasingMode = legacyLinearDefaults
+                ? CampathEasingMode.EaseInOut
+                : project.EasingMode;
             EndBehavior = project.EndBehavior;
             if (document.IsDraft)
             {
@@ -681,8 +704,8 @@ public sealed class CampathViewModel : INotifyPropertyChanged
             SelectedKeyframe = Keyframes.FirstOrDefault();
             ClearHistory();
             Status = document.IsDraft
-                ? $"Recovered draft {project.Name} ({Keyframes.Count} keyframes, unsaved)."
-                : $"Loaded {project.Name} ({Keyframes.Count} keyframes).";
+                ? $"Recovered your unfinished path ({Keyframes.Count} keyframes)."
+                : $"Opened {project.Name} ({Keyframes.Count} keyframes).";
             OnCollectionChanged();
         }
         catch (Exception ex) when (ex is IOException or InvalidDataException)
@@ -706,12 +729,16 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         SelectedKeyframe = null;
         _currentFilePath = null;
         _pathName = "Untitled Path";
+        _interpolationMode = CampathInterpolationMode.Smooth;
+        _easingMode = CampathEasingMode.EaseInOut;
         OnPropertyChanged(nameof(PathName));
+        OnPropertyChanged(nameof(InterpolationMode));
+        OnPropertyChanged(nameof(EasingMode));
         _suppressAutosave = false;
         _isDraft = true;
         _store.DeleteDraft();
         ClearHistory();
-        Status = "New draft created. Move the camera and press Mouse3 to add keyframes.";
+        Status = "New path ready. Position Free Camera and add a keyframe.";
         OnCollectionChanged();
         OnEditorStateChanged();
     }
@@ -721,7 +748,7 @@ public sealed class CampathViewModel : INotifyPropertyChanged
     {
         if (!CanEditPath || CurrentReplayIdentifier() is null)
         {
-            Status = "A confirmed replay is required before saving a Campath.";
+            Status = "Start a replay before saving a path.";
             return;
         }
         if (!string.IsNullOrWhiteSpace(name))
@@ -763,7 +790,7 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         var replay = CurrentReplayIdentifier();
         if (replay is null)
         {
-            Status = "A confirmed replay is required before recovering a Campath draft.";
+            Status = "Start a replay before recovering the unfinished path.";
             return;
         }
         RecoveryAvailable = false;
@@ -776,7 +803,7 @@ public sealed class CampathViewModel : INotifyPropertyChanged
     {
         _store.DeleteDraft();
         RecoveryAvailable = false;
-        Status = "Unsaved draft discarded.";
+        Status = "Unfinished path discarded.";
         OnEditorStateChanged();
     }
 
@@ -789,7 +816,7 @@ public sealed class CampathViewModel : INotifyPropertyChanged
             SessionState != CampathSessionState.DraftPath)
         {
             documents.Add(new CampathDocumentInfo(
-                $"{draft.Name} (unsaved draft)",
+                $"{draft.Name} (unfinished)",
                 _store.DraftFilePath,
                 draft.ReplayIdentifier,
                 draft.Keyframes.Count,
@@ -842,10 +869,10 @@ public sealed class CampathViewModel : INotifyPropertyChanged
     {
         Status = playback.State switch
         {
-            CampathPlaybackState.Completed => playback.Detail,
+            CampathPlaybackState.Completed => "Path finished. Free Camera is ready.",
             CampathPlaybackState.Stopped when Status.StartsWith("Playing", StringComparison.OrdinalIgnoreCase) =>
-                "Campath completed; camera ownership released.",
-            CampathPlaybackState.Error => playback.Detail,
+                "Path stopped. Free Camera is ready.",
+            CampathPlaybackState.Error => "The path stopped unexpectedly. Enter Free Camera and try again.",
             _ => Status,
         };
         RaiseNativeProperties();
@@ -872,7 +899,7 @@ public sealed class CampathViewModel : INotifyPropertyChanged
                 _suppressAutosave = false;
                 ClearHistory();
                 RecoveryAvailable = false;
-                Status = "Replay changed; load a matching Campath or start a new path.";
+                Status = "Replay changed. Add a keyframe or open a saved path.";
                 OnCollectionChanged();
             }
             RefreshDocuments();
@@ -911,7 +938,7 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         }
         RecoveryAvailable = _store.HasAbandonedDraft && _store.TryLoadDraft(replay) is not null;
         if (RecoveryAvailable)
-            Status = "An unsaved Campath draft from a previous session can be recovered.";
+            Status = "We found an unfinished path from your last session.";
     }
 
     private void TryRestoreSelectedCampath()

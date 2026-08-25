@@ -1,9 +1,8 @@
 #pragma once
 
-// SMVM internal editor pages (Dear ImGui). Implements the shell, navigation,
-// pages, toasts and modals from tools/research/smvm_ui_v2.md. The overlay
-// (smvm_overlay.cpp) owns the ImGui context, feeds io events, and calls
-// smvm_ui::DrawFrame once per rendered frame inside NewFrame/Render.
+// SMVM's compact replay timeline (Dear ImGui). The former tabbed editor remains
+// only as dormant implementation code while the product exposes one movie-
+// making surface. The overlay owns the ImGui context and input handoff.
 
 #include "protocol.hpp"
 
@@ -64,6 +63,11 @@ struct SmvmUiState final {
     float window_w{780.0F};
     float window_h{600.0F};
     std::array<char, 24> go_to_tick{};
+    bool replay_seek_pending{};
+    std::int64_t replay_seek_target{};
+    std::uint64_t replay_seek_retry_at_ms{};
+    float host_timescale_percent{100.0F};
+    bool host_timescale_initialized{};
     std::array<char, 64> save_as_name{};
     bool open_save_as_modal{};
     bool open_load_picker{};
@@ -103,6 +107,7 @@ struct SmvmUiFrameParams final {
     std::uint64_t raw_mouse_timestamp_ms{};
     std::uint64_t fallback_mouse_timestamp_ms{};
     bool free_camera_input_error{};
+    bool cinematic_start_ready{};
     std::uint32_t free_camera_input_failure{};
     std::uint32_t raw_registration_disposition{};
     std::function<bool(const SmvmActionPayload&)> queue_action{};
@@ -111,8 +116,7 @@ struct SmvmUiFrameParams final {
 
 namespace smvm_ui {
 
-// Toast state tracking; needs no live ImGui frame and must run every frame so
-// closed-menu notifications are detected.
+// Retained for protocol/source compatibility with the dormant legacy editor.
 void UpdateToasts(const SmvmSnapshotPayload& snapshot, SmvmUiState& state) noexcept;
 void DrawFrame(const SmvmUiFrameParams& params, SmvmUiState& state) noexcept;
 
@@ -137,6 +141,8 @@ void SmvmBeginBindingCapture(std::int32_t action, std::uint32_t original) noexce
 void SmvmClearBinding(std::int32_t action, std::uint32_t original) noexcept;
 void SmvmCloseMenu() noexcept;
 void SmvmOpenMenu() noexcept;
+[[nodiscard]] bool SmvmArmCinematicStart() noexcept;
+void SmvmSetReplayTickInputActive(bool active) noexcept;
 void SmvmReacquireFreeCameraInput() noexcept;
 
 } // namespace deadlock_mvm

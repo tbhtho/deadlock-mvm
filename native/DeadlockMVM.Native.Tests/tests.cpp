@@ -1,11 +1,13 @@
 #include "campath_math.hpp"
 #include "free_camera_input.hpp"
 #include "hook_lifecycle.hpp"
+#include "manual_camera_input_policy.hpp"
 #include "manual_camera_math.hpp"
 #include "manual_mouse_fallback.hpp"
 #include "optimistic_edit.hpp"
 #include "pattern_scan.hpp"
 #include "protocol.hpp"
+#include "replay_timeline_policy.hpp"
 #include "render_camera_policy.hpp"
 #include "smvm_action_queue.hpp"
 #include "smvm_input_gate.hpp"
@@ -54,6 +56,98 @@ void PatternTests() {
 }
 
 void ProtocolTests() {
+    using deadlock_mvm::ClampReplayTimelineTick;
+    using deadlock_mvm::ComputeReplayTimelineGeometry;
+    using deadlock_mvm::DesiredReplayPauseActionIndex;
+    using deadlock_mvm::HostTimescaleFromPercent;
+    using deadlock_mvm::IsCinematicStartPromptReady;
+    using deadlock_mvm::ReplayTimelineEditorOwnsKeyboard;
+    using deadlock_mvm::ReplayTimelineTextInputConsumesKey;
+    using deadlock_mvm::ShouldDrawCampathPlacementGuides;
+    using deadlock_mvm::ShouldOfferPlayCinematic;
+    using deadlock_mvm::ShouldQueuePendingReplaySeek;
+    using deadlock_mvm::ShouldStartCinematicForSpaceEvent;
+    using deadlock_mvm::ShouldShowCampathPlacementList;
+    using deadlock_mvm::ShouldShowReplayTimeline;
+
+    Check(ClampReplayTimelineTick(-50, 1000) == 0 &&
+              ClampReplayTimelineTick(500, 1000) == 500 &&
+              ClampReplayTimelineTick(1500, 1000) == 1000,
+          "typed timeline ticks clamp to the replay range");
+    Check(DesiredReplayPauseActionIndex(false) == 1 &&
+              DesiredReplayPauseActionIndex(true) == 0,
+          "timeline pause button requests an explicit destination state");
+    Check(!ShouldOfferPlayCinematic(0) && !ShouldOfferPlayCinematic(2) &&
+              ShouldOfferPlayCinematic(3) && ShouldOfferPlayCinematic(128),
+          "timeline replaces Add Keyframe with Play Cinematic at three cameras");
+    Check(ShouldShowCampathPlacementList(true, 1) &&
+              !ShouldShowCampathPlacementList(false, 1) &&
+              !ShouldShowCampathPlacementList(true, 0),
+          "left Campath mini menu appears only after a camera is placed");
+    Check(ShouldDrawCampathPlacementGuides(false, true, false, true) &&
+              !ShouldDrawCampathPlacementGuides(true, true, false, true) &&
+              !ShouldDrawCampathPlacementGuides(false, false, false, true) &&
+              !ShouldDrawCampathPlacementGuides(false, true, true, true) &&
+              !ShouldDrawCampathPlacementGuides(false, true, false, false),
+          "world camera and path guides hide for Clean Footage and cinematic playback");
+    Check(ReplayTimelineEditorOwnsKeyboard(true, true, true) &&
+              !ReplayTimelineEditorOwnsKeyboard(false, true, true) &&
+              !ReplayTimelineEditorOwnsKeyboard(true, false, true) &&
+              !ReplayTimelineEditorOwnsKeyboard(true, true, false),
+          "timeline text input owns keyboard only in visible timeline interaction mode");
+    Check(ReplayTimelineTextInputConsumesKey(true, false) &&
+              !ReplayTimelineTextInputConsumesKey(true, true) &&
+              !ReplayTimelineTextInputConsumesKey(false, false),
+          "timeline text input never consumes the configured menu escape key");
+    Check(!ShouldQueuePendingReplaySeek(true, true, -1, 100, 0) &&
+              !ShouldQueuePendingReplaySeek(true, false, 0, 100, 0) &&
+              !ShouldQueuePendingReplaySeek(true, true, 0, 99, 100) &&
+              ShouldQueuePendingReplaySeek(true, true, 0, 100, 100),
+          "the first typed seek waits for fresh replay readiness and retries without another click");
+    Check(IsCinematicStartPromptReady(true, true, 3, 1002, 1000, 1000, true, false) &&
+              !IsCinematicStartPromptReady(true, true, 2, 1000, 1000, 1000, true, false) &&
+              !IsCinematicStartPromptReady(true, true, 3, 1003, 1000, 1000, true, false) &&
+              !IsCinematicStartPromptReady(true, true, 3, 1000, 1001, 1000, true, false) &&
+              !IsCinematicStartPromptReady(true, true, 3, 1000, 1000, 1000, false, false) &&
+              !IsCinematicStartPromptReady(true, true, 3, 1000, 1000, 1000, true, true),
+          "cinematic Space prompt appears only at the first camera after protected preparation");
+    Check(HostTimescaleFromPercent(25.0) == 0.25 &&
+              HostTimescaleFromPercent(100.0) == 1.0 &&
+              HostTimescaleFromPercent(400.0) == 4.0 &&
+              HostTimescaleFromPercent(-20.0) == 0.01 &&
+              HostTimescaleFromPercent(5000.0) == 10.0,
+          "custom host timescale converts percentages and clamps to the supported engine range");
+    Check(ShouldStartCinematicForSpaceEvent(true, true, true, false, false) &&
+              !ShouldStartCinematicForSpaceEvent(true, false, true, false, false) &&
+              !ShouldStartCinematicForSpaceEvent(true, true, true, true, false) &&
+              !ShouldStartCinematicForSpaceEvent(true, true, true, false, true) &&
+              !ShouldStartCinematicForSpaceEvent(false, true, true, false, false),
+          "cinematic start requires a fresh non-repeated Space press after the prompt appears");
+    Check(ShouldShowReplayTimeline(true, true, true) &&
+              !ShouldShowReplayTimeline(false, true, true) &&
+              !ShouldShowReplayTimeline(true, false, true) &&
+              !ShouldShowReplayTimeline(true, true, false),
+          "mini timeline renders only for the active internal replay UI");
+    constexpr auto bottom_timeline = ComputeReplayTimelineGeometry(1920.0F, 1080.0F, 1.0F, false);
+    Check(bottom_timeline.x == 600.0F && bottom_timeline.y == 968.0F &&
+              bottom_timeline.width == 720.0F && bottom_timeline.height == 96.0F,
+          "mini timeline has a compact two-row centered bottom layout");
+    constexpr auto narrow_timeline = ComputeReplayTimelineGeometry(320.0F, 200.0F, 1.0F, true);
+    Check(narrow_timeline.x == 16.0F && narrow_timeline.y == 16.0F &&
+              narrow_timeline.width == 288.0F && narrow_timeline.height == 96.0F,
+          "mini timeline clamps inside narrow viewports");
+
+    Check(deadlock_mvm::ShouldSuppressGameplayInput(true, false, false) &&
+              !deadlock_mvm::ShouldSuppressGameplayInput(false, false, false) &&
+              !deadlock_mvm::ShouldSuppressGameplayInput(true, true, false) &&
+              !deadlock_mvm::ShouldSuppressGameplayInput(true, false, true),
+          "camera takeover suppresses only otherwise-unhandled gameplay input");
+    Check(deadlock_mvm::ShouldReserveEditorMenuBinding(true, true, true) &&
+              !deadlock_mvm::ShouldReserveEditorMenuBinding(false, true, true) &&
+              !deadlock_mvm::ShouldReserveEditorMenuBinding(true, false, true) &&
+              !deadlock_mvm::ShouldReserveEditorMenuBinding(true, true, false),
+          "the editor menu binding stays reserved for the active SMVM replay");
+
     int hook_target = 0;
     int original_target = 0;
     int foreign_target = 0;
@@ -79,7 +173,7 @@ void ProtocolTests() {
           "current connection epoch still transfers editor actions");
 
     const auto ready_capture = deadlock_mvm::SmvmCaptureAvailability{
-        true, true, true, true, true, true, false, false};
+        true, true, true, true, true, true, true, true, false, false};
     Check(deadlock_mvm::CaptureRejectionFor(ready_capture) ==
               deadlock_mvm::SmvmCaptureRejection::none,
           "capture gate accepts one fresh Free Roam frame");
@@ -93,6 +187,16 @@ void ProtocolTests() {
     Check(deadlock_mvm::CaptureRejectionFor(rejected_capture) ==
               deadlock_mvm::SmvmCaptureRejection::not_in_free_roam,
           "capture gate reports observer-mode loss precisely");
+    rejected_capture = ready_capture;
+    rejected_capture.manual_camera_requested = false;
+    Check(deadlock_mvm::CaptureRejectionFor(rejected_capture) ==
+              deadlock_mvm::SmvmCaptureRejection::not_in_free_roam,
+          "capture gate rejects Deadlock observer roam without an SMVM camera request");
+    rejected_capture = ready_capture;
+    rejected_capture.manual_camera_active = false;
+    Check(deadlock_mvm::CaptureRejectionFor(rejected_capture) ==
+              deadlock_mvm::SmvmCaptureRejection::not_in_free_roam,
+          "capture gate rejects an SMVM camera request before rendered ownership is active");
     rejected_capture = ready_capture;
     rejected_capture.snapshot_fresh = false;
     Check(deadlock_mvm::CaptureRejectionFor(rejected_capture) ==
@@ -210,9 +314,9 @@ void ProtocolTests() {
     snapshot.delete_key = 'L';
     snapshot.clean_view_key = 0x79;
     snapshot.restore_ui_key = 0x78;
-    snapshot.roll_left_key = 0;
-    snapshot.roll_right_key = 0;
-    snapshot.roll_reset_key = 0;
+    snapshot.roll_left_key = 'Z';
+    snapshot.roll_right_key = 'C';
+    snapshot.roll_reset_key = 'R';
     snapshot.movement_speed = 500.0;
     snapshot.boost_multiplier = 3.0;
     snapshot.precision_multiplier = 0.25;
@@ -228,6 +332,9 @@ void ProtocolTests() {
     snapshot.status_hud_scale = 1.0;
     snapshot.status_hud_opacity = 0.92;
     Check(ValidateSmvmSnapshotPayload(snapshot), "well-formed immutable SMVM snapshot is accepted");
+    Check(snapshot.roll_left_key == 'Z' && snapshot.roll_right_key == 'C' &&
+              snapshot.roll_reset_key == 'R',
+          "owner Z/C/R roll bindings survive native snapshot validation exactly");
     snapshot.flags = 1u << 31;
     Check(!ValidateSmvmSnapshotPayload(snapshot), "unknown SMVM snapshot flags fail closed");
     snapshot.flags = 0;
@@ -345,7 +452,7 @@ void ProtocolTests() {
     const auto rotated = ApplyManualCameraMotion(
         CameraSample{0, 0, 0, 0, 179, 0, 70}, motion, tuning, 1.0 / 60.0);
     const auto rotation_safe = rotated.yaw >= -180.0 && rotated.yaw <= 180.0 &&
-        std::abs(rotated.pitch - 89.0) < 1e-8 &&
+        std::abs(rotated.pitch + 89.0) < 1e-8 &&
         std::abs(rotated.roll - 7.5) < 1e-8 &&
         std::abs(rotated.fov - kMinFov) < 1e-8;
     Check(rotation_safe, "manual rotation wraps yaw and clamps pitch, roll, and FOV safely");
@@ -373,7 +480,7 @@ void ProtocolTests() {
     motion.wheel_steps = 2.0;
     const auto inverted = ApplyManualCameraMotion(
         CameraSample{0, 0, 0, 0, 0, 0, 70}, motion, inverted_tuning, 1.0 / 60.0);
-    Check(inverted.pitch < 0.0 && inverted.fov > 70.0,
+    Check(inverted.pitch > 0.0 && inverted.fov > 70.0,
           "manual camera honors invert-Y and inverted FOV wheel direction");
 
     ManualCameraMotion right_look{};
@@ -401,19 +508,70 @@ void ProtocolTests() {
         CameraSample{0, 0, 0, 0, 0, 0, 70}, up_look, only_y_inverted, 0.0);
     const auto inverted_right = ApplyManualCameraMotion(
         CameraSample{0, 0, 0, 0, 0, 0, 70}, right_look, only_y_inverted, 0.0);
-    Check(looked_up.pitch > 0.0 && looked_down.pitch < 0.0 && inverted_up.pitch < 0.0 &&
+    Check(looked_up.pitch < 0.0 && looked_down.pitch > 0.0 && inverted_up.pitch > 0.0 &&
               std::abs(inverted_right.yaw - looked_right.yaw) < 1e-9,
-          "default vertical is physical up/down and Invert Y changes vertical only");
+          "physical mouse up renders upward and Invert Y changes vertical only");
 
     constexpr FreeCameraInputReadiness all_ready{true, true, true, true, true, true, true};
     auto mouse_missing = all_ready;
     mouse_missing.raw_input_ready = false;
-    Check(all_ready.FullyReady() && !mouse_missing.FullyReady() && !mouse_missing.MouseReady(),
-          "keyboard readiness cannot mask a missing relative mouse route");
+    Check(all_ready.FullyReady() && !mouse_missing.FullyReady() &&
+              mouse_missing.KeyboardReady() && !mouse_missing.MouseReady() &&
+              mouse_missing.PartiallyReady() && !all_ready.PartiallyReady(),
+          "keyboard-only readiness stays usable but remains an explicit partial input state");
+    constexpr auto replay_paused = true;
+    Check(replay_paused &&
+              CanConsumeFreeCameraKeyboardInput(false, true, true, mouse_missing) &&
+              CanConsumeFreeCameraInput(false, true, true, mouse_missing) &&
+              !CanConsumeFreeCameraMouseInput(false, true, true, mouse_missing),
+          "paused Free Camera consumes keyboard motion while unavailable mouse input stays gated");
+    Check(ResolveManualCameraShortcut(true, false, false, true, false, false, false) ==
+              ManualCameraShortcutAction::enter_or_reacquire &&
+              ResolveManualCameraShortcut(true, false, false, true, false, true, false) ==
+              ManualCameraShortcutAction::enter_or_reacquire,
+          "F2 enters or reacquires and never becomes a toggle-off action");
+    Check(ResolveManualCameraShortcut(false, true, false, true, false, true, true) ==
+              ManualCameraShortcutAction::exit &&
+              ResolveManualCameraShortcut(false, true, true, true, false, true, true) ==
+              ManualCameraShortcutAction::none,
+          "Escape exits owned Free Camera only while the editor menu is closed");
+    Check(ResolveManualCameraShortcut(false, true, false, true, true, true, false) ==
+              ManualCameraShortcutAction::exit &&
+              ResolveManualCameraShortcut(false, true, false, true, false, true, false) ==
+              ManualCameraShortcutAction::exit &&
+              ResolveManualCameraShortcut(false, true, false, true, false, false, true) ==
+              ManualCameraShortcutAction::none,
+          "Escape follows durable CameraOwned intent through path, restore, and pending states");
+    Check(ResolveManualCameraShortcut(true, false, false, true, true, true, true) ==
+              ManualCameraShortcutAction::consume &&
+              ResolveManualCameraShortcut(true, false, false, true, false, true, true) ==
+              ManualCameraShortcutAction::consume,
+          "the Enter Free Camera binding is swallowed during path and restore ownership");
+    Check(ResolveManualCameraShortcut(true, false, false, true, false, true, false) ==
+              ManualCameraShortcutAction::enter_or_reacquire,
+          "F2 explicitly retries durable pending Free Camera acquisition");
+    Check(HasSmvmCameraInputTakeover(true, true) &&
+              !HasSmvmCameraInputTakeover(true, false) &&
+              !HasSmvmCameraInputTakeover(false, true),
+          "input takeover spans every CameraOwned transition and fails closed otherwise");
+    Check(HasSmvmManualCameraOwnership(true, true) &&
+              !HasSmvmManualCameraOwnership(true, false) &&
+              !HasSmvmManualCameraOwnership(false, true),
+          "shot editing and manual motion require both requested and active SMVM camera state");
+    Check(ResolveHeldManualBinding(false, true, true, true, true, true) &&
+              !ResolveHeldManualBinding(false, true, false, true, true, false) &&
+              ResolveHeldManualBinding(true, false, false, true, true, true),
+          "release-armed polling supplements routed Z/C/R events without accepting pre-held keys");
     Check(ShouldReacquireFreeCameraInputAfterMenu(true, false, true, true) &&
               !ShouldReacquireFreeCameraInputAfterMenu(false, false, true, true) &&
               !ShouldReacquireFreeCameraInputAfterMenu(true, false, false, true),
           "only an OPEN to CLOSED transition with requested active Free Camera reacquires input");
+    Check(ShouldRetryManualPointerAcquisition(true, false, false, false, 250, 250) &&
+              ShouldRetryManualPointerAcquisition(true, false, true, false, 500, 250) &&
+              !ShouldRetryManualPointerAcquisition(true, false, true, true, 500, 250) &&
+              !ShouldRetryManualPointerAcquisition(true, true, false, false, 500, 250) &&
+              !ShouldRetryManualPointerAcquisition(true, false, false, false, 249, 250),
+          "pointer health checks retry only a due, degraded live route");
     const auto acquisition_reset = ResetMouseAcquisition();
     Check(acquisition_reset.accumulated_look_right == 0 &&
               acquisition_reset.accumulated_look_up == 0 &&
@@ -453,8 +611,9 @@ void ProtocolTests() {
     Check(repeated_transitions_ready && lifecycle.successful_reacquisitions == 20,
           "twenty mutable OPEN to CLOSED cycles suspend, reset, reacquire, and retain composition");
     lifecycle.OpenMenu();
-    Check(!lifecycle.CloseMenu(mouse_missing) && !lifecycle.CanConsume(),
-          "incomplete mouse readiness cannot consume keyboard or wheel input");
+    Check(lifecycle.CloseMenu(mouse_missing) && lifecycle.CanConsume() &&
+              lifecycle.readiness.KeyboardReady() && !lifecycle.readiness.MouseReady(),
+          "menu close restores paused keyboard control even when mouse reacquisition is incomplete");
     lifecycle.OpenMenu();
     Check(lifecycle.CloseMenu(all_ready) && lifecycle.CanConsume(),
           "retry restores a fully consumable Free Camera input route");
@@ -473,6 +632,20 @@ void ProtocolTests() {
     Check(std::abs(boosted_move.x - (base_move.x * 4.0)) < 1e-8 &&
               std::abs(precision_move.x - (base_move.x * 0.2)) < 1e-8,
           "manual boost and precision multipliers scale movement deterministically");
+    Check(std::abs(AdjustManualCameraSpeed(600.0, true) - 750.0) < 1e-9 &&
+              std::abs(AdjustManualCameraSpeed(750.0, false) - 600.0) < 1e-9 &&
+              AdjustManualCameraSpeed(10000.0, true) == 10000.0 &&
+              AdjustManualCameraSpeed(1.0, false) == 1.0,
+          "minus and plus camera-speed steps are reciprocal and bounded");
+    Check(ResolveMovieMakerShortcut(true, false, false, false, true, false, true) ==
+              MovieMakerShortcutAction::toggle_replay_pause &&
+              ResolveMovieMakerShortcut(false, false, true, false, true, true, true) ==
+                  MovieMakerShortcutAction::decrease_camera_speed &&
+              ResolveMovieMakerShortcut(false, false, false, true, true, true, true) ==
+                  MovieMakerShortcutAction::increase_camera_speed &&
+              ResolveMovieMakerShortcut(false, false, false, true, true, true, false) ==
+                  MovieMakerShortcutAction::none,
+          "fixed N and minus/plus shortcuts resolve only in their owned product states");
 
     const CampathPayloadHeader path_header{
         3, CampathInterpolation::smooth, CampathEasing::ease_in_out,
@@ -501,6 +674,50 @@ void ProtocolTests() {
           "smooth interpolation starts exactly at the keyframe");
     Check(std::abs(smooth_end.x - p2.x) < 1e-8 && std::abs(smooth_end.yaw - p2.yaw) < 1e-8,
           "smooth interpolation ends exactly at the keyframe without a rotation flip");
+
+    const std::array<CampathKeyframe, 4> cinematic_path{{
+        {0, {0, 0, 0, 0, 350, 0, 60}},
+        {100, {100, 40, 20, 5, 5, 10, 65}},
+        {260, {180, 140, 50, -10, 45, 20, 50}},
+        {500, {260, 160, 100, 0, 90, 0, 70}},
+    }};
+    const auto evaluate_tick = [&cinematic_path](const std::int64_t tick) {
+        auto segment = 0u;
+        while (segment + 2 < cinematic_path.size() &&
+               tick > cinematic_path[segment + 1].demo_tick)
+            ++segment;
+        const auto span = cinematic_path[segment + 1].demo_tick -
+                          cinematic_path[segment].demo_tick;
+        const auto amount = static_cast<double>(tick - cinematic_path[segment].demo_tick) /
+                            static_cast<double>(span);
+        return EvaluateCampathCamera(
+            cinematic_path.data(),
+            static_cast<std::uint32_t>(cinematic_path.size()),
+            segment,
+            amount,
+            CampathInterpolation::smooth,
+            CampathEasing::ease_in_out);
+    };
+    const auto before_key = evaluate_tick(259);
+    const auto at_key = evaluate_tick(260);
+    const auto after_key = evaluate_tick(261);
+    const auto incoming_x = at_key.x - before_key.x;
+    const auto outgoing_x = after_key.x - at_key.x;
+    const auto incoming_y = at_key.y - before_key.y;
+    const auto outgoing_y = after_key.y - at_key.y;
+    Check(std::hypot(incoming_x - outgoing_x, incoming_y - outgoing_y) < 0.05 &&
+              std::hypot(incoming_x, incoming_y) > 0.05,
+          "whole-path smoothing preserves non-zero continuous velocity through keyframes");
+    const auto first_step = evaluate_tick(1);
+    const auto second_step = evaluate_tick(2);
+    const auto penultimate_step = evaluate_tick(499);
+    const auto final_step = evaluate_tick(500);
+    Check(std::hypot(first_step.x, first_step.y) <
+              std::hypot(second_step.x - first_step.x, second_step.y - first_step.y) &&
+              std::hypot(final_step.x - penultimate_step.x, final_step.y - penultimate_step.y) <
+              std::hypot(penultimate_step.x - evaluate_tick(498).x,
+                         penultimate_step.y - evaluate_tick(498).y),
+          "whole-path smoothing accelerates and decelerates only at path endpoints");
 }
 
 } // namespace

@@ -294,25 +294,22 @@ public:
             } else {
                 auto amount = static_cast<double>(demo_tick - p1.demo_tick) /
                               static_cast<double>(p2.demo_tick - p1.demo_tick);
-                amount = ApplyCampathEasing(amount, easing);
                 if (interpolation == CampathInterpolation::smooth) {
-                    CampathKeyframe p0{};
-                    CampathKeyframe p3{};
-                    if (left > 0) {
-                        if (!keyframes_[left - 1].Load(p0))
-                            continue;
-                    } else {
-                        p0 = CampathKeyframe{p1.demo_tick, ReflectCamera(p1.camera, p2.camera)};
+                    std::array<CampathKeyframe, kMaxCampathKeyframes> path{};
+                    auto loaded = true;
+                    for (std::uint32_t index = 0; index < count; ++index) {
+                        if (!keyframes_[index].Load(path[index])) {
+                            loaded = false;
+                            break;
+                        }
                     }
-                    if (right + 1 < count) {
-                        if (!keyframes_[right + 1].Load(p3))
-                            continue;
-                    } else {
-                        p3 = CampathKeyframe{p2.demo_tick, ReflectCamera(p2.camera, p1.camera)};
-                    }
-                    sample = EvaluateSmoothCamera(p0.camera, p1.camera, p2.camera, p3.camera, amount);
+                    if (!loaded)
+                        continue;
+                    sample = EvaluateCampathCamera(
+                        path.data(), count, left, amount, interpolation, easing);
                 } else {
-                    sample = EvaluateLinearCamera(p1.camera, p2.camera, amount);
+                    sample = EvaluateLinearCamera(
+                        p1.camera, p2.camera, ApplyCampathEasing(amount, easing));
                 }
             }
 
@@ -593,6 +590,8 @@ void OverlayRequestCameraCapture(void* context) noexcept {
         backend != nullptr && backend->pipe_connected.load(std::memory_order_acquire),
         backend != nullptr && backend->replay_active.load(std::memory_order_acquire),
         backend != nullptr && backend->free_roam.load(std::memory_order_acquire),
+        backend != nullptr && backend->manual_camera_requested.load(std::memory_order_acquire),
+        backend != nullptr && backend->manual_camera_active.load(std::memory_order_acquire),
         backend != nullptr && HasFreshSmvmSnapshot(*backend),
         backend != nullptr && backend->camera_observed.load(std::memory_order_acquire),
         observed_at != 0 && now - observed_at <= kCameraObservationFreshMilliseconds,
@@ -1261,8 +1260,8 @@ void* __fastcall CameraUpdateHook(void* camera) noexcept {
                         action_generation));
                     const SmvmActionPayload action{
                         SmvmActionType::add_keyframe, -1, tick, 0.0, observed};
-                    if (!backend->smvm_actions.TryPush(action, action_generation) &&
-                        action_generation == backend->smvm_actions.Generation() &&
+                    const auto queued = backend->smvm_actions.TryPush(action, action_generation);
+                    if (!queued && action_generation == backend->smvm_actions.Generation() &&
                         backend->pipe_connected.load(std::memory_order_acquire)) {
                         backend->internal_capture_requested_milliseconds.store(
                             GetTickCount64(), std::memory_order_release);

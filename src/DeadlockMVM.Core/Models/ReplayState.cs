@@ -22,8 +22,8 @@ public sealed record ReplayState
     public int? TotalTicks { get; init; }
 
     /// <summary>
-    /// Last playback speed commanded through MVM. The engine offers no query
-    /// for demo_timescale, so this is a commanded value, not engine-reported.
+    /// Last host_timescale commanded through MVM. This is surfaced immediately
+    /// as commanded state rather than waiting for a console query round trip.
     /// </summary>
     public double? Timescale { get; init; }
 

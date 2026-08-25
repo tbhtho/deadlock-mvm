@@ -16,6 +16,8 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
     private static readonly TimeSpan BestEffortCleanupTimeout = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan SelfTestRestorationTimeout = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan SelfTestEmergencyCleanupTimeout = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan AutomaticRecoveryTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan PausedManualCameraBootstrapDelay = TimeSpan.FromMilliseconds(125);
     private const int SeekTickTolerance = 2;
     private const int ObservationTickTolerance = 8;
     private readonly ReplayController _controller;
@@ -24,6 +26,7 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
     private readonly string _dllPath;
     private readonly CancellationTokenSource _stop = new();
     private readonly SemaphoreSlim _operationGate = new(1, 1);
+    private readonly object _manualIntentGate = new();
     private readonly Task _monitorTask;
     private readonly CampathPlaybackStateMachine _playback = new();
     private NativeReplayCameraClient? _client;
@@ -33,7 +36,9 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
     private bool _holdingKeyframe;
     private bool _manualCameraDesired;
     private int _ownershipCleanupQueued;
+    private int _manualRecoveryQueued;
     private int _cameraTransferDepth;
+    private long _explicitExitEpoch;
     private CampathPath? _activePath;
     private CampathEndBehavior _endBehavior = CampathEndBehavior.StopAndRelease;
     private SmvmRendererBackend _loggedRendererBackend;
@@ -75,6 +80,7 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
     public bool CampathPlaying => _campathPlaying;
     public bool ManualCameraDesired => Volatile.Read(ref _manualCameraDesired);
     public bool ManualCameraActive => ManualCameraDesired && _status?.ManualCameraActive == true;
+    public bool ManualCameraEstablished => IsManualCameraEstablished(ManualCameraDesired, _status);
     public bool CameraOwned => HasCameraOwnershipIntent(
         _campathPlaying,
         _holdingKeyframe,
@@ -88,62 +94,69 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
     public SmvmSelfTestResult SelfTestStatus => _selfTestStatus;
 
     /// <summary>
-    /// Requests native manual-camera ownership without issuing any engine command.
-    /// The caller must already have a calibrated replay in Free Roam. Completion
-    /// proves that a game-thread hook frame applied the manual camera.
+    /// Atomically cancels durable Free Camera intent before serialized cleanup.
+    /// Escape/F9 call this at action ingress so a seek or self-test cannot
+    /// reacquire ownership while the explicit exit waits for the operation gate.
+    /// </summary>
+    public void CancelManualCameraIntent()
+    {
+        var changed = false;
+        lock (_manualIntentGate)
+        {
+            Interlocked.Increment(ref _explicitExitEpoch);
+            changed = _manualCameraDesired;
+            Volatile.Write(ref _manualCameraDesired, false);
+            Interlocked.Exchange(ref _manualRecoveryQueued, 1);
+        }
+        if (changed)
+            OnStatusChanged();
+    }
+
+    /// <summary>
+    /// Ensures that SMVM owns the replay camera. Deadlock Free Roam is an internal
+    /// prerequisite of this transaction, not a second user-facing camera mode.
+    /// Repeated calls are idempotent once a validated game-thread frame is active.
     /// </summary>
     public async Task<InProcessCameraStatus> EnableManualCameraAsync(
         CancellationToken cancellationToken = default)
     {
+        var ownershipEpoch = CaptureOwnershipEpoch();
         await _operationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        EnterCameraTransfer();
         try
         {
+            ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
             var client = _client;
             if (client?.Connected != true)
                 throw new InvalidOperationException(_message);
             if (!IsConfirmedReplay(_controller.State) || _controller.GameTickOffset is null)
+            {
+                SetManualCameraDesired(false);
                 throw new InvalidOperationException("Replay playback and its tick calibration must be confirmed.");
-            if (_camera.Selection.Mode != SpecCameraMode.FreeRoam)
-                throw new InvalidOperationException("SMVM Free Camera is available in Free Roam.");
+            }
             if (CampathCameraOwned)
                 throw new InvalidOperationException("Stop the current Campath or held keyframe before entering SMVM Free Camera.");
 
-            SetManualCameraDesired(true);
+            if (IsManualCameraEstablished(ManualCameraDesired, _status))
+            {
+                _message = "SMVM Free Camera is already active.";
+                OnStatusChanged();
+                return _status!;
+            }
+
+            ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
+            if (!TrySetManualCameraDesiredForEpoch(ownershipEpoch))
+                throw new InvalidOperationException(
+                    "SMVM Free Camera activation was superseded by an explicit exit.");
             try
             {
-                var gateStatus = await SendHeartbeatAsync(client, cancellationToken).ConfigureAwait(false);
-                if (!IsManualCameraGateReady(gateStatus))
-                    throw new InvalidOperationException(
-                        $"Native replay/Free Roam gate is unavailable ({DescribeNativeStatus(gateStatus)}).");
-                await PublishFreshSmvmSnapshotAsync(client, required: true, cancellationToken)
-                    .ConfigureAwait(false);
-
-                var status = await client.PrepareCameraObservationAsync(cancellationToken).ConfigureAwait(false);
-                UpdateStatus(status);
-                if (!status.Ready || !IsManualCameraGateReady(status))
-                    throw new InvalidOperationException(
-                        $"SMVM Free Camera observation is unavailable: {status.Error}.");
-
-                var beforeHookCalls = status.HookCalls;
-                status = await client.EnableManualCameraAsync(cancellationToken).ConfigureAwait(false);
-                UpdateStatus(status);
-                if (!status.ManualCameraRequested)
-                    throw new InvalidOperationException(
-                        $"The native backend rejected SMVM Free Camera ownership ({DescribeNativeStatus(status)}).");
-
-                status = await WaitForManualCameraAsync(
+                return await AcquireManualCameraWithObserverRetryAsync(
                     client,
-                    beforeHookCalls,
-                    status,
-                    cancellationToken).ConfigureAwait(false);
-                _message = "SMVM Free Camera active on a validated game-thread frame.";
-                _log.Info($"Native camera: {_message}");
-                OnStatusChanged();
-                return status;
+                    cancellationToken,
+                    ownershipEpoch).ConfigureAwait(false);
             }
             catch
             {
-                SetManualCameraDesired(false);
                 using var cleanupTimeout = new CancellationTokenSource(BestEffortCleanupTimeout);
                 try
                 {
@@ -158,8 +171,151 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         }
         finally
         {
+            ExitCameraTransfer();
             _operationGate.Release();
         }
+    }
+
+    private async Task<InProcessCameraStatus> AcquireManualCameraCoreAsync(
+        NativeReplayCameraClient client,
+        CancellationToken cancellationToken,
+        bool forceInternalFreeRoam,
+        long ownershipEpoch)
+    {
+        ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
+        // A normal F2 activation must not reissue spec_goto while its key/click
+        // is still physically down. Force the internal prerequisite only when
+        // managed/native evidence says the tracked FreeRoam state is stale, or
+        // after a backend reconnect where no native ownership survived.
+        if (ShouldEnterInternalFreeRoam(
+                _camera.Selection.Mode,
+                _status?.Error ?? InProcessErrorCode.None,
+                forceInternalFreeRoam))
+            await _camera.EnterFreeRoamAsync(cancellationToken).ConfigureAwait(false);
+        ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
+        if (!ManualCameraDesired)
+            throw new InvalidOperationException("SMVM Free Camera activation was superseded by an explicit exit.");
+
+        var gateStatus = await SendHeartbeatAsync(client, cancellationToken).ConfigureAwait(false);
+        if (!IsManualCameraGateReady(gateStatus))
+            throw new InvalidOperationException(
+                $"Native replay/Free Roam gate is unavailable ({DescribeNativeStatus(gateStatus)}).");
+        await PublishFreshSmvmSnapshotAsync(client, required: true, cancellationToken)
+            .ConfigureAwait(false);
+
+        var status = await client.PrepareCameraObservationAsync(cancellationToken).ConfigureAwait(false);
+        UpdateStatus(status);
+        if (!status.Ready || !IsManualCameraGateReady(status))
+            throw new InvalidOperationException(
+                $"SMVM Free Camera observation is unavailable: {status.Error}.");
+        if (!ManualCameraDesired)
+            throw new InvalidOperationException("SMVM Free Camera activation was superseded by an explicit exit.");
+
+        ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
+        var beforeHookCalls = status.HookCalls;
+        status = await client.EnableManualCameraAsync(cancellationToken).ConfigureAwait(false);
+        UpdateStatus(status);
+        ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
+        if (!status.ManualCameraRequested)
+            throw new InvalidOperationException(
+                $"The native backend rejected SMVM Free Camera ownership ({DescribeNativeStatus(status)}).");
+
+        status = await WaitForManualCameraAsync(
+            client,
+            beforeHookCalls,
+            status,
+            cancellationToken).ConfigureAwait(false);
+        if (!CompleteManualCameraAcquisitionForEpoch(ownershipEpoch, status))
+            throw new InvalidOperationException(
+                "SMVM Free Camera activation was superseded by an explicit exit.");
+        _message = "SMVM Free Camera active on a validated game-thread frame.";
+        _log.Info($"Native camera: {_message}");
+        OnStatusChanged();
+        return status;
+    }
+
+    private async Task<InProcessCameraStatus> AcquireManualCameraWithObserverRetryAsync(
+        NativeReplayCameraClient client,
+        CancellationToken cancellationToken,
+        long ownershipEpoch)
+    {
+        if (ShouldBootstrapPausedManualCamera(_controller.State.IsPaused == true, _status))
+            await BootstrapPausedManualCameraAsync(cancellationToken, ownershipEpoch).ConfigureAwait(false);
+        try
+        {
+            return await AcquireManualCameraCoreAsync(
+                client,
+                cancellationToken,
+                forceInternalFreeRoam: false,
+                ownershipEpoch: ownershipEpoch).ConfigureAwait(false);
+        }
+        catch (InvalidOperationException) when (CanForceRetryManualCameraAcquisition(
+                   ManualCameraDesired,
+                   IsOwnershipOperationCurrent(ownershipEpoch, CaptureOwnershipEpoch()),
+                   _status?.Error ?? InProcessErrorCode.None))
+        {
+            // The first in-place arm proved that managed FreeRoam tracking was
+            // stale. Its two-second proof window also ensures the activation
+            // key/click has been released before spec_goto is deliberately retried.
+            await TryDisableManualCameraAsync(client, cancellationToken).ConfigureAwait(false);
+            if (ShouldBootstrapPausedManualCamera(_controller.State.IsPaused == true, _status))
+                await BootstrapPausedManualCameraAsync(cancellationToken, ownershipEpoch).ConfigureAwait(false);
+            return await AcquireManualCameraCoreAsync(
+                client,
+                cancellationToken,
+                forceInternalFreeRoam: true,
+                ownershipEpoch: ownershipEpoch).ConfigureAwait(false);
+        }
+    }
+
+    internal static bool CanForceRetryManualCameraAcquisition(
+        bool manualCameraDesired,
+        bool ownershipEpochCurrent,
+        InProcessErrorCode nativeError) =>
+        manualCameraDesired && ownershipEpochCurrent &&
+        nativeError is InProcessErrorCode.ObserverNotRoaming or
+            InProcessErrorCode.ReplayGateClosed or InProcessErrorCode.CameraUnavailable;
+
+    internal static bool ShouldBootstrapPausedManualCamera(
+        bool replayPaused,
+        InProcessCameraStatus? status) =>
+        replayPaused && status?.Flags.HasFlag(InProcessStatusFlags.HookInstalled) != true;
+
+    private async Task BootstrapPausedManualCameraAsync(
+        CancellationToken cancellationToken,
+        long ownershipEpoch)
+    {
+        ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
+        // A demo launched with +demo_pause can latch before Deadlock creates its
+        // roaming observer camera. Keep the transport paused: enter the hidden
+        // prerequisite, advance exactly one simulation tick, and give the game
+        // window a render turn so SMVM can install its camera hook. Once the
+        // hook exists, manual movement and capture continue on render frames
+        // without advancing the replay clock.
+        await _camera.EnterFreeRoamAsync(cancellationToken).ConfigureAwait(false);
+        _controller.StepTick();
+        await Task.Delay(PausedManualCameraBootstrapDelay, cancellationToken).ConfigureAwait(false);
+        ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
+        _log.Info("Native camera: bootstrapped the paused replay camera with one paused tick step.");
+    }
+
+    internal static bool ShouldEnterInternalFreeRoam(
+        SpecCameraMode trackedMode,
+        InProcessErrorCode nativeError,
+        bool forceInternalFreeRoam) =>
+        forceInternalFreeRoam || trackedMode != SpecCameraMode.FreeRoam ||
+        nativeError == InProcessErrorCode.ObserverNotRoaming;
+
+    internal static bool IsOwnershipOperationCurrent(long capturedEpoch, long currentEpoch) =>
+        capturedEpoch == currentEpoch;
+
+    private long CaptureOwnershipEpoch() => Interlocked.Read(ref _explicitExitEpoch);
+
+    private void ThrowIfOwnershipOperationSuperseded(long capturedEpoch)
+    {
+        if (!IsOwnershipOperationCurrent(capturedEpoch, CaptureOwnershipEpoch()))
+            throw new InvalidOperationException(
+                "Camera operation was superseded by an explicit SMVM Free Camera exit.");
     }
 
     /// <summary>
@@ -168,7 +324,7 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
     /// </summary>
     public async Task DisableManualCameraAsync(CancellationToken cancellationToken = default)
     {
-        SetManualCameraDesired(false);
+        CancelManualCameraIntent();
         await _operationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
@@ -196,6 +352,88 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Explicitly exits the single SMVM Free Camera experience. Unlike Stop,
+    /// this always clears durable manual intent and releases manual, path, and
+    /// one-shot override ownership before returning control to Deadlock.
+    /// </summary>
+    public async Task ExitFreeCameraAsync(CancellationToken cancellationToken = default)
+    {
+        CancelManualCameraIntent();
+        await _operationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        EnterCameraTransfer();
+        try
+        {
+            var hadCampathOwnership = CampathCameraOwned ||
+                                       _status?.Flags.HasFlag(InProcessStatusFlags.CampathActive) == true;
+            _campathPlaying = false;
+            _holdingKeyframe = false;
+            _activePath = null;
+
+            if (hadCampathOwnership && _playback.Status.State != CampathPlaybackState.Stopping)
+                Transition(CampathPlaybackState.Stopping, "Exiting SMVM Free Camera and releasing the active path.");
+
+            Exception? releaseFailure = null;
+            var client = _client;
+            if (client?.Connected == true)
+            {
+                try
+                {
+                    UpdateStatus(await client.DisableManualCameraAsync(cancellationToken).ConfigureAwait(false));
+                }
+                catch (Exception ex) when (ex is IOException or InvalidOperationException)
+                {
+                    releaseFailure ??= ex;
+                    _log.Warn($"Native camera: explicit exit could not confirm manual-camera release: {ex.Message}");
+                }
+
+                try
+                {
+                    UpdateStatus(await client.DisableOverrideAsync(cancellationToken).ConfigureAwait(false));
+                }
+                catch (Exception ex) when (ex is IOException or InvalidOperationException)
+                {
+                    releaseFailure ??= ex;
+                    _log.Warn($"Native camera: explicit exit could not confirm override release: {ex.Message}");
+                }
+
+                try
+                {
+                    UpdateStatus(await client.ClearCampathAsync(cancellationToken).ConfigureAwait(false));
+                }
+                catch (Exception ex) when (ex is IOException or InvalidOperationException)
+                {
+                    releaseFailure ??= ex;
+                    _log.Warn($"Native camera: explicit exit could not confirm path release: {ex.Message}");
+                }
+            }
+
+            var remainingFlags = _status?.Flags ?? InProcessStatusFlags.None;
+            if (releaseFailure is not null || HasNativeCameraResourcesToRelease(remainingFlags))
+            {
+                _message = "SMVM Free Camera exit is fail-closed locally, but native camera release was not fully confirmed.";
+                if (hadCampathOwnership)
+                {
+                    _playback.Fail(CampathStartFailure.UnexpectedFailure, _message);
+                    RaiseCampathState();
+                }
+                OnStatusChanged();
+                throw new InvalidOperationException(_message, releaseFailure);
+            }
+
+            _message = "SMVM Free Camera exited; Deadlock owns the replay camera.";
+            if (hadCampathOwnership)
+                Transition(CampathPlaybackState.Stopped, _message);
+            else
+                OnStatusChanged();
+        }
+        finally
+        {
+            ExitCameraTransfer();
+            _operationGate.Release();
+        }
+    }
+
     public Task<SmvmSelfTestResult> RunCameraSelfTestAsync(CancellationToken cancellationToken = default) =>
         RunSelfTestAsync(SmvmSelfTestKind.Camera, null, cancellationToken);
 
@@ -212,6 +450,7 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         CampathPath? path,
         CancellationToken cancellationToken)
     {
+        var ownershipEpoch = CaptureOwnershipEpoch();
         var result = SmvmSelfTestResult.Idle(kind);
         try
         {
@@ -231,6 +470,7 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         NativeReplayCameraClient? client = null;
         try
         {
+            ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
             PublishSelfTest(kind, SmvmSelfTestStage.Validating, "Validating replay and native camera gates.");
             client = _client;
             var replay = _controller.State;
@@ -298,8 +538,10 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                 PublishSelfTest(kind, SmvmSelfTestStage.ApplyingProbe,
                     "Applying a bounded FOV and roll probe on the game thread.", probe);
                 var acceptedBefore = baselineStatus.AcceptedSequence;
+                ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
                 var transfer = await connectedClient.SetCameraSampleAsync(probe, cancellationToken).ConfigureAwait(false);
                 UpdateStatus(transfer);
+                ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
                 if (!transfer.Flags.HasFlag(InProcessStatusFlags.HasSample) ||
                     transfer.AcceptedSequence <= acceptedBefore)
                 {
@@ -310,8 +552,10 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                 else
                 {
                     var beforeHookCalls = transfer.HookCalls;
+                    ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
                     var armed = await connectedClient.EnableOverrideAsync(cancellationToken).ConfigureAwait(false);
                     UpdateStatus(armed);
+                    ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
                     PublishSelfTest(kind, SmvmSelfTestStage.VerifyingAuthoritativeFrame,
                         "Verifying the rendered camera probe through authoritative readback.", probe);
                     var verified = await PollSelfTestStatusAsync(
@@ -321,6 +565,7 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                                   SmvmSelfTestPolicy.SamplesMatch(probe, status.Camera),
                         armed,
                         cancellationToken).ConfigureAwait(false);
+                    ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
                     if (!verified.OverrideActive)
                         result = CompleteSelfTestFailure(kind, SmvmSelfTestFailure.NativeOwnershipRejected,
                             $"Native camera ownership was not acquired ({DescribeNativeStatus(verified)}).", probe, verified.Camera);
@@ -339,10 +584,12 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                 PublishSelfTest(kind, SmvmSelfTestStage.TransferringPath,
                     $"Transferring editor path ({pathDescription}) without seeking.");
                 var acceptedBefore = baselineStatus.AcceptedSequence;
+                ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
                 var transfer = await connectedClient.SetCampathAsync(
                         path, CampathEndBehavior.HoldFinalCamera, cancellationToken)
                     .ConfigureAwait(false);
                 UpdateStatus(transfer);
+                ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
                 if (!transfer.Flags.HasFlag(InProcessStatusFlags.CampathActive) ||
                     !transfer.Flags.HasFlag(InProcessStatusFlags.HasSample) ||
                     transfer.AcceptedSequence <= acceptedBefore)
@@ -356,8 +603,10 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                     var beforeHookCalls = transfer.HookCalls;
                     PublishSelfTest(kind, SmvmSelfTestStage.AcquiringOwnership,
                         "Acquiring native Campath ownership at the current replay tick.");
+                    ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
                     var armed = await connectedClient.EnableOverrideAsync(cancellationToken).ConfigureAwait(false);
                     UpdateStatus(armed);
+                    ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
                     PublishSelfTest(kind, SmvmSelfTestStage.VerifyingAuthoritativeFrame,
                         "Evaluating the current replay tick against authoritative camera readback.");
                     var verified = await PollSelfTestStatusAsync(
@@ -368,6 +617,7 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                                   SmvmSelfTestPolicy.SamplesMatch(path.Evaluate(status.ReplayTick), status.Camera),
                         armed,
                         cancellationToken).ConfigureAwait(false);
+                    ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
                     var expected = path.Evaluate(verified.ReplayTick >= 0 ? verified.ReplayTick : currentTick);
                     if (!verified.OverrideActive || !verified.Flags.HasFlag(InProcessStatusFlags.CampathActive))
                         result = CompleteSelfTestFailure(kind, SmvmSelfTestFailure.NativeOwnershipRejected,
@@ -398,17 +648,39 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         {
             if (restoration is { } policy)
             {
-                if (client?.Connected != true)
+                if (!IsOwnershipOperationCurrent(ownershipEpoch, CaptureOwnershipEpoch()))
                 {
                     SetManualCameraDesired(false);
+                    if (client?.Connected == true)
+                        await BestEffortReleaseFullOverrideAsync(
+                            client,
+                            "superseded self-test cleanup").ConfigureAwait(false);
+                    result = CompleteSelfTestFailure(
+                        kind,
+                        SmvmSelfTestFailure.Cancelled,
+                        "Self-test restoration was superseded by an explicit SMVM Free Camera exit.",
+                        stage: SmvmSelfTestStage.Cancelled);
+                }
+                else if (client?.Connected != true)
+                {
+                    if (!policy.RestoreManualCamera ||
+                        !TrySetManualCameraDesiredForEpoch(ownershipEpoch))
+                        SetManualCameraDesired(false);
                     result = CompleteSelfTestFailure(
                         kind,
                         SmvmSelfTestFailure.RestorationFailed,
-                        "Self-test restoration failed closed because the native backend disconnected.");
+                        policy.RestoreManualCamera
+                            ? "Self-test restoration failed closed because the native backend disconnected; " +
+                              "Free Camera intent was preserved for explicit reacquisition."
+                            : "Self-test restoration failed closed because the native backend disconnected.");
                 }
                 else
                 {
-                    var restorationError = await RestoreAfterSelfTestAsync(client, kind, policy).ConfigureAwait(false);
+                    var restorationError = await RestoreAfterSelfTestAsync(
+                        client,
+                        kind,
+                        policy,
+                        ownershipEpoch).ConfigureAwait(false);
                     if (restorationError is not null)
                         result = CompleteSelfTestFailure(kind, SmvmSelfTestFailure.RestorationFailed, restorationError);
                 }
@@ -435,8 +707,9 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                 throw new InvalidOperationException("Stop Campath playback before adding a keyframe.");
             if (!IsConfirmedReplay(_controller.State) || _controller.GameTickOffset is null)
                 throw new InvalidOperationException("Replay playback and its tick calibration must be confirmed.");
-            if (_camera.Selection.Mode != SpecCameraMode.FreeRoam)
-                throw new InvalidOperationException("Camera capture is available in Free Roam.");
+            if (!IsManualCameraEstablished(ManualCameraDesired, _status))
+                throw new InvalidOperationException(
+                    "Enter SMVM Free Camera before adding or updating a keyframe.");
 
             var before = await SendHeartbeatAsync(client, cancellationToken).ConfigureAwait(false);
             var status = await client.PrepareCameraObservationAsync(cancellationToken).ConfigureAwait(false);
@@ -445,14 +718,17 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                 throw new InvalidOperationException($"Native camera observation is unavailable: {status.Error}.");
 
             var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
-            while ((!status.CameraObserved || status.HookCalls <= before.HookCalls) && DateTime.UtcNow < deadline)
+            while ((!IsManualCameraEstablished(ManualCameraDesired, status) ||
+                    status.HookCalls <= before.HookCalls) && DateTime.UtcNow < deadline)
             {
                 await Task.Delay(10, cancellationToken).ConfigureAwait(false);
                 status = await client.GetStatusAsync(cancellationToken).ConfigureAwait(false);
                 UpdateStatus(status);
             }
-            if (!status.CameraObserved || status.HookCalls <= before.HookCalls)
-                throw new InvalidOperationException($"A fresh renderer camera frame was not observed: {status.Error}.");
+            if (!IsManualCameraEstablished(ManualCameraDesired, status) ||
+                status.HookCalls <= before.HookCalls)
+                throw new InvalidOperationException(
+                    $"A fresh SMVM Free Camera frame was not observed: {status.Error}.");
 
             return new CampathKeyframe(status.ReplayTick, status.Camera);
         }
@@ -463,8 +739,8 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
     }
 
     /// <summary>
-    /// Applies a narrowly typed roll-only override on the spectator camera's game-thread
-    /// update. Position, pitch, yaw, FOV, replay state, and POV remain owned by Deadlock.
+    /// Applies a narrowly typed roll-only override to an established SMVM Free
+    /// Camera sample on the game-thread update. It cannot acquire camera ownership.
     /// </summary>
     public async Task<InProcessCameraStatus> SetManualRollAsync(
         double roll,
@@ -473,27 +749,35 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         if (!double.IsFinite(roll) || roll is < -180.0 or > 180.0)
             throw new ArgumentOutOfRangeException(nameof(roll));
 
+        var ownershipEpoch = CaptureOwnershipEpoch();
         await _operationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
             var client = _client ?? throw new InvalidOperationException(_message);
             if (_campathPlaying || _status?.OverrideActive == true)
                 throw new InvalidOperationException("Release Campath camera ownership before changing manual roll.");
             if (!IsConfirmedReplay(_controller.State) || _controller.GameTickOffset is null)
                 throw new InvalidOperationException("Replay playback and its tick calibration must be confirmed.");
-            if (_camera.Selection.Mode != SpecCameraMode.FreeRoam)
-                throw new InvalidOperationException("Rendered roll is available in Free Roam.");
+            if (!IsManualCameraEstablished(ManualCameraDesired, _status))
+                throw new InvalidOperationException("Enter SMVM Free Camera before changing rendered roll.");
 
             var before = await SendHeartbeatAsync(client, cancellationToken).ConfigureAwait(false);
+            if (!IsManualCameraEstablished(ManualCameraDesired, before))
+                throw new InvalidOperationException("SMVM Free Camera ownership was lost before rendered roll could be changed.");
             var status = await client.PrepareCameraObservationAsync(cancellationToken).ConfigureAwait(false);
             UpdateStatus(status);
-            if (!status.Ready)
+            if (!status.Ready || !ManualCameraDesired ||
+                !status.ManualCameraRequested || !status.ManualCameraActive)
                 throw new InvalidOperationException($"Native roll control is unavailable: {status.Error}.");
 
+            ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
             status = await client.SetRollOverrideAsync(roll, cancellationToken).ConfigureAwait(false);
             UpdateStatus(status);
+            ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
             var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
-            while ((!status.RollOverrideActive || !status.CameraObserved || status.HookCalls <= before.HookCalls ||
+            while ((!IsManualCameraEstablished(ManualCameraDesired, status) ||
+                    !status.RollOverrideActive || status.HookCalls <= before.HookCalls ||
                     Math.Abs(ShortestAngleDelta(status.Camera.Roll, roll)) > 0.05) &&
                    DateTime.UtcNow < deadline)
             {
@@ -501,7 +785,8 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                 status = await client.GetStatusAsync(cancellationToken).ConfigureAwait(false);
                 UpdateStatus(status);
             }
-            if (!status.RollOverrideActive || !status.CameraObserved || status.HookCalls <= before.HookCalls ||
+            if (!IsManualCameraEstablished(ManualCameraDesired, status) ||
+                !status.RollOverrideActive || status.HookCalls <= before.HookCalls ||
                 Math.Abs(ShortestAngleDelta(status.Camera.Roll, roll)) > 0.05)
                 throw new InvalidOperationException($"Rendered roll did not reach {roll:0.0} degrees: {status.Error}.");
 
@@ -522,11 +807,15 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(path);
 
+        var ownershipEpoch = CaptureOwnershipEpoch();
         await _operationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         EnterCameraTransfer();
-        var restorePlayingOnFailure = false;
+        var originalTransportCaptured = false;
+        bool? originalTransportWasPaused = null;
+        var playbackCommitted = false;
         try
         {
+            ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
             Transition(CampathPlaybackState.Validating, "Validating replay, path, and native backend.");
             if (!path.IsValid)
                 ThrowStartFailure(CampathStartFailure.PathHasTooFewKeyframes,
@@ -543,34 +832,56 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             if (!IsConfirmedReplay(_controller.State) || _controller.GameTickOffset is null)
                 ThrowStartFailure(CampathStartFailure.ReplayUnavailable,
                     "Replay playback and its tick calibration must be confirmed.");
+            if (!ManualCameraDesired)
+                ThrowStartFailure(CampathStartFailure.NotInFreeRoam,
+                    "Enter SMVM Free Camera before playing a Campath.");
+            if (!IsManualCameraEstablished(ManualCameraDesired, _status))
+            {
+                try
+                {
+                    await AcquireManualCameraWithObserverRetryAsync(
+                        client,
+                        cancellationToken,
+                        ownershipEpoch).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException and not CampathStartException)
+                {
+                    ThrowStartFailure(
+                        CampathStartFailure.NotInFreeRoam,
+                        $"SMVM Free Camera could not be prepared for path playback: {ex.Message}",
+                        ex);
+                }
+            }
 
             var originalState = _controller.State;
-            restorePlayingOnFailure = originalState.IsPaused == false;
+            originalTransportWasPaused = originalState.IsPaused;
+            originalTransportCaptured = true;
             var currentTick = originalState.CurrentTick!.Value;
             int? observationExpectedTick = playMode == CampathPlayMode.FromStart
                 ? checked((int)path.Keyframes[0].DemoTick)
                 : null;
+            var startSeekRequired = playMode == CampathPlayMode.FromStart &&
+                                    Math.Abs((long)currentTick - path.Keyframes[0].DemoTick) > 2;
+            var seamlessManualHandoff = CanUseSeamlessManualToPathHandoff(
+                IsManualCameraEstablished(ManualCameraDesired, _status),
+                startSeekRequired);
             if (playMode == CampathPlayMode.FromCurrent &&
                 (currentTick < path.Keyframes[0].DemoTick || currentTick > path.Keyframes[^1].DemoTick))
                 ThrowStartFailure(CampathStartFailure.CurrentTickOutsidePath,
                     $"Current replay tick {currentTick} is outside the Campath range " +
                     $"{path.Keyframes[0].DemoTick}-{path.Keyframes[^1].DemoTick}.");
 
-            Transition(CampathPlaybackState.PreparingFreeRoam, "Preparing Free Roam for native camera ownership.");
-            try
-            {
-                await _camera.EnterFreeRoamAsync(cancellationToken).ConfigureAwait(false);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                ThrowStartFailure(CampathStartFailure.NotInFreeRoam,
-                    $"Free Roam could not be prepared: {ex.Message}", ex);
-            }
+            // Keep the established manual writer armed while the typed path is
+            // transferred. EnableOverride takes precedence on the next hook
+            // frame, producing a direct SMVM manual-to-path handoff with no
+            // intervening Deadlock-owned observer frame when no seek is needed.
+            Transition(CampathPlaybackState.PreparingFreeRoam,
+                "Preparing the active SMVM Free Camera for path ownership.");
 
             if (playMode == CampathPlayMode.FromStart)
             {
                 var startTick = checked((int)path.Keyframes[0].DemoTick);
-                if (Math.Abs((long)currentTick - startTick) > 2)
+                if (startSeekRequired)
                 {
                     Transition(CampathPlaybackState.SeekingToStart,
                         "SKIPPING TO CAMPATH START", startTick, currentTick);
@@ -596,6 +907,7 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                         throw;
                     }
                     observationExpectedTick = landed;
+                    _controller.Pause();
                     Transition(CampathPlaybackState.ReacquiringFreeRoam,
                         "Reacquiring Free Roam after the landed seek.", startTick, landed);
                     try
@@ -621,17 +933,29 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                 "Native replay/Free Roam gate did not become ready.",
                 gateStatus,
                 cancellationToken).ConfigureAwait(false);
-            gateStatus = await WaitForFreshStrictFreeRoamCameraAsync(
-                client!,
-                gateStatus,
-                observationExpectedTick,
-                "A fresh Free Roam camera frame was not observed before Campath transfer.",
-                cancellationToken).ConfigureAwait(false);
+            if (seamlessManualHandoff)
+            {
+                if (!IsManualCameraEstablished(ManualCameraDesired, gateStatus))
+                    ThrowStartFailure(
+                        CampathStartFailure.CameraOwnershipRejected,
+                        "The validated SMVM Free Camera frame was lost before path handoff.");
+            }
+            else
+            {
+                gateStatus = await WaitForFreshStrictFreeRoamCameraAsync(
+                    client!,
+                    gateStatus,
+                    observationExpectedTick,
+                    "A fresh Free Roam camera frame was not observed before Campath transfer.",
+                    cancellationToken).ConfigureAwait(false);
+            }
 
             Transition(CampathPlaybackState.TransferringPath,
                 $"Transferring {path.Keyframes.Count} typed keyframes to the native replay camera.");
+            ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
             var transferStatus = await client!.SetCampathAsync(path, endBehavior, cancellationToken).ConfigureAwait(false);
             UpdateStatus(transferStatus);
+            ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
             if (!transferStatus.Flags.HasFlag(InProcessStatusFlags.CampathActive) ||
                 !transferStatus.Flags.HasFlag(InProcessStatusFlags.HasSample))
                 ThrowFromNative(transferStatus, CampathStartFailure.PathTransferFailed,
@@ -639,8 +963,10 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
 
             Transition(CampathPlaybackState.ArmingNativeCamera,
                 "Requesting terminal spectator-camera ownership.");
+            ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
             var status = await client.EnableOverrideAsync(cancellationToken).ConfigureAwait(false);
             UpdateStatus(status);
+            ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
             if (!status.Flags.HasFlag(InProcessStatusFlags.OverrideRequested))
                 ThrowFromNative(status, CampathStartFailure.NativePathNotArmed,
                     "The native backend did not arm the transferred path.");
@@ -663,14 +989,17 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             status = await EnsureManualCameraArmedUnderOverrideAsync(
                 client,
                 status,
-                cancellationToken).ConfigureAwait(false);
+                cancellationToken,
+                ownershipEpoch).ConfigureAwait(false);
 
+            ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
             _campathPlaying = true;
             _holdingKeyframe = false;
             _activePath = path;
             _endBehavior = endBehavior;
             _controller.Play();
-            restorePlayingOnFailure = false;
+            ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
+            playbackCommitted = true;
             Transition(CampathPlaybackState.Playing,
                 $"{path.Interpolation} Campath active: tick {path.Keyframes[0].DemoTick} to {path.Keyframes[^1].DemoTick}.");
             _message = _playback.Status.Detail;
@@ -685,6 +1014,8 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             if (_client is { Connected: true } client)
                 await BestEffortReleaseFullOverrideAsync(client, "cancelled Play cleanup")
                     .ConfigureAwait(false);
+            if (originalTransportCaptured && !playbackCommitted)
+                RestoreReplayTransportState(originalTransportWasPaused);
             throw;
         }
         catch (Exception ex)
@@ -703,8 +1034,8 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             if (_client is { Connected: true } client)
                 await BestEffortReleaseFullOverrideAsync(client, "failed Play cleanup")
                     .ConfigureAwait(false);
-            if (restorePlayingOnFailure)
-                _controller.Play();
+            if (originalTransportCaptured && !playbackCommitted)
+                RestoreReplayTransportState(originalTransportWasPaused);
             if (ex is CampathStartException)
                 throw;
             throw new CampathStartException(CampathStartFailure.UnexpectedFailure, _message, ex);
@@ -728,6 +1059,11 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             cancellationToken);
     }
 
+    internal static bool CanUseSeamlessManualToPathHandoff(
+        bool manualCameraEstablished,
+        bool seekRequired) =>
+        manualCameraEstablished && !seekRequired;
+
     public async Task<InProcessCameraStatus> GoToKeyframeAsync(
         CampathKeyframe keyframe,
         CancellationToken cancellationToken = default)
@@ -736,13 +1072,17 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         if (!keyframe.IsValid)
             throw new ArgumentOutOfRangeException(nameof(keyframe));
 
+        var ownershipEpoch = CaptureOwnershipEpoch();
         await _operationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         EnterCameraTransfer();
         try
         {
+            ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
             var client = _client ?? throw new InvalidOperationException(_message);
             if (!IsConfirmedReplay(_controller.State) || _controller.GameTickOffset is null)
                 throw new InvalidOperationException("Replay playback and its tick calibration must be confirmed.");
+            if (!ManualCameraDesired)
+                throw new InvalidOperationException("Enter SMVM Free Camera before going to a keyframe.");
 
             // A prior Go To intentionally holds a full native override. Release
             // that ownership before seeking so the old shot cannot reappear if
@@ -754,6 +1094,8 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             var landed = await SeekToPathStartAsync(
                 checked((int)keyframe.DemoTick),
                 cancellationToken).ConfigureAwait(false);
+            _controller.Pause();
+            ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
             await _camera.EnterFreeRoamAsync(cancellationToken).ConfigureAwait(false);
             // EnterFreeRoamAsync completes from authoritative spectator state, but
             // the renderer camera can still be between observer instances for a
@@ -767,26 +1109,15 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                 landed,
                 "A fresh post-seek Free Roam camera frame was not observed.",
                 cancellationToken).ConfigureAwait(false);
-            var transfer = await client.SetCameraSampleAsync(keyframe.Camera, cancellationToken).ConfigureAwait(false);
-            UpdateStatus(transfer);
-            var status = await client.EnableOverrideAsync(cancellationToken).ConfigureAwait(false);
-            UpdateStatus(status);
-            status = await WaitForNativeAsync(
+            var status = await RebaseManualCameraAtSampleAsync(
                 client,
-                candidate => candidate.OverrideActive && candidate.AppliedSequence >= transfer.AcceptedSequence,
-                TimeSpan.FromSeconds(2),
-                CampathStartFailure.CameraOwnershipRejected,
-                "Native camera did not acquire the selected shot.",
-                status,
-                cancellationToken).ConfigureAwait(false);
-            status = await EnsureManualCameraArmedUnderOverrideAsync(
-                client,
-                status,
-                cancellationToken).ConfigureAwait(false);
+                keyframe.Camera,
+                cancellationToken,
+                ownershipEpoch).ConfigureAwait(false);
             _campathPlaying = false;
             _activePath = null;
-            _holdingKeyframe = true;
-            _message = $"Holding keyframe at tick {keyframe.DemoTick}; Stop releases camera control.";
+            _holdingKeyframe = false;
+            _message = $"SMVM Free Camera positioned at keyframe tick {keyframe.DemoTick}.";
             OnStatusChanged();
             return status;
         }
@@ -833,16 +1164,96 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         if (tick < 0)
             throw new ArgumentOutOfRangeException(nameof(tick));
 
+        var ownershipEpoch = CaptureOwnershipEpoch();
         await _operationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         var preservingManualCamera = false;
+        var protectedManualSeek = false;
+        var activeCampathSeek = false;
+        var restoreProtectedTransport = false;
+        bool? protectedTransportWasPaused = null;
         try
         {
+            ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
             if (!_campathPlaying || _activePath is not { } path)
             {
-                _controller.SeekToTick(tick);
-                return null;
+                var releasingHeldCamera = CampathCameraOwned;
+                if (!ManualCameraDesired && !releasingHeldCamera)
+                {
+                    _controller.SeekToTick(tick);
+                    return null;
+                }
+
+                EnterCameraTransfer();
+                preservingManualCamera = true;
+                if (releasingHeldCamera)
+                    await StopCampathCoreAsync(cancellationToken).ConfigureAwait(false);
+                if (!ManualCameraDesired)
+                {
+                    _controller.SeekToTick(tick);
+                    return null;
+                }
+
+                protectedManualSeek = true;
+                ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
+                var manualClient = _client;
+                if (manualClient?.Connected != true)
+                    throw new InvalidOperationException(_message);
+
+                var baselineStatus = await SendHeartbeatAsync(manualClient, cancellationToken).ConfigureAwait(false);
+                if (!TryGetManualSeekBaseline(ManualCameraDesired, baselineStatus, out var baseline))
+                    throw new InvalidOperationException(
+                        "A validated SMVM Free Camera frame is required before seeking. " +
+                        "Free Camera intent remains requested; reacquire it and retry.");
+
+                var manualWasPaused = _controller.State.IsPaused;
+                protectedTransportWasPaused = manualWasPaused;
+                restoreProtectedTransport = true;
+                _controller.Pause();
+                int manualLanded;
+                try
+                {
+                    manualLanded = await SeekToPathStartAsync(tick, cancellationToken).ConfigureAwait(false);
+                }
+                catch (TimeoutException ex)
+                {
+                    throw new InvalidOperationException(
+                        $"Deadlock did not land at requested tick {tick} within 15 seconds.", ex);
+                }
+
+                _controller.Pause();
+                if (!ManualCameraDesired)
+                    throw new InvalidOperationException(
+                        "Replay seek landed after an explicit SMVM Free Camera exit; camera ownership will remain released.");
+                await _camera.EnterFreeRoamAsync(cancellationToken).ConfigureAwait(false);
+                var manualGateStatus = await SendHeartbeatAsync(manualClient, cancellationToken).ConfigureAwait(false);
+                manualGateStatus = await WaitForNativeAsync(
+                    manualClient,
+                    status => status.Flags.HasFlag(InProcessStatusFlags.Resolved) &&
+                              status.Flags.HasFlag(InProcessStatusFlags.ReplayGate),
+                    TimeSpan.FromSeconds(2),
+                    CampathStartFailure.FreeRoamReacquisitionFailed,
+                    "Native replay/Free Roam gate did not reopen after seek.",
+                    manualGateStatus,
+                    cancellationToken).ConfigureAwait(false);
+                await WaitForFreshStrictFreeRoamCameraAsync(
+                    manualClient,
+                    manualGateStatus,
+                    manualLanded,
+                    "A fresh post-seek Free Roam frame was not observed before restoring SMVM Free Camera.",
+                    cancellationToken).ConfigureAwait(false);
+                await RebaseManualCameraAtSampleAsync(
+                    manualClient,
+                    baseline,
+                    cancellationToken,
+                    ownershipEpoch).ConfigureAwait(false);
+
+                _message = $"SMVM Free Camera preserved at landed replay tick {manualLanded}.";
+                _log.Info($"Native camera: {_message}");
+                OnStatusChanged();
+                return manualLanded;
             }
 
+            activeCampathSeek = true;
             EnterCameraTransfer();
             preservingManualCamera = true;
 
@@ -850,7 +1261,10 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             if (client?.Connected != true)
                 throw new CampathStartException(CampathStartFailure.NativeBackendDisconnected, _message);
 
-            var wasPaused = _controller.State.IsPaused == true;
+            var wasPaused = _controller.State.IsPaused;
+            protectedTransportWasPaused = wasPaused;
+            restoreProtectedTransport = true;
+            _controller.Pause();
             var beforeTick = _controller.State.CurrentTick;
             Transition(
                 CampathPlaybackState.WaitingForLandedTick,
@@ -883,6 +1297,7 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                 $"Landed at tick {landed}; reacquiring Free Roam before camera writes resume.",
                 tick,
                 landed);
+            _controller.Pause();
             try
             {
                 await _camera.EnterFreeRoamAsync(cancellationToken).ConfigureAwait(false);
@@ -917,9 +1332,11 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             // sequence, then require a subsequent hook frame to prove ownership.
             Transition(CampathPlaybackState.TransferringPath,
                 $"Refreshing {path.Keyframes.Count} typed keyframes after seek.", tick, landed);
+            ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
             var transferStatus = await client.SetCampathAsync(path, _endBehavior, cancellationToken)
                 .ConfigureAwait(false);
             UpdateStatus(transferStatus);
+            ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
             if (!transferStatus.Flags.HasFlag(InProcessStatusFlags.CampathActive) ||
                 !transferStatus.Flags.HasFlag(InProcessStatusFlags.HasSample))
                 ThrowFromNative(transferStatus, CampathStartFailure.PathTransferFailed,
@@ -927,8 +1344,10 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
 
             Transition(CampathPlaybackState.ArmingNativeCamera,
                 "Rearming terminal spectator-camera ownership after seek.", tick, landed);
+            ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
             var status = await client.EnableOverrideAsync(cancellationToken).ConfigureAwait(false);
             UpdateStatus(status);
+            ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
             if (!status.Flags.HasFlag(InProcessStatusFlags.OverrideRequested))
                 ThrowFromNative(status, CampathStartFailure.NativePathNotArmed,
                     "The native backend did not rearm the Campath after seek.");
@@ -948,18 +1367,32 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             status = await EnsureManualCameraArmedUnderOverrideAsync(
                 client,
                 status,
-                cancellationToken).ConfigureAwait(false);
+                cancellationToken,
+                ownershipEpoch).ConfigureAwait(false);
 
-            if (wasPaused)
-                _controller.Pause();
-            else
-                _controller.Play();
+            ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
             Transition(CampathPlaybackState.Playing,
                 $"Campath reacquired at landed tick {landed}.", tick, landed);
             return landed;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
+            if (protectedManualSeek)
+            {
+                if (_client is { Connected: true } manualCleanupClient)
+                    await BestEffortReleaseFullOverrideAsync(
+                            manualCleanupClient,
+                            "cancelled Free Camera seek cleanup")
+                        .ConfigureAwait(false);
+                _message = ManualCameraDesired
+                    ? "Replay seek cancelled; SMVM Free Camera remains requested."
+                    : "Replay seek cancelled; camera ownership was released fail-closed.";
+                OnStatusChanged();
+                throw;
+            }
+            if (!activeCampathSeek)
+                throw;
+
             _campathPlaying = false;
             _holdingKeyframe = false;
             _activePath = null;
@@ -971,6 +1404,20 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             RaiseCampathState();
             OnStatusChanged();
             throw;
+        }
+        catch (Exception ex) when (protectedManualSeek)
+        {
+            if (_client is { Connected: true } manualCleanupClient)
+                await BestEffortReleaseFullOverrideAsync(
+                        manualCleanupClient,
+                        "failed Free Camera seek cleanup")
+                    .ConfigureAwait(false);
+            _message = ManualCameraDesired
+                ? $"Replay seek failed; SMVM Free Camera remains requested: {ex.Message}"
+                : $"Replay seek failed and camera ownership was released fail-closed: {ex.Message}";
+            _log.Warn($"Native camera: {_message}");
+            OnStatusChanged();
+            throw new InvalidOperationException(_message, ex);
         }
         catch (CampathStartException ex)
         {
@@ -989,17 +1436,95 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         }
         finally
         {
+            if (restoreProtectedTransport)
+                RestoreReplayTransportState(protectedTransportWasPaused);
             if (preservingManualCamera)
                 ExitCameraTransfer();
             _operationGate.Release();
         }
     }
 
+    private void RestoreReplayTransportState(bool? wasPaused)
+    {
+        if (wasPaused == true)
+            _controller.Pause();
+        else if (wasPaused == false)
+            _controller.Play();
+    }
+
+    private async Task<InProcessCameraStatus> RebaseManualCameraAtSampleAsync(
+        NativeReplayCameraClient client,
+        CameraSample baseline,
+        CancellationToken cancellationToken,
+        long ownershipEpoch)
+    {
+        ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
+        var transfer = await client.SetCameraSampleAsync(baseline, cancellationToken).ConfigureAwait(false);
+        UpdateStatus(transfer);
+        ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
+        if (!transfer.Flags.HasFlag(InProcessStatusFlags.HasSample))
+            throw new InvalidOperationException(
+                $"The native backend rejected the preserved Free Camera sample ({DescribeNativeStatus(transfer)})." );
+
+        var beforeOverrideHooks = transfer.HookCalls;
+        ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
+        var status = await client.EnableOverrideAsync(cancellationToken).ConfigureAwait(false);
+        UpdateStatus(status);
+        ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
+        if (!status.Flags.HasFlag(InProcessStatusFlags.OverrideRequested))
+            throw new InvalidOperationException(
+                $"The native backend did not arm the preserved Free Camera sample ({DescribeNativeStatus(status)})." );
+
+        status = await WaitForNativeAsync(
+            client,
+            candidate => candidate.OverrideActive && candidate.CameraObserved &&
+                         candidate.HookCalls > beforeOverrideHooks &&
+                         candidate.AppliedSequence >= transfer.AcceptedSequence &&
+                         SmvmSelfTestPolicy.SamplesMatch(baseline, candidate.Camera),
+            TimeSpan.FromSeconds(2),
+            CampathStartFailure.CameraOwnershipRejected,
+            "The preserved Free Camera sample was not rendered after seek.",
+            status,
+            cancellationToken).ConfigureAwait(false);
+
+        // Arm manual ownership under the exact temporary sample, then release
+        // the override. The native handoff rebases manual motion from that
+        // rendered sample without exposing a Deadlock-owned camera frame.
+        await PublishFreshSmvmSnapshotAsync(client, required: true, cancellationToken).ConfigureAwait(false);
+        status = await client.PrepareCameraObservationAsync(cancellationToken).ConfigureAwait(false);
+        UpdateStatus(status);
+        ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
+        status = await client.EnableManualCameraAsync(cancellationToken).ConfigureAwait(false);
+        UpdateStatus(status);
+        ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
+        if (!status.ManualCameraRequested)
+            throw new InvalidOperationException(
+                $"The native backend did not rearm SMVM Free Camera after seek ({DescribeNativeStatus(status)})." );
+
+        var beforeManualHooks = status.HookCalls;
+        status = await client.DisableOverrideAsync(cancellationToken).ConfigureAwait(false);
+        UpdateStatus(status);
+        status = await WaitForManualCameraAsync(
+            client,
+            beforeManualHooks,
+            status,
+            cancellationToken).ConfigureAwait(false);
+        if (!status.CameraObserved || !SmvmSelfTestPolicy.SamplesMatch(baseline, status.Camera))
+            throw new InvalidOperationException(
+                "SMVM Free Camera did not resume from the exact pre-seek rendered sample.");
+
+        status = await client.ClearCampathAsync(cancellationToken).ConfigureAwait(false);
+        UpdateStatus(status);
+        return status;
+    }
+
     private async Task<InProcessCameraStatus> EnsureManualCameraArmedUnderOverrideAsync(
         NativeReplayCameraClient client,
         InProcessCameraStatus status,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        long ownershipEpoch)
     {
+        ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
         if (!ShouldArmManualCameraUnderOverride(ManualCameraDesired, status))
             return status;
         if (!CanResumeManualCamera(
@@ -1007,15 +1532,16 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                 _controller.State,
                 _controller.GameTickOffset,
                 _camera.Selection.Mode))
-        {
-            SetManualCameraDesired(false);
             return status;
-        }
 
         await PublishFreshSmvmSnapshotAsync(client, required: false, cancellationToken)
             .ConfigureAwait(false);
+        ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
+        if (!ManualCameraDesired)
+            return status;
         status = await client.EnableManualCameraAsync(cancellationToken).ConfigureAwait(false);
         UpdateStatus(status);
+        ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
         if (!status.ManualCameraRequested)
             throw new InvalidOperationException(
                 $"The native backend did not preserve Free Camera intent beneath Campath " +
@@ -1119,19 +1645,14 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         NativeReplayCameraClient client,
         string context)
     {
+        var ownershipEpoch = CaptureOwnershipEpoch();
         using var cleanupTimeout = new CancellationTokenSource(BestEffortCleanupTimeout);
         var cleanupToken = cleanupTimeout.Token;
-        var resumeManualCamera = CanResumeManualCamera(
-            ManualCameraDesired,
-            _controller.State,
-            _controller.GameTickOffset,
-            _camera.Selection.Mode);
+        var resumeManualCamera = CanResumeManualCameraForEpoch(ownershipEpoch);
         var releaseManualCamera = ShouldReleaseManualCameraOnStop(
             resumeManualCamera,
             ManualCameraDesired,
             _status?.Flags ?? InProcessStatusFlags.None);
-        if (ManualCameraDesired && !resumeManualCamera)
-            SetManualCameraDesired(false);
 
         InProcessCameraStatus? status = null;
         var manualResumeArmed = false;
@@ -1156,12 +1677,28 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                 status = await EnsureManualCameraArmedUnderOverrideAsync(
                     client,
                     status,
-                    cleanupToken).ConfigureAwait(false);
+                    cleanupToken,
+                    ownershipEpoch).ConfigureAwait(false);
                 manualResumeArmed = status.ManualCameraRequested;
             }
             catch (Exception ex)
             {
                 _log.Warn($"Native camera: {context} could not preserve manual camera: {ex.Message}");
+            }
+        }
+
+        if (!CanResumeManualCameraForEpoch(ownershipEpoch))
+        {
+            resumeManualCamera = false;
+            manualResumeArmed = false;
+            try
+            {
+                status = await DisableSupersededManualResumeAsync(
+                    client, status, ownershipEpoch, cleanupToken, context).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                _log.Warn($"Native camera: {context} explicit-exit cleanup timed out.");
             }
         }
 
@@ -1172,7 +1709,8 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             UpdateStatus(status);
             status = await client.ClearCampathAsync(cleanupToken).ConfigureAwait(false);
             UpdateStatus(status);
-            if (resumeManualCamera && manualResumeArmed)
+            if (resumeManualCamera && manualResumeArmed &&
+                CanResumeManualCameraForEpoch(ownershipEpoch))
             {
                 await WaitForManualCameraAsync(
                     client,
@@ -1185,6 +1723,19 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         {
             _log.Warn($"Native camera: {context} release failed: {ex.Message}");
         }
+
+        if (!CanResumeManualCameraForEpoch(ownershipEpoch))
+        {
+            try
+            {
+                await DisableSupersededManualResumeAsync(
+                    client, status, ownershipEpoch, cleanupToken, context).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                _log.Warn($"Native camera: {context} final explicit-exit cleanup timed out.");
+            }
+        }
     }
 
     internal static bool IsFreshManualCameraFrame(
@@ -1194,6 +1745,22 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         status.ManualCameraActive &&
         status.CameraObserved &&
         status.HookCalls > beforeHookCalls;
+
+    internal static bool IsManualCameraEstablished(
+        bool manualCameraDesired,
+        InProcessCameraStatus? status) =>
+        manualCameraDesired &&
+        status is { ManualCameraRequested: true, ManualCameraActive: true, CameraObserved: true } &&
+        status.Camera.IsValid;
+
+    internal static bool TryGetManualSeekBaseline(
+        bool manualCameraDesired,
+        InProcessCameraStatus? status,
+        out CameraSample baseline)
+    {
+        baseline = status?.Camera ?? default;
+        return IsManualCameraEstablished(manualCameraDesired, status) && baseline.IsValid;
+    }
 
     internal static bool IsFreshStrictFreeRoamCameraFrame(
         InProcessCameraStatus status,
@@ -1242,6 +1809,35 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         manualCameraDesired && IsConfirmedReplay(replay) && gameTickOffset is not null &&
         mode == SpecCameraMode.FreeRoam;
 
+    private bool CanResumeManualCameraForEpoch(long ownershipEpoch) =>
+        IsOwnershipOperationCurrent(ownershipEpoch, CaptureOwnershipEpoch()) &&
+        CanResumeManualCamera(
+            ManualCameraDesired,
+            _controller.State,
+            _controller.GameTickOffset,
+            _camera.Selection.Mode);
+
+    private async Task<InProcessCameraStatus?> DisableSupersededManualResumeAsync(
+        NativeReplayCameraClient client,
+        InProcessCameraStatus? status,
+        long ownershipEpoch,
+        CancellationToken cancellationToken,
+        string context)
+    {
+        if (CanResumeManualCameraForEpoch(ownershipEpoch))
+            return status;
+        try
+        {
+            status = await client.DisableManualCameraAsync(cancellationToken).ConfigureAwait(false);
+            UpdateStatus(status);
+        }
+        catch (Exception ex) when (ex is IOException or InvalidOperationException)
+        {
+            _log.Warn($"Native camera: {context} could not fail closed after an explicit exit: {ex.Message}");
+        }
+        return status;
+    }
+
     internal static bool ShouldReleaseManualCameraOnStop(
         bool resumeManualCamera,
         bool manualCameraDesired,
@@ -1253,20 +1849,15 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
 
     private async Task StopCampathCoreAsync(CancellationToken cancellationToken)
     {
+        var ownershipEpoch = CaptureOwnershipEpoch();
         if (_playback.Status.State != CampathPlaybackState.Stopping)
             Transition(CampathPlaybackState.Stopping, "Releasing native Campath camera ownership.");
         var client = _client;
-        var resumeManualCamera = CanResumeManualCamera(
-            ManualCameraDesired,
-            _controller.State,
-            _controller.GameTickOffset,
-            _camera.Selection.Mode);
+        var resumeManualCamera = CanResumeManualCameraForEpoch(ownershipEpoch);
         var releaseManualCamera = ShouldReleaseManualCameraOnStop(
             resumeManualCamera,
             ManualCameraDesired,
             _status?.Flags ?? InProcessStatusFlags.None);
-        if (ManualCameraDesired && !resumeManualCamera)
-            SetManualCameraDesired(false);
 
         _campathPlaying = false;
         _holdingKeyframe = false;
@@ -1297,13 +1888,26 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                     status = await EnsureManualCameraArmedUnderOverrideAsync(
                         client,
                         status,
-                        cancellationToken).ConfigureAwait(false);
+                        cancellationToken,
+                        ownershipEpoch).ConfigureAwait(false);
                     manualResumeArmed = status.ManualCameraRequested;
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
                     _log.Warn($"Native camera: manual camera could not be armed before Campath release: {ex.Message}");
                 }
+            }
+
+            if (!CanResumeManualCameraForEpoch(ownershipEpoch))
+            {
+                resumeManualCamera = false;
+                manualResumeArmed = false;
+                status = await DisableSupersededManualResumeAsync(
+                    client,
+                    status,
+                    ownershipEpoch,
+                    cancellationToken,
+                    "Campath Stop").ConfigureAwait(false);
             }
 
             var beforeReleaseHookCalls = status?.HookCalls ?? 0;
@@ -1313,7 +1917,8 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                 UpdateStatus(status);
                 status = await client.ClearCampathAsync(cancellationToken).ConfigureAwait(false);
                 UpdateStatus(status);
-                if (resumeManualCamera && manualResumeArmed)
+                if (resumeManualCamera && manualResumeArmed &&
+                    CanResumeManualCameraForEpoch(ownershipEpoch))
                 {
                     status = await WaitForManualCameraAsync(
                         client,
@@ -1327,12 +1932,26 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             {
                 _log.Warn($"Native camera: release failed: {ex.Message}");
             }
+
+            if (!CanResumeManualCameraForEpoch(ownershipEpoch))
+            {
+                resumeManualCamera = false;
+                manualResumeConfirmed = false;
+                await DisableSupersededManualResumeAsync(
+                    client,
+                    status,
+                    ownershipEpoch,
+                    cancellationToken,
+                    "Campath Stop").ConfigureAwait(false);
+            }
         }
 
         _message = resumeManualCamera
             ? manualResumeConfirmed
                 ? "Campath stopped; SMVM Free Camera resumed from the final shot."
                 : "Campath stopped; Free Camera remains requested but its resumed frame is not yet confirmed."
+            : ManualCameraDesired
+                ? "Campath stopped; SMVM Free Camera remains requested. Press F2 to reacquire it."
             : "Campath stopped; Deadlock owns the Free Roam camera.";
         Transition(CampathPlaybackState.Stopped, _message);
         OnStatusChanged();
@@ -1394,7 +2013,9 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
 
     private async Task HandleMonitorFailureAsync(Exception ex, CancellationToken _)
     {
-        SetManualCameraDesired(false);
+        var preserveManualIntent = ManualCameraDesired;
+        var campathInterrupted = _campathPlaying || _holdingKeyframe ||
+                                 _playback.Status.State == CampathPlaybackState.Playing;
         _campathPlaying = false;
         _holdingKeyframe = false;
         _activePath = null;
@@ -1422,7 +2043,16 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             }
         }
 
-        _message = $"Native backend failed: {ex.Message} Retrying while replay playback remains available.";
+        _message = preserveManualIntent
+            ? $"SMVM Free Camera was interrupted by a native backend failure: {ex.Message} " +
+              "Retrying the backend; automatic recovery will resume after it reconnects."
+            : $"Native backend failed: {ex.Message} Retrying while replay playback remains available.";
+        if (campathInterrupted)
+        {
+            _playback.Fail(CampathStartFailure.NativeBackendDisconnected,
+                "Campath stopped because the native backend disconnected.");
+            RaiseCampathState();
+        }
         _log.Warn(_message);
         OnStatusChanged();
     }
@@ -1468,10 +2098,20 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             _client = client;
             UpdateStatus(status);
             _message = status.Error == InProcessErrorCode.None
-                ? "Native backend connected; camera override is armed only in Free Roam."
+                ? ManualCameraDesired
+                    ? "Native backend reconnected; automatic SMVM Free Camera recovery is starting."
+                    : "Native backend connected; camera override is armed only in Free Roam."
                 : $"Native backend connected with error: {status.Error}.";
             _log.Info($"Native camera: {load.Message} Protocol v{InProcessProtocol.Version} connected.");
             await SendHeartbeatAsync(client, cancellationToken).ConfigureAwait(false);
+            if (!ManualCameraEstablished && ResetAutomaticRecoveryLatchIfDesired())
+            {
+                QueueAutomaticManualCameraRecovery(
+                    "Native backend reconnected; automatic SMVM Free Camera recovery is starting.",
+                    releaseManualCamera: false,
+                    releaseFullOverride: false,
+                    forceInternalFreeRoam: true);
+            }
         }
         catch
         {
@@ -1487,6 +2127,8 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         var replay = _controller.State;
         var replayActive = IsConfirmedReplay(replay);
         var freeRoam = _camera.Selection.Mode == SpecCameraMode.FreeRoam;
+        var playbackInterrupted = _playback.Status.State != CampathPlaybackState.Idle &&
+                                  !_playback.Status.IsTerminal;
         var hadManualCamera = ManualCameraDesired ||
                               _status?.ManualCameraRequested == true ||
                               _status?.ManualCameraActive == true;
@@ -1527,13 +2169,25 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         {
             _ = StopAfterOwnershipLossAsync("Held keyframe lost native camera ownership.");
         }
-        if (!replayActive && (hadManualCamera || _campathPlaying || _holdingKeyframe))
+        if (!replayActive &&
+            (hadManualCamera || _campathPlaying || _holdingKeyframe || playbackInterrupted))
         {
-            SetManualCameraDesired(false);
+            CancelManualCameraIntent();
             _campathPlaying = false;
             _holdingKeyframe = false;
             _activePath = null;
-            _message = "Native camera ownership released because replay playback ended.";
+            if (playbackInterrupted)
+            {
+                _playback.Fail(
+                    CampathStartFailure.ReplayUnavailable,
+                    "Camera path stopped because replay playback ended.");
+                RaiseCampathState();
+                _message = _playback.Status.Detail;
+            }
+            else
+            {
+                _message = "Native camera ownership released because replay playback ended.";
+            }
             OnStatusChanged();
         }
         else if (!freeRoam && Volatile.Read(ref _cameraTransferDepth) == 0)
@@ -1603,47 +2257,139 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                 flags))
             return;
 
-        var releaseManualCamera = ManualCameraDesired ||
-                                  flags.HasFlag(InProcessStatusFlags.ManualCameraRequested) ||
-                                  flags.HasFlag(InProcessStatusFlags.ManualCameraActive);
+        var releaseManualCamera = flags.HasFlag(InProcessStatusFlags.ManualCameraRequested) ||
+                                  flags.HasFlag(InProcessStatusFlags.ManualCameraActive) ||
+                                  flags.HasFlag(InProcessStatusFlags.RollOverrideActive);
         var releaseFullOverride = HasFullCameraOwnershipIntent(_campathPlaying, _holdingKeyframe, flags);
-        SetManualCameraDesired(false);
-        if (Interlocked.Exchange(ref _ownershipCleanupQueued, 1) == 0)
+        var message = ManualCameraDesired
+            ? "SMVM Free Camera was interrupted because Deadlock changed POV. " +
+              "Camera writes were released; automatic recovery is starting."
+            : "Native camera ownership released because POV mode changed.";
+        if (ManualCameraDesired)
         {
-            _ = StopAfterPovLossAsync(
-                "Native camera ownership released because POV mode changed.",
+            QueueAutomaticManualCameraRecovery(
+                message,
                 releaseManualCamera,
                 releaseFullOverride);
         }
+        else if (Interlocked.Exchange(ref _ownershipCleanupQueued, 1) == 0)
+        {
+            _ = StopAfterPovLossAsync(
+                message,
+                releaseManualCamera,
+                releaseFullOverride,
+                automaticRecoveryClaimed: false,
+                ownershipEpoch: CaptureOwnershipEpoch());
+        }
+    }
+
+    private void QueueAutomaticManualCameraRecovery(
+        string message,
+        bool releaseManualCamera,
+        bool releaseFullOverride,
+        bool forceInternalFreeRoam = false)
+    {
+        var ownershipEpoch = CaptureOwnershipEpoch();
+        if (!CanQueueAutomaticManualCameraRecovery(
+                ManualCameraDesired,
+                Volatile.Read(ref _manualRecoveryQueued) != 0) ||
+            Interlocked.Exchange(ref _manualRecoveryQueued, 1) != 0)
+            return;
+
+        _ = StopAfterPovLossAsync(
+            message,
+            releaseManualCamera,
+            releaseFullOverride,
+            automaticRecoveryClaimed: true,
+            ownershipEpoch: ownershipEpoch,
+            forceInternalFreeRoam: forceInternalFreeRoam);
     }
 
     private async Task StopAfterPovLossAsync(
         string message,
         bool releaseManualCamera,
-        bool releaseFullOverride)
+        bool releaseFullOverride,
+        bool automaticRecoveryClaimed,
+        long ownershipEpoch,
+        bool forceInternalFreeRoam = false)
     {
+        using var recoveryTimeout = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
+        if (automaticRecoveryClaimed)
+            recoveryTimeout.CancelAfter(AutomaticRecoveryTimeout);
+        var recoveryToken = recoveryTimeout.Token;
         try
         {
-            await _operationGate.WaitAsync(_stop.Token).ConfigureAwait(false);
+            var recoveredAutomatically = false;
+            await _operationGate.WaitAsync(recoveryToken).ConfigureAwait(false);
+            EnterCameraTransfer();
             try
             {
                 var client = _client;
                 if (releaseManualCamera && client?.Connected == true)
-                    await TryDisableManualCameraAsync(client, _stop.Token).ConfigureAwait(false);
+                    await TryDisableManualCameraAsync(client, recoveryToken).ConfigureAwait(false);
                 if (releaseFullOverride)
-                    await StopCampathCoreAsync(_stop.Token).ConfigureAwait(false);
+                    await StopCampathCoreAsync(recoveryToken).ConfigureAwait(false);
+
+                if (automaticRecoveryClaimed && CanAutoRecoverManualCamera(
+                        ManualCameraDesired,
+                        client?.Connected == true,
+                        _controller.State,
+                        _controller.GameTickOffset) &&
+                    !CampathCameraOwned)
+                {
+                    try
+                    {
+                        await AcquireManualCameraCoreAsync(
+                            client!,
+                            recoveryToken,
+                            forceInternalFreeRoam,
+                            ownershipEpoch).ConfigureAwait(false);
+                        message = "SMVM Free Camera automatically recovered after Deadlock changed POV.";
+                        recoveredAutomatically = true;
+                    }
+                    catch (OperationCanceledException) when (_stop.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        using var cleanupTimeout = new CancellationTokenSource(BestEffortCleanupTimeout);
+                        try
+                        {
+                            await TryDisableManualCameraAsync(client!, cleanupTimeout.Token).ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException) when (cleanupTimeout.IsCancellationRequested)
+                        {
+                            _log.Warn("Native camera: automatic recovery cleanup timed out; the pipe was retired.");
+                        }
+                        message += ManualCameraDesired
+                            ? $" Automatic recovery failed: {ex.Message} Free Camera intent remains; press F2 to retry."
+                            : " Automatic recovery was superseded by an explicit Free Camera exit.";
+                    }
+                }
             }
             finally
             {
+                ExitCameraTransfer();
                 _operationGate.Release();
             }
 
             _message = message;
-            _log.Warn($"Native camera: {message}");
+            if (recoveredAutomatically)
+                _log.Info($"Native camera: {message}");
+            else
+                _log.Warn($"Native camera: {message}");
             OnStatusChanged();
         }
         catch (OperationCanceledException) when (_stop.IsCancellationRequested)
         {
+        }
+        catch (OperationCanceledException) when (automaticRecoveryClaimed && recoveryTimeout.IsCancellationRequested)
+        {
+            _message = "Automatic SMVM Free Camera recovery timed out safely. " +
+                       "Free Camera intent remains; press F2 to retry.";
+            _log.Warn($"Native camera: {_message}");
+            OnStatusChanged();
         }
         catch (Exception ex)
         {
@@ -1653,9 +2399,22 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         }
         finally
         {
-            Interlocked.Exchange(ref _ownershipCleanupQueued, 0);
+            if (!automaticRecoveryClaimed)
+                Interlocked.Exchange(ref _ownershipCleanupQueued, 0);
         }
     }
+
+    internal static bool CanQueueAutomaticManualCameraRecovery(
+        bool manualCameraDesired,
+        bool recoveryAlreadyQueued) =>
+        manualCameraDesired && !recoveryAlreadyQueued;
+
+    internal static bool CanAutoRecoverManualCamera(
+        bool manualCameraDesired,
+        bool nativeConnected,
+        ReplayState replay,
+        int? gameTickOffset) =>
+        manualCameraDesired && nativeConnected && IsConfirmedReplay(replay) && gameTickOffset is not null;
 
     private async Task StopAfterOwnershipLossAsync(string message)
     {
@@ -1688,7 +2447,11 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         bool manualCameraDesired,
         InProcessStatusFlags flags) =>
         mode != SpecCameraMode.FreeRoam &&
-        HasCameraOwnershipIntent(campathPlaying, holdingKeyframe, manualCameraDesired, flags);
+        (manualCameraDesired ||
+         HasFullCameraOwnershipIntent(campathPlaying, holdingKeyframe, flags) ||
+         flags.HasFlag(InProcessStatusFlags.ManualCameraRequested) ||
+         flags.HasFlag(InProcessStatusFlags.ManualCameraActive) ||
+         flags.HasFlag(InProcessStatusFlags.RollOverrideActive));
 
     internal static bool HasCameraOwnershipIntent(
         bool campathPlaying,
@@ -1708,13 +2471,23 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         flags.HasFlag(InProcessStatusFlags.OverrideRequested) ||
         flags.HasFlag(InProcessStatusFlags.OverrideActive);
 
-    internal static bool ShouldFailClosedManualCameraAfterNativeLoss(
+    internal static bool HasNativeCameraResourcesToRelease(InProcessStatusFlags flags) =>
+        HasCameraOwnershipIntent(
+            campathPlaying: false,
+            holdingKeyframe: false,
+            manualCameraDesired: false,
+            flags) ||
+        flags.HasFlag(InProcessStatusFlags.CampathActive) ||
+        flags.HasFlag(InProcessStatusFlags.RollOverrideActive);
+
+    internal static bool ShouldReportManualCameraInterruption(
         bool manualCameraDesired,
         InProcessCameraStatus? previous,
         InProcessCameraStatus current,
         bool cameraTransferInProgress)
     {
-        if (!manualCameraDesired || cameraTransferInProgress || previous?.ManualCameraActive != true ||
+        if (!manualCameraDesired || cameraTransferInProgress ||
+            previous is not { ManualCameraRequested: true } and not { ManualCameraActive: true } ||
             current.ManualCameraRequested || current.ManualCameraActive)
             return false;
         return true;
@@ -1722,10 +2495,65 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
 
     private void SetManualCameraDesired(bool desired)
     {
-        if (ManualCameraDesired == desired)
-            return;
-        Volatile.Write(ref _manualCameraDesired, desired);
-        OnStatusChanged();
+        var changed = false;
+        lock (_manualIntentGate)
+        {
+            changed = _manualCameraDesired != desired;
+            Volatile.Write(ref _manualCameraDesired, desired);
+            if (!desired)
+                Interlocked.Exchange(ref _manualRecoveryQueued, 1);
+        }
+        if (changed)
+            OnStatusChanged();
+    }
+
+    private bool TrySetManualCameraDesiredForEpoch(long ownershipEpoch)
+    {
+        var changed = false;
+        lock (_manualIntentGate)
+        {
+            if (!IsOwnershipOperationCurrent(ownershipEpoch, _explicitExitEpoch))
+                return false;
+            changed = !_manualCameraDesired;
+            Volatile.Write(ref _manualCameraDesired, true);
+        }
+        if (changed)
+            OnStatusChanged();
+        return true;
+    }
+
+    private bool CompleteManualCameraAcquisitionForEpoch(
+        long ownershipEpoch,
+        InProcessCameraStatus status)
+    {
+        lock (_manualIntentGate)
+        {
+            if (!IsOwnershipOperationCurrent(ownershipEpoch, _explicitExitEpoch) ||
+                !IsManualCameraEstablished(_manualCameraDesired, status))
+                return false;
+            Interlocked.Exchange(ref _manualRecoveryQueued, 0);
+            return true;
+        }
+    }
+
+    private void MarkManualCameraEstablished(InProcessCameraStatus status)
+    {
+        lock (_manualIntentGate)
+        {
+            if (IsManualCameraEstablished(_manualCameraDesired, status))
+                Interlocked.Exchange(ref _manualRecoveryQueued, 0);
+        }
+    }
+
+    private bool ResetAutomaticRecoveryLatchIfDesired()
+    {
+        lock (_manualIntentGate)
+        {
+            if (!_manualCameraDesired)
+                return false;
+            Interlocked.Exchange(ref _manualRecoveryQueued, 0);
+            return true;
+        }
     }
 
     private void EnterCameraTransfer() => Interlocked.Increment(ref _cameraTransferDepth);
@@ -1803,26 +2631,31 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
     private async Task<string?> RestoreAfterSelfTestAsync(
         NativeReplayCameraClient client,
         SmvmSelfTestKind kind,
-        SmvmSelfTestRestorationPolicy restoration)
+        SmvmSelfTestRestorationPolicy restoration,
+        long ownershipEpoch)
     {
         using var restorationTimeout = new CancellationTokenSource(SelfTestRestorationTimeout);
         var restorationToken = restorationTimeout.Token;
         try
         {
+            ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
             PublishSelfTest(kind, SmvmSelfTestStage.RestoringCamera,
                 "Restoring the exact baseline camera sample.", restoration.Baseline);
             var transfer = await client.SetCameraSampleAsync(restoration.Baseline, restorationToken)
                 .ConfigureAwait(false);
             UpdateStatus(transfer);
+            ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
             var beforeHookCalls = transfer.HookCalls;
             var armed = await client.EnableOverrideAsync(restorationToken).ConfigureAwait(false);
             UpdateStatus(armed);
+            ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
             var restored = await PollSelfTestStatusAsync(
                 client,
                 status => status.OverrideActive && status.CameraObserved && status.HookCalls > beforeHookCalls &&
                           SmvmSelfTestPolicy.SamplesMatch(restoration.Baseline, status.Camera),
                 armed,
                 restorationToken).ConfigureAwait(false);
+            ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
             if (!restored.OverrideActive || !restored.CameraObserved ||
                 !SmvmSelfTestPolicy.SamplesMatch(restoration.Baseline, restored.Camera))
                 throw new InvalidOperationException(
@@ -1836,13 +2669,18 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                 // Arm manual ownership beneath the still-active baseline override.
                 // DisableOverride then rebases manual from the exact applied sample,
                 // avoiding a Deadlock-owned recompute frame between the two modes.
-                SetManualCameraDesired(true);
+                ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
+                if (!TrySetManualCameraDesiredForEpoch(ownershipEpoch))
+                    throw new InvalidOperationException(
+                        "Self-test ownership restoration was superseded by an explicit exit.");
                 await PublishFreshSmvmSnapshotAsync(client, required: true, restorationToken)
                     .ConfigureAwait(false);
                 var prepared = await client.PrepareCameraObservationAsync(restorationToken).ConfigureAwait(false);
                 UpdateStatus(prepared);
+                ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
                 var requested = await client.EnableManualCameraAsync(restorationToken).ConfigureAwait(false);
                 UpdateStatus(requested);
+                ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
                 if (!requested.ManualCameraRequested)
                     throw new InvalidOperationException("The prior Free Camera request could not be rearmed.");
                 var beforeManualHooks = requested.HookCalls;
@@ -1865,9 +2703,11 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             }
             if (restoration.RestoreRollOverride)
             {
+                ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
                 var rollStatus = await client.SetRollOverrideAsync(
                     restoration.Baseline.Roll, restorationToken).ConfigureAwait(false);
                 UpdateStatus(rollStatus);
+                ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
                 var beforeRollHooks = rollStatus.HookCalls;
                 bool RollOwnershipRestored(InProcessCameraStatus status) =>
                     status.RollOverrideActive && status.CameraObserved &&
@@ -1887,7 +2727,9 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            SetManualCameraDesired(false);
+            if (!restoration.RestoreManualCamera ||
+                !TrySetManualCameraDesiredForEpoch(ownershipEpoch))
+                SetManualCameraDesired(false);
             using var cleanupTimeout = new CancellationTokenSource(SelfTestEmergencyCleanupTimeout);
             try { await TryDisableManualCameraAsync(client, cleanupTimeout.Token).ConfigureAwait(false); }
             catch (OperationCanceledException)
@@ -2061,18 +2903,23 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
     private void UpdateStatus(InProcessCameraStatus status)
     {
         var previous = _status;
-        var manualCameraLost = ShouldFailClosedManualCameraAfterNativeLoss(
+        var manualCameraInterrupted = ShouldReportManualCameraInterruption(
             ManualCameraDesired,
             previous,
             status,
             Volatile.Read(ref _cameraTransferDepth) > 0);
         _status = status;
-        if (manualCameraLost)
+        MarkManualCameraEstablished(status);
+        if (manualCameraInterrupted)
         {
-            Volatile.Write(ref _manualCameraDesired, false);
-            _message = $"SMVM Free Camera ownership was revoked by the native backend " +
-                       $"({DescribeNativeStatus(status)}). Reacquire explicitly after the camera gate is healthy.";
+            _message = $"SMVM Free Camera was interrupted by the native backend " +
+                       $"({DescribeNativeStatus(status)}). Camera writes are fail-closed; " +
+                       "automatic recovery is starting.";
             _log.Warn($"Native camera: {_message}");
+            QueueAutomaticManualCameraRecovery(
+                _message,
+                releaseManualCamera: true,
+                releaseFullOverride: false);
         }
         var lifecycle = status.OverlayFlags &
             (SmvmOverlayFlags.HookInstalled | SmvmOverlayFlags.PresentObserved | SmvmOverlayFlags.Ready |
@@ -2156,7 +3003,7 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         _camera.SelectionChanged -= OnSelectionChanged;
-        SetManualCameraDesired(false);
+        CancelManualCameraIntent();
         SmvmSnapshotProvider = null;
         _stop.Cancel();
         try { await _monitorTask.ConfigureAwait(false); } catch (OperationCanceledException) { }

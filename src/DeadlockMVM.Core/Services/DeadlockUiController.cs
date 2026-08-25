@@ -56,6 +56,17 @@ public sealed class DeadlockUiController
     }
 
     /// <summary>
+    /// Replays the active suppression command without changing presentation
+    /// mode. Replay transport and editor-menu transitions can make the engine
+    /// recreate Panorama even though SMVM still owns the movie interface.
+    /// </summary>
+    public bool ReassertSuppression(bool replayActive)
+    {
+        var mode = State.Mode;
+        return mode == DeadlockUiMode.DeadlockUi || Apply(mode, replayActive);
+    }
+
+    /// <summary>
     /// Leaves Clean Footage without guessing which visible interface the editor
     /// was using before it was hidden.
     /// </summary>

@@ -27,7 +27,7 @@ public sealed class AppSettings : IAppSettings
         public string SmvmRestoreUiHotkey { get; set; } = "F9";
         public string SmvmCycleUiHotkey { get; set; } = "F8";
         public string SmvmToggleFreeCameraHotkey { get; set; } = "F2";
-        public string SmvmReplayPauseHotkey { get; set; } = "RightShift";
+        public string SmvmReplayPauseHotkey { get; set; } = "N";
         public string SmvmStepBackHotkey { get; set; } = "PageUp";
         public string SmvmStepForwardHotkey { get; set; } = "PageDown";
         public bool SmvmCameraInputTakeover { get; set; } = true;
@@ -173,7 +173,7 @@ public sealed class AppSettings : IAppSettings
     public string SmvmReplayPauseHotkey
     {
         get => _document.SmvmReplayPauseHotkey;
-        set => _document.SmvmReplayPauseHotkey = NormalizeSlotBinding(125, value, "RightShift");
+        set => _document.SmvmReplayPauseHotkey = NormalizeSlotBinding(125, value, "N");
     }
 
     public string SmvmStepBackHotkey
@@ -543,8 +543,13 @@ public sealed class AppSettings : IAppSettings
         _document.SmvmCycleUiHotkey = NormalizeSlotBinding(123, _document.SmvmCycleUiHotkey, "F8");
         _document.SmvmToggleFreeCameraHotkey = NormalizeSlotBinding(
             124, _document.SmvmToggleFreeCameraHotkey, "F2");
+        // RightShift was the pre-simplification default. Migrate that exact
+        // canonical value so existing internal installs receive the owner's N
+        // shortcut without requiring a settings reset.
+        if (string.Equals(_document.SmvmReplayPauseHotkey, "RightShift", StringComparison.OrdinalIgnoreCase))
+            _document.SmvmReplayPauseHotkey = "N";
         _document.SmvmReplayPauseHotkey = NormalizeSlotBinding(
-            125, _document.SmvmReplayPauseHotkey, "RightShift");
+            125, _document.SmvmReplayPauseHotkey, "N");
         _document.SmvmStepBackHotkey = NormalizeSlotBinding(
             127, _document.SmvmStepBackHotkey, "PageUp");
         _document.SmvmStepForwardHotkey = NormalizeSlotBinding(

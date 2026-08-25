@@ -14,9 +14,8 @@ namespace DeadlockMVM.Core.Services;
 ///  - paused: derived authoritatively from stalled tick progression between
 ///    consecutive polls; "CGameRules - paused/unpaused" output lines provide
 ///    instant hints that the next poll confirms or corrects.
-///  - timescale: the engine cannot report demo_timescale (host_timescale does
-///    not track it), so the last commanded value is surfaced and null until
-///    MVM sets one.
+///  - timescale: the last SMVM-commanded host_timescale is surfaced and remains
+///    null until SMVM sets one for the active demo.
 /// </summary>
 public sealed class ReplayController : IReplayPlaybackState, IDisposable
 {
@@ -120,7 +119,8 @@ public sealed class ReplayController : IReplayPlaybackState, IDisposable
     {
         ReplayCommands.ValidateSpeed(speed);
         Send(ReplayCommands.SetTimescale(speed));
-        // Engine has no query for this; surface the commanded value explicitly.
+        // Surface the commanded value immediately; the replay snapshot stays
+        // consistent with the host_timescale controls without a console poll.
         lock (_gate)
         {
             _state = _state with { Timescale = speed };

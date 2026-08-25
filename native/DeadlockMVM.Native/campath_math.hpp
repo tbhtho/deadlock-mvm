@@ -170,4 +170,316 @@ struct Vector3 final {
     };
 }
 
+namespace campath_detail {
+
+// HLAE's default campath uses a whole-path cubic spline instead of easing each
+// keyframe pair independently.  The latter makes the camera brake and restart
+// at every keyframe.  These helpers use the real demo ticks as knot times, so
+// velocity and direction remain continuous even when keyframes are unevenly
+// spaced.  Ease modes become endpoint boundary conditions; they never alter an
+// interior segment's clock.
+[[nodiscard]] inline std::array<double, kMaxCampathKeyframes> SplineSecondDerivatives(
+    const CampathKeyframe* keys,
+    const std::uint32_t count,
+    const std::array<double, kMaxCampathKeyframes>& values,
+    const bool ease_in,
+    const bool ease_out) noexcept {
+    std::array<double, kMaxCampathKeyframes> second{};
+    std::array<double, kMaxCampathKeyframes> upper{};
+    if (keys == nullptr || count < 2 || count > kMaxCampathKeyframes)
+        return second;
+
+    const auto first_span = std::max(
+        static_cast<double>(keys[1].demo_tick - keys[0].demo_tick), 1.0);
+    if (ease_in) {
+        second[0] = -0.5;
+        upper[0] = (3.0 / first_span) * ((values[1] - values[0]) / first_span);
+    }
+
+    for (std::uint32_t index = 1; index + 1 < count; ++index) {
+        const auto previous_span = std::max(
+            static_cast<double>(keys[index].demo_tick - keys[index - 1].demo_tick), 1.0);
+        const auto next_span = std::max(
+            static_cast<double>(keys[index + 1].demo_tick - keys[index].demo_tick), 1.0);
+        const auto sigma = previous_span / (previous_span + next_span);
+        const auto pivot = (sigma * second[index - 1]) + 2.0;
+        second[index] = (sigma - 1.0) / pivot;
+        const auto slope_delta =
+            ((values[index + 1] - values[index]) / next_span) -
+            ((values[index] - values[index - 1]) / previous_span);
+        upper[index] = ((6.0 * slope_delta / (previous_span + next_span)) -
+                        (sigma * upper[index - 1])) /
+                       pivot;
+    }
+
+    auto final_second = 0.0;
+    auto final_upper = 0.0;
+    if (ease_out) {
+        const auto final_span = std::max(
+            static_cast<double>(keys[count - 1].demo_tick - keys[count - 2].demo_tick), 1.0);
+        final_second = 0.5;
+        final_upper = (-3.0 / final_span) *
+                      ((values[count - 1] - values[count - 2]) / final_span);
+    }
+    second[count - 1] =
+        (final_upper - (final_second * upper[count - 2])) /
+        ((final_second * second[count - 2]) + 1.0);
+    for (std::uint32_t index = count - 1; index-- > 0;)
+        second[index] = (second[index] * second[index + 1]) + upper[index];
+    return second;
+}
+
+[[nodiscard]] inline double EvaluateSpline(
+    const CampathKeyframe* keys,
+    const std::uint32_t count,
+    const std::uint32_t segment,
+    const double amount,
+    const std::array<double, kMaxCampathKeyframes>& values,
+    const CampathEasing easing) noexcept {
+    const auto second = SplineSecondDerivatives(
+        keys,
+        count,
+        values,
+        easing == CampathEasing::ease_in || easing == CampathEasing::ease_in_out,
+        easing == CampathEasing::ease_out || easing == CampathEasing::ease_in_out);
+    const auto span = std::max(
+        static_cast<double>(keys[segment + 1].demo_tick - keys[segment].demo_tick), 1.0);
+    const auto right = std::clamp(amount, 0.0, 1.0);
+    const auto left = 1.0 - right;
+    return (left * values[segment]) + (right * values[segment + 1]) +
+           ((((left * left * left) - left) * second[segment]) +
+            (((right * right * right) - right) * second[segment + 1])) *
+               (span * span) / 6.0;
+}
+
+struct Quaternion final {
+    double w{1.0};
+    double x{};
+    double y{};
+    double z{};
+};
+
+[[nodiscard]] inline Quaternion Scale(const Quaternion value, const double amount) noexcept {
+    return {value.w * amount, value.x * amount, value.y * amount, value.z * amount};
+}
+
+[[nodiscard]] inline double Dot(const Quaternion left, const Quaternion right) noexcept {
+    return (left.w * right.w) + (left.x * right.x) +
+           (left.y * right.y) + (left.z * right.z);
+}
+
+[[nodiscard]] inline Quaternion Normalize(const Quaternion value) noexcept {
+    const auto length = std::sqrt(std::max(Dot(value, value), 1e-24));
+    return Scale(value, 1.0 / length);
+}
+
+[[nodiscard]] inline Quaternion Multiply(
+    const Quaternion left, const Quaternion right) noexcept {
+    return {
+        (left.w * right.w) - (left.x * right.x) -
+            (left.y * right.y) - (left.z * right.z),
+        (left.w * right.x) + (left.x * right.w) +
+            (left.y * right.z) - (left.z * right.y),
+        (left.w * right.y) - (left.x * right.z) +
+            (left.y * right.w) + (left.z * right.x),
+        (left.w * right.z) + (left.x * right.y) -
+            (left.y * right.x) + (left.z * right.w),
+    };
+}
+
+[[nodiscard]] inline Quaternion Inverse(const Quaternion value) noexcept {
+    const auto length_squared = std::max(Dot(value, value), 1e-24);
+    return {value.w / length_squared, -value.x / length_squared,
+            -value.y / length_squared, -value.z / length_squared};
+}
+
+[[nodiscard]] inline Vector3 QuaternionLog(const Quaternion raw) noexcept {
+    const auto value = Normalize(raw);
+    const auto vector_length = std::sqrt(
+        (value.x * value.x) + (value.y * value.y) + (value.z * value.z));
+    if (vector_length < 1e-12)
+        return {};
+    const auto angle = std::atan2(vector_length, value.w);
+    const auto scale = angle / vector_length;
+    return {value.x * scale, value.y * scale, value.z * scale};
+}
+
+[[nodiscard]] inline Quaternion QuaternionExp(const Vector3 value) noexcept {
+    const auto angle = std::sqrt(
+        (value.x * value.x) + (value.y * value.y) + (value.z * value.z));
+    if (angle < 1e-12)
+        return Normalize({1.0, value.x, value.y, value.z});
+    const auto scale = std::sin(angle) / angle;
+    return {std::cos(angle), value.x * scale, value.y * scale, value.z * scale};
+}
+
+[[nodiscard]] inline Quaternion Slerp(
+    Quaternion from, Quaternion to, const double raw_amount) noexcept {
+    from = Normalize(from);
+    to = Normalize(to);
+    auto cosine = Dot(from, to);
+    if (cosine < 0.0) {
+        to = Scale(to, -1.0);
+        cosine = -cosine;
+    }
+    const auto amount = std::clamp(raw_amount, 0.0, 1.0);
+    if (cosine > 0.9995) {
+        return Normalize({
+            LerpValue(from.w, to.w, amount), LerpValue(from.x, to.x, amount),
+            LerpValue(from.y, to.y, amount), LerpValue(from.z, to.z, amount),
+        });
+    }
+    const auto angle = std::acos(std::clamp(cosine, -1.0, 1.0));
+    const auto divisor = std::sin(angle);
+    const auto left = std::sin((1.0 - amount) * angle) / divisor;
+    const auto right = std::sin(amount * angle) / divisor;
+    return Normalize({
+        (from.w * left) + (to.w * right), (from.x * left) + (to.x * right),
+        (from.y * left) + (to.y * right), (from.z * left) + (to.z * right),
+    });
+}
+
+[[nodiscard]] inline Quaternion QuaternionFromCamera(const CameraSample& camera) noexcept {
+    constexpr auto radians = 3.14159265358979323846 / 180.0;
+    const auto half_roll = camera.roll * radians * 0.5;
+    const auto half_pitch = camera.pitch * radians * 0.5;
+    const auto half_yaw = camera.yaw * radians * 0.5;
+    const auto sr = std::sin(half_roll);
+    const auto cr = std::cos(half_roll);
+    const auto sp = std::sin(half_pitch);
+    const auto cp = std::cos(half_pitch);
+    const auto sy = std::sin(half_yaw);
+    const auto cy = std::cos(half_yaw);
+    return Normalize({
+        (cr * cp * cy) + (sr * sp * sy),
+        (sr * cp * cy) - (cr * sp * sy),
+        (cr * sp * cy) + (sr * cp * sy),
+        (cr * cp * sy) - (sr * sp * cy),
+    });
+}
+
+[[nodiscard]] inline CameraSample CameraAnglesFromQuaternion(
+    const Quaternion raw, CameraSample sample) noexcept {
+    constexpr auto degrees = 180.0 / 3.14159265358979323846;
+    const auto value = Normalize(raw);
+    const auto matrix_11 = (2.0 * ((value.w * value.w) + (value.x * value.x))) - 1.0;
+    const auto matrix_12 = 2.0 * ((value.x * value.y) + (value.w * value.z));
+    const auto matrix_13 = 2.0 * ((value.x * value.z) - (value.w * value.y));
+    const auto matrix_23 = 2.0 * ((value.y * value.z) + (value.w * value.x));
+    const auto matrix_33 = (2.0 * ((value.w * value.w) + (value.z * value.z))) - 1.0;
+    sample.pitch = std::clamp(
+        std::asin(std::clamp(-matrix_13, -1.0, 1.0)) * degrees, -89.0, 89.0);
+    sample.yaw = NormalizeAngle(std::atan2(matrix_12, matrix_11) * degrees);
+    sample.roll = NormalizeAngle(std::atan2(matrix_23, matrix_33) * degrees);
+    return sample;
+}
+
+[[nodiscard]] inline std::array<Quaternion, kMaxCampathKeyframes> AlignedRotations(
+    const CampathKeyframe* keys, const std::uint32_t count) noexcept {
+    std::array<Quaternion, kMaxCampathKeyframes> rotations{};
+    for (std::uint32_t index = 0; index < count; ++index) {
+        rotations[index] = QuaternionFromCamera(keys[index].camera);
+        if (index > 0 && Dot(rotations[index - 1], rotations[index]) < 0.0)
+            rotations[index] = Scale(rotations[index], -1.0);
+    }
+    return rotations;
+}
+
+[[nodiscard]] inline Vector3 RotationTangent(
+    const CampathKeyframe* keys,
+    const std::array<Quaternion, kMaxCampathKeyframes>& rotations,
+    const std::uint32_t count,
+    const std::uint32_t index) noexcept {
+    if (index == 0 || index + 1 >= count)
+        return {};
+    const auto previous_span = std::max(
+        static_cast<double>(keys[index].demo_tick - keys[index - 1].demo_tick), 1.0);
+    const auto next_span = std::max(
+        static_cast<double>(keys[index + 1].demo_tick - keys[index].demo_tick), 1.0);
+    const auto previous = Scale(
+        QuaternionLog(Multiply(Inverse(rotations[index]), rotations[index - 1])),
+        -1.0 / previous_span);
+    const auto next = Scale(
+        QuaternionLog(Multiply(Inverse(rotations[index]), rotations[index + 1])),
+        1.0 / next_span);
+    return Scale(
+        Add(Scale(previous, next_span), Scale(next, previous_span)),
+        1.0 / (previous_span + next_span));
+}
+
+[[nodiscard]] inline Quaternion EvaluateRotationSpline(
+    const CampathKeyframe* keys,
+    const std::uint32_t count,
+    const std::uint32_t segment,
+    const double raw_amount) noexcept {
+    const auto rotations = AlignedRotations(keys, count);
+    const auto span = std::max(
+        static_cast<double>(keys[segment + 1].demo_tick - keys[segment].demo_tick), 1.0);
+    const auto from_tangent = RotationTangent(keys, rotations, count, segment);
+    const auto to_tangent = RotationTangent(keys, rotations, count, segment + 1);
+    const auto first_control = Multiply(
+        rotations[segment], QuaternionExp(Scale(from_tangent, span / 3.0)));
+    const auto second_control = Multiply(
+        rotations[segment + 1], QuaternionExp(Scale(to_tangent, -span / 3.0)));
+    const auto amount = std::clamp(raw_amount, 0.0, 1.0);
+    const auto first = Slerp(rotations[segment], first_control, amount);
+    const auto middle = Slerp(first_control, second_control, amount);
+    const auto last = Slerp(second_control, rotations[segment + 1], amount);
+    const auto left = Slerp(first, middle, amount);
+    const auto right = Slerp(middle, last, amount);
+    return Slerp(left, right, amount);
+}
+
+} // namespace campath_detail
+
+// Whole-path cinematic evaluation used by both the rendered camera and the
+// preview geometry. Position/FOV are tick-aware cubic splines; orientation is a
+// shortest-path spherical cubic with continuous interior tangents and zero
+// endpoint angular velocity.
+[[nodiscard]] inline CameraSample EvaluateCampathCamera(
+    const CampathKeyframe* keys,
+    const std::uint32_t count,
+    const std::uint32_t segment,
+    const double raw_amount,
+    const CampathInterpolation interpolation,
+    const CampathEasing easing) noexcept {
+    if (keys == nullptr || count < 2 || count > kMaxCampathKeyframes || segment + 1 >= count)
+        return {};
+    if (interpolation == CampathInterpolation::linear) {
+        return EvaluateLinearCamera(
+            keys[segment].camera,
+            keys[segment + 1].camera,
+            ApplyCampathEasing(raw_amount, easing));
+    }
+
+    std::array<double, kMaxCampathKeyframes> x{};
+    std::array<double, kMaxCampathKeyframes> y{};
+    std::array<double, kMaxCampathKeyframes> z{};
+    std::array<double, kMaxCampathKeyframes> fov{};
+    auto minimum_fov = kMaxFov;
+    auto maximum_fov = kMinFov;
+    for (std::uint32_t index = 0; index < count; ++index) {
+        x[index] = keys[index].camera.x;
+        y[index] = keys[index].camera.y;
+        z[index] = keys[index].camera.z;
+        fov[index] = keys[index].camera.fov;
+        minimum_fov = std::min(minimum_fov, fov[index]);
+        maximum_fov = std::max(maximum_fov, fov[index]);
+    }
+    CameraSample sample{
+        campath_detail::EvaluateSpline(keys, count, segment, raw_amount, x, easing),
+        campath_detail::EvaluateSpline(keys, count, segment, raw_amount, y, easing),
+        campath_detail::EvaluateSpline(keys, count, segment, raw_amount, z, easing),
+        0.0,
+        0.0,
+        0.0,
+        std::clamp(
+            campath_detail::EvaluateSpline(keys, count, segment, raw_amount, fov, easing),
+            minimum_fov,
+            maximum_fov),
+    };
+    return campath_detail::CameraAnglesFromQuaternion(
+        campath_detail::EvaluateRotationSpline(keys, count, segment, raw_amount), sample);
+}
+
 } // namespace deadlock_mvm

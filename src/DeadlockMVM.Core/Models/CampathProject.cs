@@ -18,8 +18,8 @@ public sealed class CampathProject
     public int SchemaVersion { get; init; } = CurrentSchemaVersion;
     public string Name { get; init; } = "Untitled Campath";
     public CampathReplayIdentifier ReplayIdentifier { get; init; } = new(string.Empty, null);
-    public CampathInterpolationMode InterpolationMode { get; init; } = CampathInterpolationMode.Linear;
-    public CampathEasingMode EasingMode { get; init; } = CampathEasingMode.Linear;
+    public CampathInterpolationMode InterpolationMode { get; init; } = CampathInterpolationMode.Smooth;
+    public CampathEasingMode EasingMode { get; init; } = CampathEasingMode.EaseInOut;
     public CampathEndBehavior EndBehavior { get; init; } = CampathEndBehavior.StopAndRelease;
     public List<CampathKeyframe> Keyframes { get; init; } = [];
 

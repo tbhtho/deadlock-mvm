@@ -34,6 +34,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
     private readonly IAppSettings _settings;
     private readonly ILogService _log;
     private readonly DeadlockUiController _deadlockUi;
+    private readonly DemoStartupPolicy _demoStartup = new();
     private readonly Dispatcher _dispatcher;
     private readonly SemaphoreSlim _actionGate = new(1, 1);
     private readonly SemaphoreSlim _pathPublishGate = new(1, 1);
@@ -45,6 +46,9 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
     private int _publishedRevision = -1;
     private int _replaySeekInFlight;
     private bool _nativeWasConnected;
+    private string _observedReplayIdentity = string.Empty;
+    private string _normalizedHostTimescaleIdentity = string.Empty;
+    private bool? _observedReplayPaused;
 
     public SmvmHostCoordinator(
         ICameraService camera,
@@ -74,10 +78,37 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         _native.CampathStateChanged += OnCampathStateChanged;
         _controller.StateChanged += OnReplayStateChanged;
         _ = PublishEditorPathAsync();
+        CoordinateDemoStartup(_controller.State);
     }
 
-    private void OnActionReceived(object? sender, SmvmAction action) =>
+    private void OnActionReceived(object? sender, SmvmAction action)
+    {
+        if (IsDemoStartupOwnerOverride(action))
+            _demoStartup.MarkOwnerOverride();
+        // Explicit exits win immediately over any seek/self-test already ahead
+        // of this action in the serialized queue. Native cleanup remains ordered.
+        if (IsExplicitFreeCameraExitAction(action.Type))
+            _native.CancelManualCameraIntent();
+        if (action.Type == SmvmActionType.RestoreDeadlockUi)
+        {
+            // F9 is an emergency presentation escape. Restore Panorama at
+            // ingress instead of making it wait behind a seek or self-test;
+            // the queued handler still performs ordered camera cleanup.
+            _deadlockUi.Restore(force: true);
+        }
         _dispatcher.BeginInvoke(() => _ = ExecuteActionSafeAsync(action));
+    }
+
+    internal static bool IsExplicitFreeCameraExitAction(SmvmActionType action) =>
+        action is SmvmActionType.ToggleManualCamera or SmvmActionType.RestoreDeadlockUi or
+            SmvmActionType.PreviousPlayer or SmvmActionType.NextPlayer or
+            SmvmActionType.InEye or SmvmActionType.Chase;
+
+    private static bool IsDemoStartupOwnerOverride(SmvmAction action) =>
+        IsExplicitFreeCameraExitAction(action.Type) ||
+        action.Type is SmvmActionType.CycleReplayInterface ||
+        (action.Type == SmvmActionType.SetDeadlockUiMode &&
+         action.Index == (int)DeadlockUiMode.DeadlockUi);
 
     private void OnEditorStateChanged(object? sender, EventArgs e)
     {
@@ -97,6 +128,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         {
             _nativeWasConnected = false;
         }
+        _dispatcher.BeginInvoke(() => CoordinateDemoStartup(_controller.State));
     }
 
     private void OnCampathStateChanged(object? sender, CampathPlaybackStatus status) =>
@@ -106,22 +138,153 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         _dispatcher.BeginInvoke(() =>
         {
             RefreshEditorSnapshot();
-            SynchronizeDeadlockUi(state);
+            ReassertMovieUiAfterTransportBoundary(state);
+            CoordinateDemoStartup(state);
         });
 
-    private void SynchronizeDeadlockUi(ReplayState replay)
+    private void ReassertMovieUiAfterTransportBoundary(ReplayState replay)
+    {
+        if (!IsReplayActive(replay))
+        {
+            _observedReplayIdentity = string.Empty;
+            _observedReplayPaused = null;
+            return;
+        }
+
+        var identity = DemoStartupPolicy.CreateReplayIdentity(replay.ReplayName!, replay.TotalTicks);
+        if (!string.Equals(identity, _observedReplayIdentity, StringComparison.Ordinal))
+        {
+            _observedReplayIdentity = identity;
+            _observedReplayPaused = replay.IsPaused;
+            return;
+        }
+
+        var pauseChanged = replay.IsPaused is not null && _observedReplayPaused is not null &&
+                           replay.IsPaused != _observedReplayPaused;
+        if (replay.IsPaused is not null)
+            _observedReplayPaused = replay.IsPaused;
+        if (pauseChanged)
+            _deadlockUi.ReassertSuppression(replayActive: true);
+    }
+
+    private void CoordinateDemoStartup(ReplayState replay)
     {
         var replayActive = IsReplayActive(replay);
+        var replayIdentity = replayActive
+            ? DemoStartupPolicy.CreateReplayIdentity(replay.ReplayName!, replay.TotalTicks)
+            : string.Empty;
+        var directives = _demoStartup.Observe(
+            new DemoStartupObservation(
+                replayActive,
+                replayIdentity,
+                replay.IsPaused == true,
+                _deadlockUi.State.Mode is DeadlockUiMode.SmvmReplayUi or DeadlockUiMode.CleanFootage,
+                _native.Connected,
+                _controller.GameTickOffset is not null,
+                _native.ManualCameraEstablished),
+            DateTimeOffset.UtcNow);
+
         if (!replayActive)
         {
+            _normalizedHostTimescaleIdentity = string.Empty;
             if (_deadlockUi.State.Mode != DeadlockUiMode.DeadlockUi)
                 _deadlockUi.Restore();
             return;
         }
 
-        var preferred = _settings.SmvmDeadlockUiMode;
-        if (_deadlockUi.State.Mode == DeadlockUiMode.DeadlockUi && preferred == DeadlockUiMode.SmvmReplayUi)
-            _deadlockUi.Apply(preferred, replayActive: true);
+        // host_timescale is process-global and can survive replay transitions.
+        // Establish the owner's 100% baseline once for every newly observed
+        // demo, then leave later custom choices alone for that demo session.
+        if (!string.Equals(
+                _normalizedHostTimescaleIdentity,
+                replayIdentity,
+                StringComparison.Ordinal))
+        {
+            _normalizedHostTimescaleIdentity = replayIdentity;
+            try
+            {
+                _controller.SetSpeed(1.0);
+                _log.Info("Demo startup: host_timescale reset to 100%.");
+            }
+            catch (Exception ex)
+            {
+                _normalizedHostTimescaleIdentity = string.Empty;
+                _log.Warn($"Demo startup: host_timescale reset failed: {ex.Message}");
+            }
+        }
+
+        if (directives.PauseDemo)
+        {
+            try
+            {
+                _controller.Pause();
+                _log.Info("Demo startup: pause requested.");
+            }
+            catch (Exception ex)
+            {
+                _demoStartup.MarkPauseCommandFailed(directives.Generation);
+                _log.Warn($"Demo startup: pause request failed: {ex.Message}");
+            }
+        }
+
+        if (directives.HideGameHud)
+        {
+            var hidden = _deadlockUi.Apply(DeadlockUiMode.SmvmReplayUi, replayActive: true);
+            _demoStartup.MarkHudAttemptCompleted(
+                directives.Generation,
+                hidden,
+                DateTimeOffset.UtcNow);
+            if (hidden)
+                _log.Info("Demo startup: Deadlock HUD hidden.");
+        }
+
+        if (directives.EnterFreeCamera)
+            _ = EnterAutomaticFreeCameraAsync(directives.Generation);
+    }
+
+    private async Task EnterAutomaticFreeCameraAsync(int generation)
+    {
+        var acquired = false;
+        var success = false;
+        try
+        {
+            await _actionGate.WaitAsync(_stop.Token).ConfigureAwait(true);
+            acquired = true;
+            if (!_demoStartup.IsCurrent(generation) || !IsReplayActive(_controller.State))
+                return;
+            await EnterSmvmFreeCameraAsync().ConfigureAwait(true);
+            success = _native.ManualCameraEstablished;
+            if (success)
+                _log.Info("Demo startup: SMVM Free Camera active; Deadlock gameplay input is suppressed.");
+        }
+        catch (OperationCanceledException) when (_stop.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Demo startup: automatic Free Camera attempt failed: {ex.Message}");
+        }
+        finally
+        {
+            if (acquired)
+                _actionGate.Release();
+            _demoStartup.MarkFreeCameraAttemptCompleted(
+                generation,
+                success,
+                DateTimeOffset.UtcNow);
+        }
+
+        if (!success && _demoStartup.IsCurrent(generation) && !_stop.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(500, _stop.Token).ConfigureAwait(false);
+                _ = _dispatcher.BeginInvoke(() => CoordinateDemoStartup(_controller.State));
+            }
+            catch (OperationCanceledException) when (_stop.IsCancellationRequested)
+            {
+            }
+        }
     }
 
     private static bool IsReplayActive(ReplayState replay) =>
@@ -174,48 +337,56 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         var availability = ResolveCameraAvailability(
             internalEnabled, replayActive, replay, native, playback, ownership);
         var capabilities = ResolveCapabilities(internalEnabled, native);
+        var cameraOwnershipIntent = replayActive && _native.CameraOwned;
         var cameraReadable = replayActive && _native.Connected &&
             (native?.CameraObserved == true ||
              (native?.Camera.IsValid == true &&
               ownership is CameraOwnership.SmvmManualCamera or
                   CameraOwnership.SmvmRestore or CameraOwnership.SmvmCampath));
-        var spectatorCameraWritable = availability == CameraAvailability.Ready &&
-                                      ownership == CameraOwnership.DeadlockSpectator;
+        var rollWritable = availability == CameraAvailability.Ready &&
+                           ownership == CameraOwnership.SmvmManualCamera &&
+                           _native.ManualCameraEstablished;
 
         var flags = SmvmSnapshotFlags.None;
         if (replayActive) flags |= SmvmSnapshotFlags.ReplayActive;
         if (replay.IsPaused is not null) flags |= SmvmSnapshotFlags.PauseKnown;
         if (replay.IsPaused == true) flags |= SmvmSnapshotFlags.Paused;
         if (cameraReadable) flags |= SmvmSnapshotFlags.CameraReadable;
-        if (_camera.Capabilities.CanWriteActiveFov && spectatorCameraWritable)
-            flags |= SmvmSnapshotFlags.FovWritable;
-        if (cameraReadable && _native.Available && spectatorCameraWritable)
+        if (cameraReadable && _native.Available && rollWritable)
             flags |= SmvmSnapshotFlags.RollWritable;
         if (ownership == CameraOwnership.SmvmCampath) flags |= SmvmSnapshotFlags.CampathPlaying;
-        if (ownership is CameraOwnership.SmvmManualCamera or CameraOwnership.SmvmRestore or CameraOwnership.SmvmCampath)
+        // CameraOwned is the existing protocol flag for managed ownership
+        // intent. It deliberately includes a desired-but-recovering Free Camera,
+        // while ManualCameraRequested/Active retain their native meanings.
+        if (cameraOwnershipIntent)
             flags |= SmvmSnapshotFlags.CameraOwned;
-        if (editor.Keyframes.Length > 0) flags |= SmvmSnapshotFlags.EditorPath;
+        if (editor.Keyframes.Length > 0)
+        {
+            flags |= SmvmSnapshotFlags.EditorPath;
+            flags |= SmvmSnapshotFlags.ShowCameras;
+            if (editor.Keyframes.Length > 1)
+                flags |= SmvmSnapshotFlags.ShowPath;
+        }
         if (internalEnabled) flags |= SmvmSnapshotFlags.InternalEnabled;
-        if (_settings.SmvmShowToolbar) flags |= SmvmSnapshotFlags.ShowToolbar;
-        if (_settings.SmvmShowPath) flags |= SmvmSnapshotFlags.ShowPath;
-        if (_settings.SmvmShowCameras) flags |= SmvmSnapshotFlags.ShowCameras;
-        if (_settings.SmvmShowLabels) flags |= SmvmSnapshotFlags.ShowLabels;
+        // Keep legacy visibility settings load-compatible without publishing
+        // their toolbar, labels, pill, toast, or HUD flags into the live product.
+        // Camera placement markers and their connecting path are always-on
+        // editor guides now; they are not another settings decision.
         if (_settings.SmvmFovWheelInverted) flags |= SmvmSnapshotFlags.FovInverted;
         if (replayActive && _native.Connected && native?.ManualCameraRequested == true)
             flags |= SmvmSnapshotFlags.ManualCameraRequested;
         if (replayActive && _native.Connected && _native.ManualCameraActive)
             flags |= SmvmSnapshotFlags.ManualCameraActive;
-        if (_settings.SmvmCameraInputTakeover && _native.ManualCameraActive)
+        // SMVM Free Camera is the single user-facing camera. Suppressing
+        // Deadlock's competing observer input is an invariant for manual
+        // acquisition/recovery and for full path/restore ownership.
+        if (cameraOwnershipIntent)
             flags |= SmvmSnapshotFlags.InputTakeover;
         if (_settings.SmvmMouseInvertY) flags |= SmvmSnapshotFlags.InvertY;
-        if (_settings.SmvmShowMinimalPill) flags |= SmvmSnapshotFlags.ShowMinimalPill;
-        if (_settings.SmvmNotificationsEnabled) flags |= SmvmSnapshotFlags.Notifications;
-        if (_settings.SmvmHidePathWhilePlaying) flags |= SmvmSnapshotFlags.HidePathWhilePlaying;
         if (editor.Session == CampathSessionState.DraftPath) flags |= SmvmSnapshotFlags.CampathUnsaved;
         if (editor.RecoveryAvailable) flags |= SmvmSnapshotFlags.CampathRecoveryAvailable;
         if (_settings.RestoreLastWorkspace) flags |= SmvmSnapshotFlags.RestoreWorkspace;
         if (_captureDiagnosticsEnabled) flags |= SmvmSnapshotFlags.CaptureDiagnostics;
-        if (_settings.SmvmShowStatusHud) flags |= SmvmSnapshotFlags.ShowStatusHud;
 
         return new SmvmSnapshot(
             flags,
@@ -287,7 +458,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
             _settings.SmvmReplayBarAnchor,
             SmvmInputCode.ParseForSlotOrDefault(123, _settings.SmvmCycleUiHotkey, "F8"),
             SmvmInputCode.ParseForSlotOrDefault(124, _settings.SmvmToggleFreeCameraHotkey, "F2"),
-            SmvmInputCode.ParseForSlotOrDefault(125, _settings.SmvmReplayPauseHotkey, "RightShift"),
+            SmvmInputCode.ParseForSlotOrDefault(125, _settings.SmvmReplayPauseHotkey, "N"),
             SmvmInputCode.ParseForSlotOrDefault(127, _settings.SmvmStepBackHotkey, string.Empty),
             SmvmInputCode.ParseForSlotOrDefault(128, _settings.SmvmStepForwardHotkey, string.Empty),
             _settings.SmvmStatusHudAnchor,
@@ -303,10 +474,10 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
             return CameraOwnership.DeadlockSpectator;
         if (_native.CampathPlaying || native?.Flags.HasFlag(InProcessStatusFlags.CampathActive) == true)
             return CameraOwnership.SmvmCampath;
-        if (native?.ManualCameraRequested == true || native?.ManualCameraActive == true)
-            return CameraOwnership.SmvmManualCamera;
         if (native?.OverrideActive == true || _native.CampathCameraOwned)
             return CameraOwnership.SmvmRestore;
+        if (native?.ManualCameraRequested == true || native?.ManualCameraActive == true)
+            return CameraOwnership.SmvmManualCamera;
         return CameraOwnership.DeadlockSpectator;
     }
 
@@ -499,9 +670,28 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                 ApplyDeadlockUiMode((DeadlockUiMode)action.Index);
                 break;
             case SmvmActionType.RestoreDeadlockUi:
-                _settings.SmvmDeadlockUiMode = DeadlockUiMode.DeadlockUi;
-                _settings.Save();
-                _deadlockUi.Restore(force: true);
+                var exitTask = ExitSmvmFreeCameraAsync();
+                try
+                {
+                    try
+                    {
+                        await exitTask.WaitAsync(TimeSpan.FromSeconds(2), _stop.Token).ConfigureAwait(true);
+                    }
+                    catch (TimeoutException)
+                    {
+                        // F9 is the emergency presentation escape. Do not cancel
+                        // the ownership release: let it finish behind any active
+                        // seek while restoring Deadlock UI immediately.
+                        _log.Warn("SMVM camera release is still completing after F9; Deadlock UI was restored immediately.");
+                        _ = ObserveDeferredCameraExitAsync(exitTask);
+                    }
+                }
+                finally
+                {
+                    _settings.SmvmDeadlockUiMode = DeadlockUiMode.DeadlockUi;
+                    _settings.Save();
+                    _deadlockUi.Restore(force: true);
+                }
                 break;
             case SmvmActionType.CycleReplayInterface:
             {
@@ -548,7 +738,16 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                 _settings.Save();
                 break;
             case SmvmActionType.ToggleReplayPause:
-                _controller.TogglePause();
+                if (action.Index == 1)
+                    _controller.Pause();
+                else if (action.Index == 0)
+                    _controller.Play();
+                else
+                    _controller.TogglePause();
+                // Send suppression after the transport command in the same
+                // VConsole ordering window. The observed pause-state edge
+                // reasserts once more after the engine settles.
+                _deadlockUi.ReassertSuppression(IsReplayActive(_controller.State));
                 break;
             case SmvmActionType.SetTimescale:
                 _controller.SetSpeed(action.Value);
@@ -569,52 +768,57 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                 await EnterSmvmFreeCameraAsync().ConfigureAwait(true);
                 break;
             case SmvmActionType.PreviousPlayer:
-                await DisableManualCameraIfOwnedAsync().ConfigureAwait(true);
+                await ExitSmvmFreeCameraAsync().ConfigureAwait(true);
                 _camera.SelectPrevPlayer();
                 break;
             case SmvmActionType.NextPlayer:
-                await DisableManualCameraIfOwnedAsync().ConfigureAwait(true);
+                await ExitSmvmFreeCameraAsync().ConfigureAwait(true);
                 _camera.SelectNextPlayer();
                 break;
             case SmvmActionType.InEye:
-                await DisableManualCameraIfOwnedAsync().ConfigureAwait(true);
+                await ExitSmvmFreeCameraAsync().ConfigureAwait(true);
                 _camera.SelectInEye();
                 break;
             case SmvmActionType.Chase:
-                await DisableManualCameraIfOwnedAsync().ConfigureAwait(true);
+                await ExitSmvmFreeCameraAsync().ConfigureAwait(true);
                 _camera.SelectChase();
                 break;
             case SmvmActionType.SetFov:
-                if (!_native.CampathPlaying)
-                    await _camera.SetActiveFovAsync(Math.Clamp(action.Value, 5.0, 170.0), _stop.Token)
-                        .ConfigureAwait(true);
+                // A stale overlay may still send this legacy action. The
+                // external Deadlock FOV backend cannot update the in-process
+                // manual sample, so fail closed until a true manual setter exists.
                 break;
             case SmvmActionType.SaveCamera:
                 await _camera.SaveCameraAsync(_stop.Token).ConfigureAwait(true);
                 break;
             case SmvmActionType.RestoreCamera:
-                if (_camera.SavedShot is { } savedShot && !_native.CampathPlaying && !_native.CameraOwned)
-                    await _native.SetManualRollAsync(savedShot.Transform.Roll, _stop.Token).ConfigureAwait(true);
-                await _camera.RestoreCameraAsync(_stop.Token).ConfigureAwait(true);
+                if (!_native.CameraOwned)
+                    await _camera.RestoreCameraAsync(_stop.Token).ConfigureAwait(true);
                 break;
             case SmvmActionType.AddKeyframe:
                 if (action.Tick >= 0 && action.Camera.IsValid)
                 {
+                    if (!_native.ManualCameraEstablished)
+                    {
+                        TraceCapture(
+                            SmvmCaptureStage.CaptureRejected,
+                            SmvmCaptureRejection.NotInFreeRoam,
+                            "SMVM Free Camera is not active");
+                        _campath.ReportCaptureRejection(SmvmCaptureRejection.NotInFreeRoam);
+                        break;
+                    }
                     TraceCapture(
                         SmvmCaptureStage.ManagedActionReturned,
                         detail: $"tick={action.Tick}, camera=({action.Camera.X:F3}, {action.Camera.Y:F3}, {action.Camera.Z:F3}), " +
                                 $"rot=({action.Camera.Pitch:F3}, {action.Camera.Yaw:F3}, {action.Camera.Roll:F3}), fov={action.Camera.Fov:F3}");
                     var priorSession = _campath.SessionState;
-                    var priorCount = _campath.Keyframes.Count;
                     _campath.AddAuthoritativeKeyframe(new CampathKeyframe(action.Tick, action.Camera));
                     if (priorSession == CampathSessionState.NoPath &&
                         _campath.SessionState == CampathSessionState.DraftPath)
                         TraceCapture(SmvmCaptureStage.DraftCreated);
-                    if (_campath.Keyframes.Count > priorCount ||
-                        _campath.Keyframes.Any(keyframe => keyframe.DemoTick == action.Tick))
-                        TraceCapture(
-                            SmvmCaptureStage.KeyframeAdded,
-                            detail: $"count={_campath.Keyframes.Count}, tick={action.Tick}");
+                    TraceCapture(
+                        SmvmCaptureStage.KeyframeAdded,
+                        detail: $"count={_campath.Keyframes.Count}, tick={action.Tick}");
                 }
                 break;
             case SmvmActionType.DeleteKeyframe:
@@ -624,6 +828,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                 _campath.SelectKeyframe(action.Index);
                 break;
             case SmvmActionType.GoToKeyframe:
+                await EnterSmvmFreeCameraAsync().ConfigureAwait(true);
                 _campath.SelectKeyframe(action.Index);
                 await _campath.GoToAsync().ConfigureAwait(true);
                 break;
@@ -644,9 +849,11 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                     _campath.EasingMode = (CampathEasingMode)action.Index;
                 break;
             case SmvmActionType.PlayFromStart:
+                await EnterSmvmFreeCameraAsync().ConfigureAwait(true);
                 await _campath.PlayAsync(CampathPlayMode.FromStart).ConfigureAwait(true);
                 break;
             case SmvmActionType.PlayFromCurrent:
+                await EnterSmvmFreeCameraAsync().ConfigureAwait(true);
                 await _campath.PlayAsync(CampathPlayMode.FromCurrent).ConfigureAwait(true);
                 break;
             case SmvmActionType.StopCampath:
@@ -742,7 +949,9 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                 _settings.Save();
                 break;
             case SmvmActionType.ToggleInputTakeover:
-                _settings.SmvmCameraInputTakeover = !_settings.SmvmCameraInputTakeover;
+                // Kept for protocol compatibility with older overlays. Camera
+                // input takeover is now mandatory while Free Camera is active.
+                _settings.SmvmCameraInputTakeover = true;
                 _settings.Save();
                 break;
             case SmvmActionType.SetUiScale:
@@ -793,19 +1002,9 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                 _settings.Save();
                 break;
             case SmvmActionType.ToggleManualCamera:
-                if (_native.ManualCameraDesired || _native.ManualCameraActive)
-                {
-                    await DisableManualCameraIfOwnedAsync().ConfigureAwait(true);
-                }
-                else
-                {
-                    // The START control is only enabled after the snapshot and
-                    // native replay gate both prove Free Roam. Re-entering roam
-                    // here was not idempotent: spec_goto reconfigured SDL input
-                    // while the activating mouse button was still physically
-                    // down, allowing the same click to select a player.
-                    await _native.EnableManualCameraAsync(_stop.Token).ConfigureAwait(true);
-                }
+                // Native input reserves the legacy action for Escape so the
+                // protocol layout stays stable. F2 emits ReacquireCamera below.
+                await ExitSmvmFreeCameraAsync().ConfigureAwait(true);
                 break;
             case SmvmActionType.ReacquireCamera:
                 await EnterSmvmFreeCameraAsync().ConfigureAwait(true);
@@ -824,19 +1023,29 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         }
     }
 
-    private async Task DisableManualCameraIfOwnedAsync()
-    {
-        if (_native.ManualCameraDesired || _native.ManualCameraActive)
-            await _native.DisableManualCameraAsync(_stop.Token).ConfigureAwait(true);
-    }
-
     private async Task EnterSmvmFreeCameraAsync()
     {
         if (_native.CampathPlaying)
             throw new InvalidOperationException("Stop Campath before reacquiring SMVM Free Camera.");
-        await DisableManualCameraIfOwnedAsync().ConfigureAwait(true);
-        await _camera.EnterFreeRoamAsync(_stop.Token).ConfigureAwait(true);
         await _native.EnableManualCameraAsync(_stop.Token).ConfigureAwait(true);
+    }
+
+    private Task ExitSmvmFreeCameraAsync() =>
+        _native.ExitFreeCameraAsync(_stop.Token);
+
+    private async Task ObserveDeferredCameraExitAsync(Task exitTask)
+    {
+        try
+        {
+            await exitTask.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (_stop.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"SMVM deferred camera release failed: {ex.Message}");
+        }
     }
 
     private void TraceCapture(
@@ -866,7 +1075,8 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         // Clean Footage is deliberately transient. A fresh replay never starts
         // with both native UI stacks hidden; it returns to the user's normal or
         // custom replay UI preference.
-        if (mode is DeadlockUiMode.DeadlockUi or DeadlockUiMode.SmvmReplayUi)
+        if ((mode is DeadlockUiMode.DeadlockUi or DeadlockUiMode.SmvmReplayUi) &&
+            _settings.SmvmDeadlockUiMode != mode)
         {
             _settings.SmvmDeadlockUiMode = mode;
             _settings.Save();
@@ -912,7 +1122,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
     {
         ApplyBindingPreset([
             (111, "Tab"), (112, "Mouse3"), (113, "L"), (114, "F10"), (122, "F9"),
-            (123, "F8"), (124, "F2"), (125, "RightShift"),
+            (123, "F8"), (124, "F2"), (125, "N"),
             (100, "W"), (101, "S"), (102, "A"), (103, "D"), (104, "Space"),
             (105, "LeftCtrl"), (106, "LeftShift"), (107, "LeftAlt"),
             (108, "Q"), (109, "E"), (110, "R"),
@@ -926,7 +1136,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
     {
         ApplyBindingPreset([
             (111, "Tab"), (112, "Mouse3"), (113, "L"), (114, "F10"), (122, "F9"),
-            (123, "F8"), (124, "F2"), (125, "RightShift"),
+            (123, "F8"), (124, "F2"), (125, "N"),
             (100, "W"), (101, "S"), (102, "A"), (103, "D"), (104, "Space"),
             (105, "LeftCtrl"), (106, "LeftShift"), (107, "LeftAlt"),
             (108, "Q"), (109, "E"), (110, "R"),
@@ -1124,7 +1334,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         119 => "Redo",
         120 => "Show Path",
         121 => "Show Cameras",
-        122 => "Restore Deadlock UI",
+        122 => "Emergency Exit + Restore",
         123 => "Cycle Replay Interface",
         124 => "Toggle Free Camera",
         125 => "Replay Play/Pause",

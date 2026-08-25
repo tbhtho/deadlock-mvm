@@ -9,7 +9,7 @@ public readonly record struct CampathCaptureAvailability(
     bool ReplayActive,
     bool NativeBackendReady,
     bool CameraReadable,
-    bool FreeRoam,
+    bool FreeCameraActive,
     bool CameraOwned,
     bool OperationInFlight);
 
@@ -17,7 +17,7 @@ public static class CampathCaptureGate
 {
     public static bool CanCapture(CampathCaptureAvailability availability) =>
         availability.DeadlockRunning && availability.ReplayActive && availability.NativeBackendReady &&
-        availability.CameraReadable && availability.FreeRoam && !availability.CameraOwned &&
+        availability.CameraReadable && availability.FreeCameraActive && !availability.CameraOwned &&
         !availability.OperationInFlight;
 }
 
