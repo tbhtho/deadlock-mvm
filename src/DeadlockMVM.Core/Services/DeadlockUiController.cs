@@ -36,6 +36,15 @@ public sealed class DeadlockUiController
         "r_drawpanorama true",
     });
 
+    /// <summary>
+    /// Pause/resume and Tab can recreate Panorama without resetting the other
+    /// movie-presentation cvars. Those frequent transitions only need this
+    /// single idempotent command; replaying the full profile on every state
+    /// callback creates avoidable VConsole and render-thread pressure.
+    /// </summary>
+    public static IReadOnlyList<string> ReplayHudSuppressionCommands { get; } =
+        Array.AsReadOnly(new[] { "r_drawpanorama false" });
+
     private readonly ReplayController _replay;
     private readonly ILogService _log;
     private readonly object _gate = new();
@@ -134,9 +143,34 @@ public sealed class DeadlockUiController
     public bool ReassertSuppression(bool replayActive)
     {
         var profile = ProfileStatus;
-        return profile.DesiredMode == DeadlockUiMode.DeadlockUi
-            ? profile.Ui.Mode == DeadlockUiMode.DeadlockUi && !profile.RestorePending
-            : Apply(profile.DesiredMode, replayActive);
+        if (profile.DesiredMode == DeadlockUiMode.DeadlockUi)
+            return profile.Ui.Mode == DeadlockUiMode.DeadlockUi && !profile.RestorePending;
+        if (!replayActive)
+            return Fail(DeadlockUiError.ReplayUnavailable, "A live replay is required before hiding Deadlock UI.");
+
+        lock (_profileTransactionGate)
+        {
+            profile = ProfileStatus;
+            if (profile.DesiredMode == DeadlockUiMode.DeadlockUi)
+                return profile.Ui.Mode == DeadlockUiMode.DeadlockUi && !profile.RestorePending;
+            if (!_replay.IsConnected)
+                return Fail(DeadlockUiError.CommandChannelUnavailable, "Deadlock's command channel is unavailable.");
+
+            SetDesiredForwardMode(profile.DesiredMode);
+            BeginProfileApply();
+            try
+            {
+                SendProfile(ReplayHudSuppressionCommands);
+                CompleteProfileApply(profile.DesiredMode, profile.AcknowledgementGeneration);
+                _log.Info("Deadlock HUD suppression reasserted.");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                TryRestoreAfterFailureLocked();
+                return Fail(DeadlockUiError.ApplyFailed, $"Could not reassert Deadlock HUD suppression: {ex.Message}");
+            }
+        }
     }
 
     /// <summary>

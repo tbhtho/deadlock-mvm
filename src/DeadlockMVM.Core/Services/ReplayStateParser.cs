@@ -60,8 +60,8 @@ public sealed partial class ReplayStateParser
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex DemoPlaybackStartedLine();
 
-    [GeneratedRegex(@"demo_timescale\s*=\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)")]
-    private static partial Regex DemoTimescaleLine();
+    [GeneratedRegex(@"host_timescale\s*=\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)")]
+    private static partial Regex HostTimescaleLine();
 
     /// <summary>
     /// Source emits this only when a demo instance actually begins playback,
@@ -153,9 +153,9 @@ public sealed partial class ReplayStateParser
             };
         }
 
-        var demoTimescale = DemoTimescaleLine().Match(line);
-        if (demoTimescale.Success && double.TryParse(
-                demoTimescale.Groups[1].Value,
+        var hostTimescale = HostTimescaleLine().Match(line);
+        if (hostTimescale.Success && double.TryParse(
+                hostTimescale.Groups[1].Value,
                 NumberStyles.Float,
                 CultureInfo.InvariantCulture,
                 out var timescale) && double.IsFinite(timescale))

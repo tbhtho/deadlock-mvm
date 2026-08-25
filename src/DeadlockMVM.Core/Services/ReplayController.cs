@@ -15,7 +15,7 @@ namespace DeadlockMVM.Core.Services;
 ///    consecutive polls; "CGameRules - paused/unpaused" output lines provide
 ///    instant hints that the next poll confirms or corrects.
 ///  - timescale: queried from the engine after every connection. A canonical
-///    SMVM-commanded demo_timescale is surfaced immediately, then reconciled
+///    SMVM-commanded host_timescale is surfaced immediately, then reconciled
 ///    with the following engine readback.
 /// </summary>
 public sealed class ReplayController : IReplayPlaybackState, IDisposable

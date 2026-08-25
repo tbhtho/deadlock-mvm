@@ -14,8 +14,9 @@ public static class ReplayCommands
     public const string Pause = "demo_pause";
     public const string Resume = "demo_resume";
     public const string TogglePause = "demo_togglepause";
-    public const string QueryTimescale = "demo_timescale";
-    public const string ResetLegacyHostTimescale = "host_timescale 1";
+    public const string QueryTimescale = "host_timescale";
+    public const string ResetLegacyDemoTimescale = "demo_timescale 1";
+    public const string DisableFrameSpikeReports = "engine_frametime_warnings_enable 0";
 
     /// <summary>Steps one tick and pauses (engine default).</summary>
     public const string StepTick = "demo_step_tick";
@@ -36,7 +37,17 @@ public static class ReplayCommands
     public static IReadOnlyList<string> StartDemoPaused(string gamePath)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(gamePath);
-        return ["+playdemo", gamePath, $"+{Pause}"];
+        // -dev enables Source 2's detailed per-spike VProf dumps by default.
+        // Disable those before demo activation: condebug remains available,
+        // but a struggling replay no longer performs a large diagnostic dump
+        // for every slow frame and feeds that work back into the next frame.
+        return [
+            "+engine_frametime_warnings_enable",
+            "0",
+            "+playdemo",
+            gamePath,
+            $"+{Pause}",
+        ];
     }
 
     public static IReadOnlyList<double> SpeedPresets { get; } = new[] { 0.25, 0.50, 1.00, 2.00, 4.00 };
@@ -44,7 +55,7 @@ public static class ReplayCommands
     public static string SetTimescale(double speed)
     {
         var canonical = CanonicalizeSpeed(speed);
-        return string.Create(CultureInfo.InvariantCulture, $"demo_timescale {canonical:0.########}");
+        return string.Create(CultureInfo.InvariantCulture, $"host_timescale {canonical:0.########}");
     }
 
     public static double CanonicalizeSpeed(double speed)

@@ -18,6 +18,10 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
     private static readonly TimeSpan SelfTestEmergencyCleanupTimeout = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan AutomaticRecoveryTimeout = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan PausedManualCameraBootstrapDelay = TimeSpan.FromMilliseconds(125);
+    private static readonly TimeSpan VisibilityOriginSyncInterval = TimeSpan.FromMilliseconds(250);
+    private static readonly TimeSpan VisibilityOriginWarningInterval = TimeSpan.FromSeconds(5);
+    private const double VisibilityOriginSyncDistance = 384.0;
+    private const double DefaultCameraHeight = 63.0;
     private const string QueuedActionLeaseExpiredMessage =
         "The queued SMVM action expired before native camera access began.";
     private const int SeekTickTolerance = 2;
@@ -30,6 +34,7 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
     private readonly SemaphoreSlim _operationGate = new(1, 1);
     private readonly AsyncLocal<QueuedActionContext?> _queuedActionContext = new();
     private readonly object _manualIntentGate = new();
+    private readonly object _visibilityOriginGate = new();
     private readonly Task _monitorTask;
     private readonly CampathPlaybackStateMachine _playback = new();
     private NativeReplayCameraClient? _client;
@@ -45,6 +50,10 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
     private int _cameraTransferDepth;
     private long _explicitExitEpoch;
     private long _connectionEpoch;
+    private CameraSample? _lastVisibilityOrigin;
+    private long _lastVisibilityOriginSyncTimestamp;
+    private long _lastVisibilityOriginWarningTimestamp;
+    private int _loggedLiveVisibilitySync;
     private CampathPath? _activePath;
     private CampathEndBehavior _endBehavior = CampathEndBehavior.StopAndRelease;
     private SmvmRendererBackend _loggedRendererBackend;
@@ -1705,6 +1714,125 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         {
             _log.Info("Native camera: post-seek observer and rendered visibility origins synchronized.");
         }
+        RememberVisibilityOrigin(renderedSample);
+    }
+
+    /// <summary>
+    /// SMVM writes the rendered camera after Deadlock has chosen its observer
+    /// origin. While a demo is paused, Source 2 does not naturally advance that
+    /// hidden roaming origin as native Free Camera moves. Keep it near the
+    /// rendered camera at a bounded cadence so PVS/streaming cannot remain back
+    /// at the seek landing and cull the battlefield the owner is composing.
+    /// </summary>
+    private void TrySynchronizePausedManualVisibilityOrigin(InProcessCameraStatus status)
+    {
+        var rendered = status.Camera;
+        var now = Stopwatch.GetTimestamp();
+        CameraSample? previous;
+        TimeSpan elapsed;
+        lock (_visibilityOriginGate)
+        {
+            previous = _lastVisibilityOrigin;
+            elapsed = _lastVisibilityOriginSyncTimestamp == 0
+                ? TimeSpan.Zero
+                : Stopwatch.GetElapsedTime(_lastVisibilityOriginSyncTimestamp, now);
+            if (!ShouldSynchronizePausedManualVisibilityOrigin(
+                    _controller.State.IsPaused == true,
+                    ManualCameraDesired,
+                    status.ManualCameraActive,
+                    status.CameraObserved,
+                    Volatile.Read(ref _cameraTransferDepth) != 0,
+                    Volatile.Read(ref _campathPlaying),
+                    Volatile.Read(ref _holdingKeyframe),
+                    _camera.Selection.Mode,
+                    rendered,
+                    previous,
+                    elapsed))
+            {
+                // Establish the current hidden/rendered relationship without
+                // issuing a redundant spec_goto on initial Free Camera entry.
+                if (previous is null && status.CameraObserved && rendered.IsValid)
+                {
+                    _lastVisibilityOrigin = rendered;
+                    _lastVisibilityOriginSyncTimestamp = now;
+                }
+                return;
+            }
+
+            // Reserve this cadence slot before performing VConsole I/O. A
+            // transient failure may retry after the same bounded interval.
+            _lastVisibilityOriginSyncTimestamp = now;
+        }
+
+        try
+        {
+            _camera.MoveRoamTarget(rendered.X, rendered.Y, rendered.Z - DefaultCameraHeight);
+            lock (_visibilityOriginGate)
+                _lastVisibilityOrigin = rendered;
+            if (Interlocked.Exchange(ref _loggedLiveVisibilitySync, 1) == 0)
+            {
+                _log.Info(
+                    "Native camera: paused Free Camera visibility origin now follows the rendered camera.");
+            }
+        }
+        catch (Exception ex)
+        {
+            var shouldWarn = false;
+            lock (_visibilityOriginGate)
+            {
+                if (_lastVisibilityOriginWarningTimestamp == 0 ||
+                    Stopwatch.GetElapsedTime(_lastVisibilityOriginWarningTimestamp, now) >=
+                    VisibilityOriginWarningInterval)
+                {
+                    _lastVisibilityOriginWarningTimestamp = now;
+                    shouldWarn = true;
+                }
+            }
+            if (shouldWarn)
+            {
+                _log.Warn(
+                    $"Native camera: paused visibility-origin follow is temporarily unavailable: {ex.Message}");
+            }
+        }
+    }
+
+    private void RememberVisibilityOrigin(CameraSample rendered)
+    {
+        if (!rendered.IsValid)
+            return;
+        lock (_visibilityOriginGate)
+        {
+            _lastVisibilityOrigin = rendered;
+            _lastVisibilityOriginSyncTimestamp = Stopwatch.GetTimestamp();
+        }
+    }
+
+    internal static bool ShouldSynchronizePausedManualVisibilityOrigin(
+        bool replayPaused,
+        bool manualCameraDesired,
+        bool manualCameraActive,
+        bool cameraObserved,
+        bool cameraTransferInProgress,
+        bool campathPlaying,
+        bool holdingKeyframe,
+        SpecCameraMode observerMode,
+        CameraSample rendered,
+        CameraSample? lastVisibilityOrigin,
+        TimeSpan elapsed)
+    {
+        if (!replayPaused || !manualCameraDesired || !manualCameraActive || !cameraObserved ||
+            cameraTransferInProgress || campathPlaying || holdingKeyframe ||
+            observerMode != SpecCameraMode.FreeRoam || !rendered.IsValid ||
+            lastVisibilityOrigin is not { } previous || elapsed < VisibilityOriginSyncInterval)
+        {
+            return false;
+        }
+
+        var dx = rendered.X - previous.X;
+        var dy = rendered.Y - previous.Y;
+        var dz = rendered.Z - previous.Z;
+        return dx * dx + dy * dy + dz * dz >=
+               VisibilityOriginSyncDistance * VisibilityOriginSyncDistance;
     }
 
     private async Task<InProcessCameraStatus> EnsureManualCameraArmedUnderOverrideAsync(
@@ -2171,8 +2299,10 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                         if (SmvmSnapshotProvider?.Invoke() is { } snapshot)
                         {
                             using var snapshotLease = BeginSmvmSnapshotPublicationLease(snapshot);
-                            UpdateStatus(await _client.UpdateSmvmSnapshotAsync(snapshot, token)
-                                .ConfigureAwait(false));
+                            var updated = await _client.UpdateSmvmSnapshotAsync(snapshot, token)
+                                .ConfigureAwait(false);
+                            UpdateStatus(updated);
+                            TrySynchronizePausedManualVisibilityOrigin(updated);
                         }
                     }
                     catch (Exception ex) when (ShouldRetryMonitorAfterReplayLeaseChange(

@@ -22,7 +22,7 @@ public sealed record ReplayState
     public int? TotalTicks { get; init; }
 
     /// <summary>
-    /// Last known demo_timescale. The canonical requested value is surfaced
+    /// Last known host_timescale. The canonical requested value is surfaced
     /// immediately and replaced by engine readback when the console reports it.
     /// </summary>
     public double? Timescale { get; init; }

@@ -559,16 +559,16 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                     if (!TryCaptureReplayCommandLease(replayIdentity, out var speedCommandLease))
                         throw new InvalidOperationException(
                             "Replay changed before startup playback speed normalization.");
-                    // One-way migration from the earlier host-wide control. A
-                    // running Deadlock process can retain that value across tool
-                    // updates, so neutralize it before applying demo playback
-                    // speed. Owner controls never write host_timescale afterward.
-                    _controller.SendRaw(ReplayCommands.ResetLegacyHostTimescale);
+                    // The previous internal build wrote demo_timescale, but the
+                    // physical tick trace proved that Deadlock ignored it. Keep
+                    // that ineffective multiplier neutral and make the engine's
+                    // working host clock the single playback-speed authority.
+                    _controller.SendRaw(ReplayCommands.ResetLegacyDemoTimescale);
                     if (!_controller.SetSpeedIfCurrent(1.0, speedCommandLease))
                         throw new InvalidOperationException(
                             "Replay changed while startup playback speed was being normalized.");
                     _log.Info(
-                        "Demo startup: legacy host scaling neutralized and replay playback speed reset to 100%.");
+                        "Demo startup: legacy demo scaling neutralized and host playback speed reset to 100%.");
                 }
                 catch (Exception ex)
                 {
@@ -1817,8 +1817,8 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
             if (applied)
             {
                 _log.Info(
-                    $"Replay speed applied: {speed * 100.0:0.##}% through demo_timescale " +
-                    "(host_timescale remains neutral at 100%).");
+                    $"Replay speed requested: {speed * 100.0:0.##}% through host_timescale; " +
+                    "engine readback will reconcile the displayed value.");
             }
             else
             {
