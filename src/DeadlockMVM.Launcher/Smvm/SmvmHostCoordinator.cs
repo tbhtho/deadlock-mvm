@@ -15,6 +15,11 @@ namespace DeadlockMVM.Launcher.Smvm;
 /// </summary>
 public sealed class SmvmHostCoordinator : IAsyncDisposable
 {
+    private readonly record struct ForwardPresentationLease(
+        long ConnectionEpoch,
+        long IntentEpoch,
+        long ReplayEpoch);
+
     private sealed record EditorSnapshot(
         string Name,
         string Status,
@@ -35,19 +40,30 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
     private readonly ILogService _log;
     private readonly DeadlockUiController _deadlockUi;
     private readonly DemoStartupPolicy _demoStartup = new();
+    private readonly DemoPlaybackSpeedPolicy _demoPlaybackSpeed = new();
     private readonly Dispatcher _dispatcher;
     private readonly SemaphoreSlim _actionGate = new(1, 1);
     private readonly SemaphoreSlim _pathPublishGate = new(1, 1);
     private readonly CancellationTokenSource _stop = new();
     private readonly object _editorGate = new();
+    private readonly object _presentationReplayGate = new();
+    private readonly object _processBoundaryGate = new();
     private readonly bool _captureDiagnosticsEnabled;
     private EditorSnapshot _editor;
     private int _editorRevision;
     private int _publishedRevision = -1;
+    private int _pathPublishPending;
     private int _replaySeekInFlight;
-    private bool _nativeWasConnected;
+    private long _presentationIntentEpoch;
+    private int _stopping;
+    private long _presentationReplayEpoch;
+    private string _presentationReplayIdentity = string.Empty;
+    private int _nativeWasConnected;
+    private int _nativeProcessId;
+    private long _processBoundaryEpoch;
+    private long _minimumProcessTelemetryGeneration;
+    private int _processProfileReassertPending;
     private string _observedReplayIdentity = string.Empty;
-    private string _normalizedHostTimescaleIdentity = string.Empty;
     private bool? _observedReplayPaused;
 
     public SmvmHostCoordinator(
@@ -71,6 +87,8 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         _captureDiagnosticsEnabled = string.Equals(captureTrace, "1", StringComparison.OrdinalIgnoreCase) ||
                                      string.Equals(captureTrace, "true", StringComparison.OrdinalIgnoreCase);
         _editor = ReadEditorSnapshot();
+        if (UpdatePresentationReplayEpoch(_controller.State))
+            _deadlockUi.NormalizeTransientCleanForNewReplay();
         _native.SmvmSnapshotProvider = CreateSnapshot;
         _native.SmvmActionReceived += OnActionReceived;
         _native.StatusChanged += OnNativeStatusChanged;
@@ -78,25 +96,117 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         _native.CampathStateChanged += OnCampathStateChanged;
         _controller.StateChanged += OnReplayStateChanged;
         _ = PublishEditorPathAsync();
-        CoordinateDemoStartup(_controller.State);
+        _ = CoordinateDemoStartupAsync(_controller.State);
     }
 
-    private void OnActionReceived(object? sender, SmvmAction action)
+    private void OnActionReceived(object? sender, SmvmActionDispatch dispatch)
     {
-        if (IsDemoStartupOwnerOverride(action))
-            _demoStartup.MarkOwnerOverride();
-        // Explicit exits win immediately over any seek/self-test already ahead
-        // of this action in the serialized queue. Native cleanup remains ordered.
-        if (IsExplicitFreeCameraExitAction(action.Type))
-            _native.CancelManualCameraIntent();
-        if (action.Type == SmvmActionType.RestoreDeadlockUi)
+        if (Volatile.Read(ref _stopping) != 0)
+            return;
+        var action = dispatch.Action;
+        var connectionEpoch = dispatch.ConnectionEpoch;
+        string? playbackSpeedReplayIdentity = null;
+        long playbackSpeedOwnerIntentEpoch = 0;
+        long processBoundaryEpoch;
+        (long ConnectionGeneration, ReplayState State) replaySnapshot;
+        lock (_processBoundaryGate)
         {
-            // F9 is an emergency presentation escape. Restore Panorama at
-            // ingress instead of making it wait behind a seek or self-test;
-            // the queued handler still performs ordered camera cleanup.
-            _deadlockUi.Restore(force: true);
+            // Native callbacks can unwind after their client was retired. Do
+            // not let stale ingress mutate startup policy or perform the
+            // immediate Escape/F9 inverse against the replacement connection.
+            if (connectionEpoch <= 0 ||
+                !_native.IsConnectionLeaseCurrent(connectionEpoch))
+            {
+                return;
+            }
+            replaySnapshot = _controller.CaptureReplayTelemetrySnapshot();
+            var actionScope = SmvmQueuedActionLeasePolicy.GetScope(action);
+            var authoritativeReplay = HasAuthoritativeReplayTelemetry(replaySnapshot.State);
+            var sourceMatchesProvisionalReplay = replaySnapshot.State.ReplaySessionGeneration > 0
+                ? dispatch.ReplaySessionGeneration == replaySnapshot.State.ReplaySessionGeneration
+                : dispatch.ReplaySessionGeneration == 0;
+            var rejectSource = actionScope switch
+            {
+                SmvmQueuedActionScope.ReplayIdentity =>
+                    !authoritativeReplay ||
+                    dispatch.ReplaySessionGeneration <= 0 ||
+                    dispatch.ReplaySessionGeneration != replaySnapshot.State.ReplaySessionGeneration,
+                SmvmQueuedActionScope.PresentationReplay or SmvmQueuedActionScope.PlaybackSpeed =>
+                    authoritativeReplay
+                        ? dispatch.ReplaySessionGeneration <= 0 ||
+                          dispatch.ReplaySessionGeneration != replaySnapshot.State.ReplaySessionGeneration
+                        : !sourceMatchesProvisionalReplay,
+                _ => false,
+            };
+            if (rejectSource)
+            {
+                return;
+            }
+            if (action.Type == SmvmActionType.SetTimescale)
+            {
+                var speedReplay = replaySnapshot.State;
+                playbackSpeedReplayIdentity = IsReplayActive(speedReplay)
+                    ? DemoStartupPolicy.CreateReplayIdentity(
+                        speedReplay.ReplayName!,
+                        speedReplay.TotalTicks,
+                        speedReplay.ReplaySessionGeneration)
+                    : null;
+                playbackSpeedOwnerIntentEpoch =
+                    _demoPlaybackSpeed.MarkOwnerIntent(playbackSpeedReplayIdentity);
+            }
+            if (IsDemoStartupOwnerOverride(action))
+            {
+                var replay = replaySnapshot.State;
+                var authoritative = HasAuthoritativeReplayTelemetry(replay);
+                if (!authoritative)
+                {
+                    _demoStartup.MarkOwnerOverride(scopeToNextObservedSession: true);
+                }
+                else if (IsReplayActive(replay))
+                {
+                    _demoStartup.MarkOwnerOverride(
+                        DemoStartupPolicy.CreateReplayIdentity(
+                            replay.ReplayName!,
+                            replay.TotalTicks,
+                            replay.ReplaySessionGeneration));
+                }
+                Interlocked.Increment(ref _presentationIntentEpoch);
+            }
+            processBoundaryEpoch = Volatile.Read(ref _processBoundaryEpoch);
+            // Exit/F9 are immediate owner inverses and must not wait behind a
+            // seek or self-test. The process-boundary lock makes validation and
+            // these synchronous effects one host-side linearization point.
+            if (IsExplicitFreeCameraExitAction(action.Type))
+                _native.CancelManualCameraIntent();
+            if (action.Type == SmvmActionType.RestoreDeadlockUi)
+            {
+                _deadlockUi.Restore(force: true, RecoveryGeneration(action));
+                _settings.SmvmDeadlockUiMode = DeadlockUiMode.DeadlockUi;
+                _settings.Save();
+            }
         }
-        _dispatcher.BeginInvoke(() => _ = ExecuteActionSafeAsync(action));
+        var presentationIntentEpoch = Volatile.Read(ref _presentationIntentEpoch);
+        var presentationReplayEpoch = CurrentPresentationReplayEpoch;
+        var playbackSpeedActionLease = new DemoPlaybackSpeedActionLease(
+            playbackSpeedOwnerIntentEpoch,
+            processBoundaryEpoch,
+            connectionEpoch,
+            presentationReplayEpoch,
+            playbackSpeedReplayIdentity);
+        var queuedActionLease = new SmvmQueuedActionLease(
+            processBoundaryEpoch,
+            connectionEpoch,
+            presentationReplayEpoch,
+            replaySnapshot.ConnectionGeneration,
+            replaySnapshot.State.ReplaySessionGeneration,
+            replaySnapshot.State.ReplayName?.Trim() ?? string.Empty,
+            dispatch.ReplaySessionGeneration);
+        BeginInvokeIsolated(
+            () => _ = ExecuteActionSafeAsync(
+                action,
+                queuedActionLease,
+                presentationIntentEpoch,
+                playbackSpeedActionLease));
     }
 
     internal static bool IsExplicitFreeCameraExitAction(SmvmActionType action) =>
@@ -104,11 +214,25 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
             SmvmActionType.PreviousPlayer or SmvmActionType.NextPlayer or
             SmvmActionType.InEye or SmvmActionType.Chase;
 
-    private static bool IsDemoStartupOwnerOverride(SmvmAction action) =>
+    private void BeginInvokeIsolated(Action callback)
+    {
+        ArgumentNullException.ThrowIfNull(callback);
+        if (ExecutionContext.IsFlowSuppressed())
+        {
+            _dispatcher.BeginInvoke(callback);
+            return;
+        }
+        using (ExecutionContext.SuppressFlow())
+            _dispatcher.BeginInvoke(callback);
+    }
+
+    private bool IsDemoStartupOwnerOverride(SmvmAction action) =>
         IsExplicitFreeCameraExitAction(action.Type) ||
         action.Type is SmvmActionType.CycleReplayInterface ||
+        (action.Type == SmvmActionType.ToggleReplayPause &&
+         action.Index <= 0) ||
         (action.Type == SmvmActionType.SetDeadlockUiMode &&
-         action.Index == (int)DeadlockUiMode.DeadlockUi);
+         action.Tick < 0);
 
     private void OnEditorStateChanged(object? sender, EventArgs e)
     {
@@ -119,130 +243,394 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
     private void OnNativeStatusChanged(object? sender, EventArgs e)
     {
         var connected = _native.Connected;
-        if (connected && !_nativeWasConnected)
+        var connectionBecameLive = connected &&
+            Interlocked.Exchange(ref _nativeWasConnected, 1) == 0;
+        var processId = _native.Status?.ProcessId ?? 0;
+        var previousProcessId = processId > 0
+            ? Interlocked.Exchange(ref _nativeProcessId, processId)
+            : Volatile.Read(ref _nativeProcessId);
+        var processChanged = previousProcessId > 0 && processId > 0 &&
+                             previousProcessId != processId;
+        if (processChanged)
         {
-            _nativeWasConnected = true;
+            lock (_processBoundaryGate)
+            {
+                // Quarantine every startup/profile/speed action before invalidating
+                // VConsole state. Native publishes the candidate PID while loading,
+                // so this also catches A -> B when A never completed its pipe lease.
+                Interlocked.Increment(ref _processBoundaryEpoch);
+                Volatile.Write(ref _minimumProcessTelemetryGeneration, long.MaxValue);
+                Interlocked.Exchange(ref _processProfileReassertPending, 1);
+                var requiredGeneration = _controller.BeginProcessBoundaryTelemetryFence();
+                _demoPlaybackSpeed.ResetForNewProcess();
+                _demoStartup.ResetForNewProcess();
+                _deadlockUi.NormalizeTransientCleanForNewReplay();
+                Volatile.Write(ref _minimumProcessTelemetryGeneration, requiredGeneration);
+            }
+        }
+        if (connectionBecameLive)
+        {
             _ = PublishEditorPathAsync();
         }
         else if (!connected)
         {
-            _nativeWasConnected = false;
+            Interlocked.Exchange(ref _nativeWasConnected, 0);
         }
-        _dispatcher.BeginInvoke(() => CoordinateDemoStartup(_controller.State));
+        BeginInvokeIsolated(
+            () => _ = CoordinateAfterNativeStatusAsync(connectionBecameLive));
+    }
+
+    private async Task CoordinateAfterNativeStatusAsync(bool connectionBecameLive)
+    {
+        var processBoundaryEpoch = Volatile.Read(ref _processBoundaryEpoch);
+        if (connectionBecameLive &&
+            Volatile.Read(ref _processProfileReassertPending) == 0)
+        {
+            // TryConnect publishes only after native acknowledged the first
+            // snapshot. Reassert the managed logical profile once for this new
+            // physical module/pipe lease; fresh Deadlock defaults cannot inherit
+            // an acknowledgement from an older process.
+            await ReassertMovieUiWithConnectionLeaseAsync(
+                    CaptureForwardPresentationLease(),
+                    processBoundaryEpoch)
+                .ConfigureAwait(true);
+        }
+        if (!IsProcessBoundaryCurrent(processBoundaryEpoch))
+            return;
+        await CoordinateDemoStartupAsync(_controller.State).ConfigureAwait(true);
     }
 
     private void OnCampathStateChanged(object? sender, CampathPlaybackStatus status) =>
-        _dispatcher.BeginInvoke(RefreshEditorSnapshot);
+        BeginInvokeIsolated(RefreshEditorSnapshot);
 
-    private void OnReplayStateChanged(object? sender, ReplayState state) =>
-        _dispatcher.BeginInvoke(() =>
+    private void OnReplayStateChanged(object? sender, ReplayState state)
+    {
+        // This callback can run synchronously inside a failed VConsole profile
+        // write while DeadlockUiController owns its transaction lock. Never
+        // acquire the process-boundary lock here (profile -> process would
+        // invert the process -> profile order used by PID replacement).
+        if (!ReferenceEquals(state, _controller.State))
+            return;
+        var processBoundaryEpoch = Volatile.Read(ref _processBoundaryEpoch);
+        var previousPresentationReplayEpoch = CurrentPresentationReplayEpoch;
+        var normalizeTransientClean = UpdatePresentationReplayEpoch(state);
+        var presentationReplayEpoch = CurrentPresentationReplayEpoch;
+        var replayEpochChanged =
+            presentationReplayEpoch != previousPresentationReplayEpoch;
+        BeginInvokeIsolated(() =>
         {
+            var current = _controller.State;
+            if (normalizeTransientClean &&
+                IsProcessBoundaryCurrent(processBoundaryEpoch) &&
+                CurrentPresentationReplayEpoch == presentationReplayEpoch &&
+                HasAuthoritativeReplayTelemetry(current))
+            {
+                _deadlockUi.NormalizeTransientCleanForNewReplay();
+            }
+            if (replayEpochChanged)
+                _publishedRevision = -1;
             RefreshEditorSnapshot();
-            ReassertMovieUiAfterTransportBoundary(state);
-            CoordinateDemoStartup(state);
+            if (replayEpochChanged)
+                _ = PublishEditorPathAsync();
+            ReassertMovieUiAfterTransportBoundary(current);
+            _ = CoordinateDemoStartupAsync(current);
         });
+    }
 
     private void ReassertMovieUiAfterTransportBoundary(ReplayState replay)
     {
-        if (!IsReplayActive(replay))
+        var processBoundaryEpoch = Volatile.Read(ref _processBoundaryEpoch);
+        lock (_processBoundaryGate)
         {
-            _observedReplayIdentity = string.Empty;
-            _observedReplayPaused = null;
-            return;
-        }
+            if (!IsProcessBoundaryCurrent(processBoundaryEpoch) ||
+                !HasAuthoritativeReplayTelemetry(replay))
+            {
+                return;
+            }
+            if (!IsReplayActive(replay))
+            {
+                _observedReplayIdentity = string.Empty;
+                _observedReplayPaused = null;
+                return;
+            }
 
-        var identity = DemoStartupPolicy.CreateReplayIdentity(replay.ReplayName!, replay.TotalTicks);
-        if (!string.Equals(identity, _observedReplayIdentity, StringComparison.Ordinal))
-        {
-            _observedReplayIdentity = identity;
-            _observedReplayPaused = replay.IsPaused;
-            return;
-        }
+            var identity = DemoStartupPolicy.CreateReplayIdentity(
+                replay.ReplayName!,
+                replay.TotalTicks,
+                replay.ReplaySessionGeneration);
+            if (!string.Equals(identity, _observedReplayIdentity, StringComparison.Ordinal))
+            {
+                var replacedActiveReplay = !string.IsNullOrWhiteSpace(_observedReplayIdentity);
+                _observedReplayIdentity = identity;
+                _observedReplayPaused = replay.IsPaused;
+                if (replacedActiveReplay)
+                {
+                    // Direct demo-to-demo loads can recreate Panorama and visual
+                    // cvars without an inactive/end observation. Reassert once
+                    // through the new replay epoch; Deadlock mode remains a no-op.
+                    _ = ReassertMovieUiWithConnectionLeaseAsync(
+                        CaptureForwardPresentationLease(),
+                        processBoundaryEpoch);
+                }
+                return;
+            }
 
-        var pauseChanged = replay.IsPaused is not null && _observedReplayPaused is not null &&
-                           replay.IsPaused != _observedReplayPaused;
-        if (replay.IsPaused is not null)
-            _observedReplayPaused = replay.IsPaused;
-        if (pauseChanged)
-            _deadlockUi.ReassertSuppression(replayActive: true);
+            var pauseChanged = replay.IsPaused is not null && _observedReplayPaused is not null &&
+                               replay.IsPaused != _observedReplayPaused;
+            if (replay.IsPaused is not null)
+                _observedReplayPaused = replay.IsPaused;
+            if (pauseChanged)
+                _ = ReassertMovieUiWithConnectionLeaseAsync(
+                    CaptureForwardPresentationLease(),
+                    processBoundaryEpoch);
+        }
     }
 
-    private void CoordinateDemoStartup(ReplayState replay)
+    private async Task CoordinateDemoStartupAsync(ReplayState replay)
     {
+        var processBoundaryEpoch = Volatile.Read(ref _processBoundaryEpoch);
+        var playbackSpeedLease = _demoPlaybackSpeed.CaptureLease();
+        replay = _controller.State;
+        var requiredTelemetryGeneration =
+            Volatile.Read(ref _minimumProcessTelemetryGeneration);
+        if (requiredTelemetryGeneration > 0)
+        {
+            if (requiredTelemetryGeneration == long.MaxValue ||
+                _controller.AuthoritativeTelemetryGeneration < requiredTelemetryGeneration ||
+                !HasAuthoritativeReplayTelemetry(replay))
+            {
+                return;
+            }
+
+            if (Interlocked.CompareExchange(
+                    ref _minimumProcessTelemetryGeneration,
+                    0,
+                    requiredTelemetryGeneration) != requiredTelemetryGeneration &&
+                Volatile.Read(ref _minimumProcessTelemetryGeneration) > 0)
+            {
+                return;
+            }
+            replay = _controller.State;
+        }
+        if (!IsProcessBoundaryCurrent(processBoundaryEpoch))
+            return;
+
+        // A replacement Deadlock process starts with fresh HUD/cvar state.
+        // Reassert only after both its marker-fenced telemetry and native pipe
+        // are authoritative; retain the debt if either side arrives first.
+        if (_native.Connected &&
+            Interlocked.CompareExchange(ref _processProfileReassertPending, 0, 1) == 1)
+        {
+            var reasserted = await ReassertMovieUiWithConnectionLeaseAsync(
+                    CaptureForwardPresentationLease(),
+                    processBoundaryEpoch)
+                .ConfigureAwait(true);
+            if (!reasserted)
+                Interlocked.CompareExchange(ref _processProfileReassertPending, 1, 0);
+            if (!IsProcessBoundaryCurrent(processBoundaryEpoch))
+                return;
+            replay = _controller.State;
+        }
+
         var replayActive = IsReplayActive(replay);
+        if (!replay.Connected)
+        {
+            // ReplayState.Empty is also the transient VConsole-disconnect
+            // sentinel. It must not reset same-demo startup completion, owner
+            // overrides, or the once-per-demo speed normalization identity.
+            lock (_processBoundaryGate)
+            {
+                if (!IsProcessBoundaryCurrent(processBoundaryEpoch))
+                    return;
+                _ = _demoStartup.Observe(
+                    new DemoStartupObservation(
+                        false, false, string.Empty, false, false, false, false, false),
+                    DateTimeOffset.UtcNow);
+            }
+            return;
+        }
+        // A failed F9/inverse profile remains an explicit Deadlock-mode debt.
+        // Retry it on any healthy coordinator pass, including reconnects where
+        // the replay itself stayed active, before startup may reapply SMVM.
+        if (_controller.IsConnected && _deadlockUi.ProfileStatus.ShouldRetryRestore &&
+            !RunForProcessBoundary(
+                processBoundaryEpoch,
+                _deadlockUi.RetryPendingRestore))
+        {
+            return;
+        }
+        if (_deadlockUi.ProfileStatus.ShouldRetryRestore)
+            return;
+        var replayTelemetryAuthoritative = HasAuthoritativeReplayTelemetry(replay);
         var replayIdentity = replayActive
-            ? DemoStartupPolicy.CreateReplayIdentity(replay.ReplayName!, replay.TotalTicks)
+            ? DemoStartupPolicy.CreateReplayIdentity(
+                replay.ReplayName!,
+                replay.TotalTicks,
+                replay.ReplaySessionGeneration)
             : string.Empty;
-        var directives = _demoStartup.Observe(
-            new DemoStartupObservation(
-                replayActive,
-                replayIdentity,
-                replay.IsPaused == true,
-                _deadlockUi.State.Mode is DeadlockUiMode.SmvmReplayUi or DeadlockUiMode.CleanFootage,
-                _native.Connected,
-                _controller.GameTickOffset is not null,
-                _native.ManualCameraEstablished),
-            DateTimeOffset.UtcNow);
+        var presentation = _deadlockUi.ProfileStatus;
+        if (replayTelemetryAuthoritative && replayActive &&
+            presentation.ShouldRetryForwardProfile)
+        {
+            var forwardLease = CaptureForwardPresentationLease();
+            var reapplied = await ApplyForwardPresentationWithLeaseAsync(
+                forwardLease,
+                stillCurrent => RunForProcessBoundary(
+                    processBoundaryEpoch,
+                    () => _deadlockUi.ApplyIfCurrent(
+                        presentation.DesiredMode,
+                        replayActive: true,
+                        () => stillCurrent() &&
+                              IsProcessBoundaryCurrent(processBoundaryEpoch))),
+                "deferred recording-profile reassert",
+                () => IsProcessBoundaryCurrent(processBoundaryEpoch)).ConfigureAwait(true);
+            if (!reapplied || !IsProcessBoundaryCurrent(processBoundaryEpoch))
+                return;
+        }
+        DemoStartupDirectives directives;
+        lock (_processBoundaryGate)
+        {
+            if (!IsProcessBoundaryCurrent(processBoundaryEpoch))
+                return;
+            directives = _demoStartup.Observe(
+                new DemoStartupObservation(
+                    true,
+                    replayActive,
+                    replayIdentity,
+                    replay.IsPaused == true,
+                    _deadlockUi.State.Mode is DeadlockUiMode.SmvmReplayUi or DeadlockUiMode.CleanFootage,
+                    _native.Connected,
+                    _controller.GameTickOffset is not null,
+                    _native.ManualCameraEstablished,
+                    replayTelemetryAuthoritative),
+                DateTimeOffset.UtcNow);
+        }
+
+        // A fresh VConsole connection publishes Connected=true before the
+        // marker-fenced position response arrives. That provisional state must
+        // not clear the same-demo startup owner override, custom speed identity,
+        // or recording profile.
+        if (!replayTelemetryAuthoritative)
+            return;
 
         if (!replayActive)
         {
-            _normalizedHostTimescaleIdentity = string.Empty;
-            if (_deadlockUi.State.Mode != DeadlockUiMode.DeadlockUi)
-                _deadlockUi.Restore();
+            lock (_processBoundaryGate)
+            {
+                if (!IsProcessBoundaryCurrent(processBoundaryEpoch))
+                    return;
+                _demoPlaybackSpeed.ClearForNoReplay();
+                var profile = _deadlockUi.ProfileStatus;
+                if (profile.RequiresRestore || profile.DesiredMode != DeadlockUiMode.DeadlockUi)
+                    _deadlockUi.Restore();
+            }
             return;
         }
 
-        // host_timescale is process-global and can survive replay transitions.
-        // Establish the owner's 100% baseline once for every newly observed
-        // demo, then leave later custom choices alone for that demo session.
-        if (!string.Equals(
-                _normalizedHostTimescaleIdentity,
-                replayIdentity,
-                StringComparison.Ordinal))
+        // Establish the owner's 100% demo-playback baseline once for every
+        // newly observed replay, then leave later custom choices alone for
+        // that replay session.
+        lock (_processBoundaryGate)
         {
-            _normalizedHostTimescaleIdentity = replayIdentity;
-            try
+            if (!IsProcessBoundaryCurrent(processBoundaryEpoch))
+                return;
+            if (_demoPlaybackSpeed.TryClaimStartupNormalization(
+                    replayIdentity,
+                    playbackSpeedLease))
             {
-                _controller.SetSpeed(1.0);
-                _log.Info("Demo startup: host_timescale reset to 100%.");
-            }
-            catch (Exception ex)
-            {
-                _normalizedHostTimescaleIdentity = string.Empty;
-                _log.Warn($"Demo startup: host_timescale reset failed: {ex.Message}");
+                try
+                {
+                    if (!TryCaptureReplayCommandLease(replayIdentity, out var speedCommandLease))
+                        throw new InvalidOperationException(
+                            "Replay changed before startup playback speed normalization.");
+                    // One-way migration from the earlier host-wide control. A
+                    // running Deadlock process can retain that value across tool
+                    // updates, so neutralize it before applying demo playback
+                    // speed. Owner controls never write host_timescale afterward.
+                    _controller.SendRaw(ReplayCommands.ResetLegacyHostTimescale);
+                    if (!_controller.SetSpeedIfCurrent(1.0, speedCommandLease))
+                        throw new InvalidOperationException(
+                            "Replay changed while startup playback speed was being normalized.");
+                    _log.Info(
+                        "Demo startup: legacy host scaling neutralized and replay playback speed reset to 100%.");
+                }
+                catch (Exception ex)
+                {
+                    _demoPlaybackSpeed.MarkNormalizationFailed(
+                        replayIdentity,
+                        playbackSpeedLease);
+                    _log.Warn($"Demo startup: replay playback speed reset failed: {ex.Message}");
+                }
             }
         }
 
         if (directives.PauseDemo)
         {
-            try
+            lock (_processBoundaryGate)
             {
-                _controller.Pause();
-                _log.Info("Demo startup: pause requested.");
-            }
-            catch (Exception ex)
-            {
-                _demoStartup.MarkPauseCommandFailed(directives.Generation);
-                _log.Warn($"Demo startup: pause request failed: {ex.Message}");
+                if (!IsProcessBoundaryCurrent(processBoundaryEpoch) ||
+                    !_demoStartup.IsCurrent(directives.Generation))
+                    return;
+                try
+                {
+                    if (!TryCaptureReplayCommandLease(replayIdentity, out var pauseCommandLease) ||
+                        !_controller.PauseIfCurrent(pauseCommandLease))
+                    {
+                        throw new InvalidOperationException(
+                            "Replay changed before the startup pause command was issued.");
+                    }
+                    _log.Info("Demo startup: pause requested.");
+                }
+                catch (Exception ex)
+                {
+                    _demoStartup.MarkPauseCommandFailed(directives.Generation);
+                    _log.Warn($"Demo startup: pause request failed: {ex.Message}");
+                }
             }
         }
 
         if (directives.HideGameHud)
         {
-            var hidden = _deadlockUi.Apply(DeadlockUiMode.SmvmReplayUi, replayActive: true);
-            _demoStartup.MarkHudAttemptCompleted(
-                directives.Generation,
-                hidden,
-                DateTimeOffset.UtcNow);
-            if (hidden)
-                _log.Info("Demo startup: Deadlock HUD hidden.");
+            var forwardLease = CaptureForwardPresentationLease();
+            var hidden = await ApplyForwardPresentationWithLeaseAsync(
+                forwardLease,
+                stillCurrent => RunForProcessBoundary(
+                    processBoundaryEpoch,
+                    () => _deadlockUi.ApplyIfCurrent(
+                        DeadlockUiMode.SmvmReplayUi,
+                        replayActive: true,
+                        () => stillCurrent() &&
+                              IsProcessBoundaryCurrent(processBoundaryEpoch))),
+                "demo-startup recording profile",
+                () => _demoStartup.IsCurrent(directives.Generation) &&
+                      IsReplayIdentityCurrent(replayIdentity) &&
+                      IsProcessBoundaryCurrent(processBoundaryEpoch)).ConfigureAwait(true);
+            lock (_processBoundaryGate)
+            {
+                if (!IsProcessBoundaryCurrent(processBoundaryEpoch))
+                    return;
+                _demoStartup.MarkHudAttemptCompleted(
+                    directives.Generation,
+                    hidden,
+                    DateTimeOffset.UtcNow);
+                if (hidden)
+                    _log.Info("Demo startup: Deadlock HUD hidden.");
+            }
         }
 
         if (directives.EnterFreeCamera)
-            _ = EnterAutomaticFreeCameraAsync(directives.Generation);
+            _ = EnterAutomaticFreeCameraAsync(
+                directives.Generation,
+                processBoundaryEpoch,
+                replayIdentity,
+                CurrentPresentationReplayEpoch);
     }
 
-    private async Task EnterAutomaticFreeCameraAsync(int generation)
+    private async Task EnterAutomaticFreeCameraAsync(
+        int generation,
+        long processBoundaryEpoch,
+        string replayIdentity,
+        long presentationReplayEpoch)
     {
         var acquired = false;
         var success = false;
@@ -250,12 +638,46 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         {
             await _actionGate.WaitAsync(_stop.Token).ConfigureAwait(true);
             acquired = true;
-            if (!_demoStartup.IsCurrent(generation) || !IsReplayActive(_controller.State))
-                return;
-            await EnterSmvmFreeCameraAsync().ConfigureAwait(true);
-            success = _native.ManualCameraEstablished;
-            if (success)
-                _log.Info("Demo startup: SMVM Free Camera active; Deadlock gameplay input is suppressed.");
+            Task enterTask;
+            ReplayCommandLease replayCommandLease;
+            lock (_processBoundaryGate)
+            {
+                if (!IsAutomaticStartupLeaseCurrent(
+                        generation,
+                        processBoundaryEpoch,
+                        replayIdentity,
+                        presentationReplayEpoch) ||
+                    !TryCaptureReplayCommandLease(replayIdentity, out replayCommandLease))
+                {
+                    return;
+                }
+            }
+            bool StillCurrent() => IsAutomaticStartupLeaseCurrent(
+                generation,
+                processBoundaryEpoch,
+                replayIdentity,
+                presentationReplayEpoch);
+            using (_native.BeginQueuedActionLease(StillCurrent, replayCommandLease))
+            {
+                if (!StillCurrent())
+                    return;
+                enterTask = EnterSmvmFreeCameraAsync();
+                await enterTask.ConfigureAwait(true);
+            }
+            lock (_processBoundaryGate)
+            {
+                if (!IsAutomaticStartupLeaseCurrent(
+                        generation,
+                        processBoundaryEpoch,
+                        replayIdentity,
+                        presentationReplayEpoch))
+                {
+                    return;
+                }
+                success = _native.ManualCameraEstablished;
+                if (success)
+                    _log.Info("Demo startup: SMVM Free Camera active; Deadlock gameplay input is suppressed.");
+            }
         }
         catch (OperationCanceledException) when (_stop.IsCancellationRequested)
         {
@@ -268,18 +690,32 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         {
             if (acquired)
                 _actionGate.Release();
-            _demoStartup.MarkFreeCameraAttemptCompleted(
-                generation,
-                success,
-                DateTimeOffset.UtcNow);
+            lock (_processBoundaryGate)
+            {
+                if (IsProcessBoundaryCurrent(processBoundaryEpoch) &&
+                    IsReplayIdentityCurrent(replayIdentity) &&
+                    CurrentPresentationReplayEpoch == presentationReplayEpoch)
+                {
+                    _demoStartup.MarkFreeCameraAttemptCompleted(
+                        generation,
+                        success,
+                        DateTimeOffset.UtcNow);
+                }
+            }
         }
 
-        if (!success && _demoStartup.IsCurrent(generation) && !_stop.IsCancellationRequested)
+        if (!success && IsAutomaticStartupLeaseCurrent(
+                generation,
+                processBoundaryEpoch,
+                replayIdentity,
+                presentationReplayEpoch) &&
+            !_stop.IsCancellationRequested)
         {
             try
             {
                 await Task.Delay(500, _stop.Token).ConfigureAwait(false);
-                _ = _dispatcher.BeginInvoke(() => CoordinateDemoStartup(_controller.State));
+                BeginInvokeIsolated(
+                    () => _ = CoordinateDemoStartupAsync(_controller.State));
             }
             catch (OperationCanceledException) when (_stop.IsCancellationRequested)
             {
@@ -288,9 +724,12 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
     }
 
     private static bool IsReplayActive(ReplayState replay) =>
-        replay.Connected && !string.IsNullOrWhiteSpace(replay.ReplayName) &&
-        replay.CurrentTick is not null &&
+        HasAuthoritativeReplayTelemetry(replay) &&
         (replay.TotalTicks is null || replay.CurrentTick < replay.TotalTicks);
+
+    private static bool HasAuthoritativeReplayTelemetry(ReplayState replay) =>
+        replay.Connected && !string.IsNullOrWhiteSpace(replay.ReplayName) &&
+        replay.CurrentTick is not null;
 
     private EditorSnapshot ReadEditorSnapshot()
     {
@@ -330,9 +769,15 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         var replay = _controller.State;
         var native = _native.Status;
         var playback = _native.CampathStatus;
+        var replaySeekInProgress =
+            Volatile.Read(ref _replaySeekInFlight) != 0 || IsReplaySeeking(playback.State);
         var internalEnabled = true; // The internal SMVM editor is the only editor.
         var replayActive = IsReplayActive(replay);
-        var deadlockUi = _deadlockUi.State;
+        // Read the managed presentation transaction atomically. Mode, debt,
+        // and transaction-in-progress must describe the same point in time so native
+        // recovery cannot mistake a healthy four-command apply for a failure.
+        var presentation = _deadlockUi.ProfileStatus;
+        var deadlockUi = presentation.Ui;
         var ownership = ResolveCameraOwnership(replayActive, native);
         var availability = ResolveCameraAvailability(
             internalEnabled, replayActive, replay, native, playback, ownership);
@@ -387,6 +832,11 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         if (editor.RecoveryAvailable) flags |= SmvmSnapshotFlags.CampathRecoveryAvailable;
         if (_settings.RestoreLastWorkspace) flags |= SmvmSnapshotFlags.RestoreWorkspace;
         if (_captureDiagnosticsEnabled) flags |= SmvmSnapshotFlags.CaptureDiagnostics;
+        if (replaySeekInProgress) flags |= SmvmSnapshotFlags.ReplaySeekInProgress;
+        if (presentation.RestorePending)
+            flags |= SmvmSnapshotFlags.RecordingProfileRestorePending;
+        if (presentation.TransactionInProgress)
+            flags |= SmvmSnapshotFlags.RecordingProfileTransactionInProgress;
 
         return new SmvmSnapshot(
             flags,
@@ -463,7 +913,9 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
             SmvmInputCode.ParseForSlotOrDefault(128, _settings.SmvmStepForwardHotkey, string.Empty),
             _settings.SmvmStatusHudAnchor,
             _settings.SmvmStatusHudScale,
-            _settings.SmvmStatusHudOpacity);
+            _settings.SmvmStatusHudOpacity,
+            presentation.AcknowledgementGeneration,
+            replay.ReplaySessionGeneration);
     }
 
     private CameraOwnership ResolveCameraOwnership(bool replayActive, InProcessCameraStatus? native)
@@ -578,38 +1030,43 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
 
     private async Task PublishEditorPathAsync()
     {
+        Interlocked.Exchange(ref _pathPublishPending, 1);
         var acquired = false;
         try
         {
             acquired = await _pathPublishGate.WaitAsync(0, _stop.Token).ConfigureAwait(false);
             if (!acquired)
                 return;
-            if (!_native.Connected)
+            while (Interlocked.Exchange(ref _pathPublishPending, 0) != 0 &&
+                   !_stop.IsCancellationRequested)
             {
-                _publishedRevision = -1;
-                return;
-            }
-            while (!_stop.IsCancellationRequested)
-            {
-                EditorSnapshot editor;
-                int revision;
-                lock (_editorGate)
+                if (!_native.Connected)
                 {
-                    editor = _editor;
-                    revision = _editorRevision;
+                    _publishedRevision = -1;
+                    return;
                 }
-                if (revision == _publishedRevision && _native.Connected)
-                    break;
-                await _native.PublishEditorCampathAsync(
-                    editor.Keyframes,
-                    editor.Interpolation,
-                    editor.Easing,
-                    _stop.Token).ConfigureAwait(false);
-                _publishedRevision = revision;
-                lock (_editorGate)
+                while (!_stop.IsCancellationRequested)
                 {
-                    if (revision == _editorRevision)
+                    EditorSnapshot editor;
+                    int revision;
+                    lock (_editorGate)
+                    {
+                        editor = _editor;
+                        revision = _editorRevision;
+                    }
+                    if (revision == _publishedRevision && _native.Connected)
                         break;
+                    await _native.PublishEditorCampathAsync(
+                        editor.Keyframes,
+                        editor.Interpolation,
+                        editor.Easing,
+                        _stop.Token).ConfigureAwait(false);
+                    _publishedRevision = revision;
+                    lock (_editorGate)
+                    {
+                        if (revision == _editorRevision)
+                            break;
+                    }
                 }
             }
         }
@@ -625,17 +1082,114 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         {
             if (acquired)
                 _pathPublishGate.Release();
+            if (acquired && Volatile.Read(ref _pathPublishPending) != 0 &&
+                !_stop.IsCancellationRequested)
+                _ = PublishEditorPathAsync();
         }
     }
 
-    private async Task ExecuteActionSafeAsync(SmvmAction action)
+    private async Task ExecuteActionSafeAsync(
+        SmvmAction action,
+        SmvmQueuedActionLease queuedActionLease,
+        long presentationIntentEpoch,
+        DemoPlaybackSpeedActionLease playbackSpeedActionLease)
     {
         var acquired = false;
         try
         {
             await _actionGate.WaitAsync(_stop.Token).ConfigureAwait(true);
             acquired = true;
-            await ExecuteActionAsync(action).ConfigureAwait(true);
+            bool QueuedActionStillCurrent() =>
+                IsQueuedActionLeaseCurrent(action, queuedActionLease);
+            if (!QueuedActionStillCurrent())
+            {
+                _log.Info($"Ignored queued SMVM action {action.Type}: its process, native, or replay lease expired.");
+                return;
+            }
+            if (action.Type == SmvmActionType.SetTimescale)
+            {
+                try
+                {
+                    if (!TryExecutePlaybackSpeedAction(
+                            action.Value,
+                            playbackSpeedActionLease,
+                            queuedActionLease))
+                        ReleaseFailedPlaybackSpeedIntent(playbackSpeedActionLease);
+                }
+                catch
+                {
+                    ReleaseFailedPlaybackSpeedIntent(playbackSpeedActionLease);
+                    throw;
+                }
+                return;
+            }
+            var replayCommandLease = SmvmQueuedActionLeasePolicy.RequiresReplayLease(action)
+                ? new ReplayCommandLease(
+                    queuedActionLease.ReplayConnectionGeneration,
+                    queuedActionLease.ReplaySessionGeneration,
+                    queuedActionLease.ReplayName)
+                : (ReplayCommandLease?)null;
+            var resolvedPresentationTarget = ResolvePresentationTarget(action);
+            var requiresPresentationLease =
+                resolvedPresentationTarget is not null and not DeadlockUiMode.DeadlockUi;
+            var forwardLease = new ForwardPresentationLease(
+                queuedActionLease.NativeConnectionEpoch,
+                presentationIntentEpoch,
+                queuedActionLease.PresentationReplayEpoch);
+            if (requiresPresentationLease &&
+                !await ConfirmPresentationConnectionLeaseAsync(
+                    forwardLease.ConnectionEpoch,
+                    $"queued {action.Type}").ConfigureAwait(true))
+                return;
+            if (requiresPresentationLease &&
+                (!IsForwardPresentationLeaseCurrent(forwardLease) ||
+                 !QueuedActionStillCurrent()))
+                return;
+
+            Func<bool>? forwardStillCurrent = requiresPresentationLease
+                ? () => IsForwardPresentationLeaseCurrent(forwardLease) &&
+                        QueuedActionStillCurrent()
+                : null;
+            using (_native.BeginQueuedActionLease(
+                       QueuedActionStillCurrent,
+                       replayCommandLease))
+            {
+                if (!QueuedActionStillCurrent())
+                    return;
+                await ExecuteActionAsync(
+                    action,
+                    resolvedPresentationTarget,
+                    forwardStillCurrent,
+                    QueuedActionStillCurrent,
+                    replayCommandLease).ConfigureAwait(true);
+            }
+
+            if (requiresPresentationLease)
+            {
+                if (!IsForwardPresentationLeaseCurrent(forwardLease) ||
+                    !QueuedActionStillCurrent())
+                {
+                    RestoreAfterInvalidForwardPresentationLease(forwardLease);
+                }
+                else if (!await ConfirmPresentationConnectionLeaseAsync(
+                             forwardLease.ConnectionEpoch,
+                             $"completed {action.Type}").ConfigureAwait(true))
+                {
+                    // A host-loss inverse may have raced this independent
+                    // VConsole forward batch. End with the inverse again; the
+                    // new native connection generation owns any later reassert.
+                    _deadlockUi.RestoreAfterConnectionLeaseLoss();
+                }
+                else if (!IsForwardPresentationLeaseCurrent(forwardLease) ||
+                         !QueuedActionStillCurrent())
+                {
+                    // GetStatus can itself deliver F9. Never let that ingress
+                    // restore be the middle rather than the end of the profile.
+                    RestoreAfterInvalidForwardPresentationLease(forwardLease);
+                }
+            }
+            if (!QueuedActionStillCurrent())
+                return;
             RefreshEditorSnapshot();
             _ = PublishEditorPathAsync();
         }
@@ -653,21 +1207,72 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         }
     }
 
-    private async Task ExecuteActionAsync(SmvmAction action)
+    private bool IsQueuedActionLeaseCurrent(
+        SmvmAction action,
+        SmvmQueuedActionLease lease)
     {
+        var replaySnapshot = _controller.CaptureReplayTelemetrySnapshot();
+        var replay = replaySnapshot.State;
+        var nativeLeaseCurrent = _native.IsConnectionLeaseCurrent(lease.NativeConnectionEpoch);
+        return SmvmQueuedActionLeasePolicy.IsCurrent(
+            action,
+            lease,
+            Volatile.Read(ref _processBoundaryEpoch),
+            nativeLeaseCurrent ? lease.NativeConnectionEpoch : _native.ConnectionEpoch,
+            CurrentPresentationReplayEpoch,
+            replaySnapshot.ConnectionGeneration,
+            replay.ReplaySessionGeneration,
+            replay.ReplayName,
+            nativeLeaseCurrent,
+            HasAuthoritativeReplayTelemetry(replay));
+    }
+
+    private async Task ExecuteActionAsync(
+        SmvmAction action,
+        DeadlockUiMode? resolvedPresentationTarget,
+        Func<bool>? forwardStillCurrent,
+        Func<bool> actionStillCurrent,
+        ReplayCommandLease? replayCommandLease)
+    {
+        if (!actionStillCurrent())
+            return;
+        bool RunReplayEffect(Action effect)
+        {
+            if (replayCommandLease is { } lease)
+                return _controller.RunIfCurrent(lease, effect);
+            if (!actionStillCurrent())
+                return false;
+            effect();
+            return true;
+        }
         switch (action.Type)
         {
             case SmvmActionType.CaptureDiagnostic:
             {
                 var stage = (SmvmCaptureStage)action.Index;
                 var rejection = (SmvmCaptureRejection)action.Tick;
-                TraceCapture(stage, rejection);
-                if (stage == SmvmCaptureStage.CaptureRejected)
-                    _campath.ReportCaptureRejection(rejection);
+                _ = RunReplayEffect(() =>
+                {
+                    TraceCapture(stage, rejection);
+                    if (stage == SmvmCaptureStage.CaptureRejected)
+                        _campath.ReportCaptureRejection(rejection);
+                });
                 break;
             }
             case SmvmActionType.SetDeadlockUiMode:
-                ApplyDeadlockUiMode((DeadlockUiMode)action.Index);
+                if (action.Tick == 0)
+                {
+                    // Tab/menu reassertion carries no owner generation. Reapply
+                    // whichever mode is current when this FIFO action executes;
+                    // never let a stale SMVM target supersede a newer owner
+                    // transition that was queued immediately before it.
+                    ReassertDeadlockUiIfCurrent(actionStillCurrent);
+                    break;
+                }
+                ApplyDeadlockUiMode(
+                    resolvedPresentationTarget ?? (DeadlockUiMode)action.Index,
+                    RecoveryGeneration(action),
+                    forwardStillCurrent ?? actionStillCurrent);
                 break;
             case SmvmActionType.RestoreDeadlockUi:
                 var exitTask = ExitSmvmFreeCameraAsync();
@@ -688,19 +1293,20 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                 }
                 finally
                 {
-                    _settings.SmvmDeadlockUiMode = DeadlockUiMode.DeadlockUi;
-                    _settings.Save();
-                    _deadlockUi.Restore(force: true);
+                    if (actionStillCurrent())
+                    {
+                        ApplyDeadlockUiMode(
+                            DeadlockUiMode.DeadlockUi,
+                            RecoveryGeneration(action),
+                            actionStillCurrent);
+                    }
                 }
                 break;
             case SmvmActionType.CycleReplayInterface:
             {
-                var current = _deadlockUi.State.Mode == DeadlockUiMode.CleanFootage
-                    ? _deadlockUi.State.PreviousVisibleMode
-                    : _deadlockUi.State.Mode;
-                ApplyDeadlockUiMode(current == DeadlockUiMode.DeadlockUi
-                    ? DeadlockUiMode.SmvmReplayUi
-                    : DeadlockUiMode.DeadlockUi);
+                ApplyDeadlockUiMode(
+                    resolvedPresentationTarget ?? DeadlockUiMode.DeadlockUi,
+                    stillCurrent: forwardStillCurrent ?? actionStillCurrent);
                 break;
             }
             case SmvmActionType.SetReplayBarScale:
@@ -738,19 +1344,26 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                 _settings.Save();
                 break;
             case SmvmActionType.ToggleReplayPause:
-                if (action.Index == 1)
-                    _controller.Pause();
-                else if (action.Index == 0)
-                    _controller.Play();
-                else
-                    _controller.TogglePause();
+                if (replayCommandLease is not { } pauseLease)
+                    return;
+                var pauseCommandIssued = action.Index switch
+                {
+                    1 => _controller.PauseIfCurrent(pauseLease),
+                    0 => _controller.PlayIfCurrent(pauseLease),
+                    _ => _controller.TogglePauseIfCurrent(pauseLease),
+                };
+                if (!pauseCommandIssued || !actionStillCurrent())
+                    return;
                 // Send suppression after the transport command in the same
                 // VConsole ordering window. The observed pause-state edge
                 // reasserts once more after the engine settles.
-                _deadlockUi.ReassertSuppression(IsReplayActive(_controller.State));
-                break;
-            case SmvmActionType.SetTimescale:
-                _controller.SetSpeed(action.Value);
+                if (resolvedPresentationTarget is { } pauseTarget &&
+                    pauseTarget != DeadlockUiMode.DeadlockUi)
+                {
+                    ApplyDeadlockUiMode(
+                        pauseTarget,
+                        stillCurrent: forwardStillCurrent);
+                }
                 break;
             case SmvmActionType.SeekTick:
                 await ExecuteReplaySeekAsync(
@@ -769,19 +1382,23 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                 break;
             case SmvmActionType.PreviousPlayer:
                 await ExitSmvmFreeCameraAsync().ConfigureAwait(true);
-                _camera.SelectPrevPlayer();
+                if (!RunReplayEffect(_camera.SelectPrevPlayer))
+                    return;
                 break;
             case SmvmActionType.NextPlayer:
                 await ExitSmvmFreeCameraAsync().ConfigureAwait(true);
-                _camera.SelectNextPlayer();
+                if (!RunReplayEffect(_camera.SelectNextPlayer))
+                    return;
                 break;
             case SmvmActionType.InEye:
                 await ExitSmvmFreeCameraAsync().ConfigureAwait(true);
-                _camera.SelectInEye();
+                if (!RunReplayEffect(_camera.SelectInEye))
+                    return;
                 break;
             case SmvmActionType.Chase:
                 await ExitSmvmFreeCameraAsync().ConfigureAwait(true);
-                _camera.SelectChase();
+                if (!RunReplayEffect(_camera.SelectChase))
+                    return;
                 break;
             case SmvmActionType.SetFov:
                 // A stale overlay may still send this legacy action. The
@@ -789,15 +1406,15 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                 // manual sample, so fail closed until a true manual setter exists.
                 break;
             case SmvmActionType.SaveCamera:
-                await _camera.SaveCameraAsync(_stop.Token).ConfigureAwait(true);
-                break;
             case SmvmActionType.RestoreCamera:
-                if (!_native.CameraOwned)
-                    await _camera.RestoreCameraAsync(_stop.Token).ConfigureAwait(true);
+                // Snapshot utilities were removed from the product workflow.
+                // Keep their protocol values as inert compatibility entries.
                 break;
             case SmvmActionType.AddKeyframe:
-                if (action.Tick >= 0 && action.Camera.IsValid)
+                _ = RunReplayEffect(() =>
                 {
+                    if (action.Tick < 0 || !action.Camera.IsValid)
+                        return;
                     if (!_native.ManualCameraEstablished)
                     {
                         TraceCapture(
@@ -805,7 +1422,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                             SmvmCaptureRejection.NotInFreeRoam,
                             "SMVM Free Camera is not active");
                         _campath.ReportCaptureRejection(SmvmCaptureRejection.NotInFreeRoam);
-                        break;
+                        return;
                     }
                     TraceCapture(
                         SmvmCaptureStage.ManagedActionReturned,
@@ -819,56 +1436,66 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                     TraceCapture(
                         SmvmCaptureStage.KeyframeAdded,
                         detail: $"count={_campath.Keyframes.Count}, tick={action.Tick}");
-                }
+                });
                 break;
             case SmvmActionType.DeleteKeyframe:
-                _campath.DeleteKeyframe(action.Index);
+                _ = RunReplayEffect(() => _campath.DeleteKeyframe(action.Index));
                 break;
             case SmvmActionType.SelectKeyframe:
-                _campath.SelectKeyframe(action.Index);
+                _ = RunReplayEffect(() => _campath.SelectKeyframe(action.Index));
                 break;
             case SmvmActionType.GoToKeyframe:
                 await EnterSmvmFreeCameraAsync().ConfigureAwait(true);
-                _campath.SelectKeyframe(action.Index);
-                await _campath.GoToAsync().ConfigureAwait(true);
+                if (!RunReplayEffect(() => _campath.SelectKeyframe(action.Index)))
+                    return;
+                await ExecuteKeyframeSeekAsync().ConfigureAwait(true);
                 break;
             case SmvmActionType.UpdateKeyframe:
-                _campath.SelectKeyframe(action.Index);
-                await _campath.UpdateAsync().ConfigureAwait(true);
+                if (!RunReplayEffect(() => _campath.SelectKeyframe(action.Index)))
+                    return;
+                await _campath.UpdateAsync(
+                    actionStillCurrent,
+                    effect => RunReplayEffect(effect)).ConfigureAwait(true);
                 break;
             case SmvmActionType.ClearPath:
-                _campath.RequestClear();
+                _ = RunReplayEffect(_campath.RequestClear);
                 break;
             case SmvmActionType.SetInterpolation:
-                _campath.InterpolationMode = action.Index == 1
-                    ? CampathInterpolationMode.Smooth
-                    : CampathInterpolationMode.Linear;
+                _ = RunReplayEffect(() =>
+                    _campath.InterpolationMode = action.Index == 1
+                        ? CampathInterpolationMode.Smooth
+                        : CampathInterpolationMode.Linear);
                 break;
             case SmvmActionType.SetEasing:
                 if (Enum.IsDefined((CampathEasingMode)action.Index))
-                    _campath.EasingMode = (CampathEasingMode)action.Index;
+                    _ = RunReplayEffect(() => _campath.EasingMode = (CampathEasingMode)action.Index);
                 break;
             case SmvmActionType.PlayFromStart:
                 await EnterSmvmFreeCameraAsync().ConfigureAwait(true);
+                if (!actionStillCurrent())
+                    return;
                 await _campath.PlayAsync(CampathPlayMode.FromStart).ConfigureAwait(true);
                 break;
             case SmvmActionType.PlayFromCurrent:
                 await EnterSmvmFreeCameraAsync().ConfigureAwait(true);
+                if (!actionStillCurrent())
+                    return;
                 await _campath.PlayAsync(CampathPlayMode.FromCurrent).ConfigureAwait(true);
                 break;
             case SmvmActionType.StopCampath:
                 await _campath.StopAsync().ConfigureAwait(true);
                 break;
             case SmvmActionType.SetEndBehavior:
-                _campath.EndBehavior = action.Index == 1
-                    ? CampathEndBehavior.HoldFinalCamera
-                    : CampathEndBehavior.StopAndRelease;
+                _ = RunReplayEffect(() =>
+                    _campath.EndBehavior = action.Index == 1
+                        ? CampathEndBehavior.HoldFinalCamera
+                        : CampathEndBehavior.StopAndRelease);
                 break;
             case SmvmActionType.UndoEdit:
-                _campath.UndoCommand.Execute(null);
+                _ = RunReplayEffect(() => _campath.UndoCommand.Execute(null));
                 break;
             case SmvmActionType.RedoEdit:
-                _campath.RedoCommand.Execute(null);
+                _ = RunReplayEffect(() => _campath.RedoCommand.Execute(null));
                 break;
             case SmvmActionType.ToggleToolbar:
                 _settings.SmvmShowToolbar = !_settings.SmvmShowToolbar;
@@ -895,34 +1522,34 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                 break;
             case SmvmActionType.SetPathName:
                 if (!string.IsNullOrWhiteSpace(action.Text))
-                    _campath.PathName = action.Text;
+                    _ = RunReplayEffect(() => _campath.PathName = action.Text);
                 break;
             case SmvmActionType.SavePath:
-                _campath.SaveCurrent();
+                _ = RunReplayEffect(_campath.SaveCurrent);
                 break;
             case SmvmActionType.LoadNextPath:
-                _campath.LoadNextMatching();
+                _ = RunReplayEffect(_campath.LoadNextMatching);
                 break;
             case SmvmActionType.NewPath:
-                _campath.NewPath();
+                _ = RunReplayEffect(_campath.NewPath);
                 break;
             case SmvmActionType.SavePathAs:
-                _campath.SaveAs(action.Text);
+                _ = RunReplayEffect(() => _campath.SaveAs(action.Text));
                 break;
             case SmvmActionType.LoadPath:
-                _campath.LoadPathByIndex(action.Index);
+                _ = RunReplayEffect(() => _campath.LoadPathByIndex(action.Index));
                 break;
             case SmvmActionType.ClosePath:
-                _campath.ClosePath();
+                _ = RunReplayEffect(_campath.ClosePath);
                 break;
             case SmvmActionType.RecoverDraft:
-                _campath.RecoverDraft();
+                _ = RunReplayEffect(_campath.RecoverDraft);
                 break;
             case SmvmActionType.DiscardDraft:
-                _campath.DiscardDraft();
+                _ = RunReplayEffect(_campath.DiscardDraft);
                 break;
             case SmvmActionType.RequestPathList:
-                _ = PublishDocumentsAsync();
+                _ = RunReplayEffect(() => _ = PublishDocumentsAsync());
                 break;
             case SmvmActionType.ToggleRestoreWorkspace:
                 _settings.RestoreLastWorkspace = !_settings.RestoreLastWorkspace;
@@ -1013,11 +1640,14 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                 await _native.RunCameraSelfTestAsync(_stop.Token).ConfigureAwait(true);
                 break;
             case SmvmActionType.CampathSelfTest:
-                await _native.RunCampathSelfTestAsync(
-                    new CampathPath(
+                CampathPath? selfTestPath = null;
+                if (!RunReplayEffect(() => selfTestPath = new CampathPath(
                         _campath.GetKeyframeSnapshot(),
                         _campath.InterpolationMode,
-                        _campath.EasingMode),
+                        _campath.EasingMode)))
+                    return;
+                await _native.RunCampathSelfTestAsync(
+                    selfTestPath!,
                     _stop.Token).ConfigureAwait(true);
                 break;
         }
@@ -1066,33 +1696,415 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
             _log.Info(message);
     }
 
-    private void ApplyDeadlockUiMode(DeadlockUiMode mode)
+    private void ApplyDeadlockUiMode(
+        DeadlockUiMode mode,
+        ulong recoveryGeneration = 0,
+        Func<bool>? stillCurrent = null)
     {
-        var replayActive = IsReplayActive(_controller.State);
-        if (!_deadlockUi.Apply(mode, replayActive))
-            return;
-
-        // Clean Footage is deliberately transient. A fresh replay never starts
-        // with both native UI stacks hidden; it returns to the user's normal or
-        // custom replay UI preference.
-        if ((mode is DeadlockUiMode.DeadlockUi or DeadlockUiMode.SmvmReplayUi) &&
-            _settings.SmvmDeadlockUiMode != mode)
+        lock (_processBoundaryGate)
         {
-            _settings.SmvmDeadlockUiMode = mode;
-            _settings.Save();
+            lock (_presentationReplayGate)
+            {
+                var replayActive = IsReplayActive(_controller.State);
+                var applied = stillCurrent is null
+                    ? _deadlockUi.Apply(mode, replayActive, recoveryGeneration)
+                    : _deadlockUi.ApplyIfCurrent(
+                        mode,
+                        replayActive,
+                        stillCurrent,
+                        recoveryGeneration);
+                if (!applied)
+                    return;
+
+                // Clean Footage is deliberately transient. A fresh replay never starts
+                // with both native UI stacks hidden; it returns to the user's normal or
+                // custom replay UI preference.
+                if ((mode is DeadlockUiMode.DeadlockUi or DeadlockUiMode.SmvmReplayUi) &&
+                    _settings.SmvmDeadlockUiMode != mode)
+                {
+                    _settings.SmvmDeadlockUiMode = mode;
+                    _settings.Save();
+                }
+            }
+        }
+    }
+
+    private void ReassertDeadlockUiIfCurrent(Func<bool> stillCurrent)
+    {
+        lock (_processBoundaryGate)
+        {
+            lock (_presentationReplayGate)
+            {
+                if (stillCurrent())
+                    _deadlockUi.ReassertSuppression(IsReplayActive(_controller.State));
+            }
         }
     }
 
     private async Task ExecuteReplaySeekAsync(int tick)
     {
-        Interlocked.Exchange(ref _replaySeekInFlight, 1);
+        Interlocked.Increment(ref _replaySeekInFlight);
         try
         {
             await _native.SeekReplayAsync(tick, _stop.Token).ConfigureAwait(true);
         }
         finally
         {
-            Volatile.Write(ref _replaySeekInFlight, 0);
+            Interlocked.Decrement(ref _replaySeekInFlight);
+        }
+    }
+
+    private bool TryExecutePlaybackSpeedAction(
+        double speed,
+        DemoPlaybackSpeedActionLease lease,
+        SmvmQueuedActionLease queuedActionLease)
+    {
+        lock (_processBoundaryGate)
+        {
+            var replay = _controller.State;
+            var currentReplayIdentity = IsReplayActive(replay)
+                ? DemoStartupPolicy.CreateReplayIdentity(
+                    replay.ReplayName!,
+                    replay.TotalTicks,
+                    replay.ReplaySessionGeneration)
+                : null;
+            var nativeLeaseCurrent = _native.IsConnectionLeaseCurrent(lease.NativeConnectionEpoch);
+            if (!_demoPlaybackSpeed.IsOwnerActionCurrent(
+                    lease,
+                    Volatile.Read(ref _processBoundaryEpoch),
+                    nativeLeaseCurrent ? lease.NativeConnectionEpoch : _native.ConnectionEpoch,
+                    CurrentPresentationReplayEpoch,
+                    currentReplayIdentity,
+                    nativeLeaseCurrent))
+            {
+                _log.Info("Ignored a queued playback-speed action whose replay or process lease expired.");
+                return false;
+            }
+
+            if (currentReplayIdentity is null ||
+                !TryCaptureReplayCommandLease(currentReplayIdentity, out var commandLease))
+            {
+                return false;
+            }
+            if (lease.ReplayIdentity is null &&
+                queuedActionLease.SourceReplaySessionGeneration > 0 &&
+                commandLease.ReplaySessionGeneration != queuedActionLease.SourceReplaySessionGeneration)
+            {
+                return false;
+            }
+            return _controller.SetSpeedIfCurrent(speed, commandLease);
+        }
+    }
+
+    private void ReleaseFailedPlaybackSpeedIntent(DemoPlaybackSpeedActionLease lease)
+    {
+        if (!_demoPlaybackSpeed.ReleaseFailedOwnerIntent(lease) ||
+            Volatile.Read(ref _stopping) != 0)
+        {
+            return;
+        }
+
+        BeginInvokeIsolated(
+            () => _ = CoordinateDemoStartupAsync(_controller.State));
+    }
+
+    private DeadlockUiMode? ResolvePresentationTarget(SmvmAction action)
+    {
+        if (action.Type == SmvmActionType.SetDeadlockUiMode)
+            return action.Tick == 0
+                ? _deadlockUi.ProfileStatus.DesiredMode
+                : (DeadlockUiMode)action.Index;
+        if (action.Type == SmvmActionType.CycleReplayInterface)
+        {
+            var profile = _deadlockUi.ProfileStatus;
+            var current = profile.DesiredMode == DeadlockUiMode.CleanFootage
+                ? profile.DesiredPreviousVisibleMode
+                : profile.DesiredMode;
+            return current == DeadlockUiMode.DeadlockUi
+                ? DeadlockUiMode.SmvmReplayUi
+                : DeadlockUiMode.DeadlockUi;
+        }
+        if (action.Type == SmvmActionType.ToggleReplayPause)
+            return _deadlockUi.ProfileStatus.DesiredMode;
+        return null;
+    }
+
+    private async Task<bool> ConfirmPresentationConnectionLeaseAsync(
+        long connectionEpoch,
+        string operation)
+    {
+        if (await _native.ConfirmConnectionEpochAsync(connectionEpoch, _stop.Token)
+                .ConfigureAwait(true))
+            return true;
+
+        if (!_stop.IsCancellationRequested)
+            _log.Warn($"SMVM skipped or rolled back {operation}: native connection changed.");
+        return false;
+    }
+
+    private async Task<bool> ApplyForwardPresentationWithLeaseAsync(
+        ForwardPresentationLease lease,
+        Func<Func<bool>, bool> apply,
+        string operation,
+        Func<bool>? additionalValidity = null)
+    {
+        var acquired = false;
+        try
+        {
+            await _actionGate.WaitAsync(_stop.Token).ConfigureAwait(true);
+            acquired = true;
+            bool StillCurrent() =>
+                IsForwardPresentationLeaseCurrent(lease) &&
+                (additionalValidity?.Invoke() ?? true);
+            if (!StillCurrent())
+                return false;
+            if (!await ConfirmPresentationConnectionLeaseAsync(lease.ConnectionEpoch, operation)
+                    .ConfigureAwait(true))
+                return false;
+            if (!StillCurrent())
+                return false;
+
+            var applied = apply(StillCurrent);
+            if (!applied)
+                return false;
+
+            if (!StillCurrent())
+            {
+                RestoreAfterInvalidForwardPresentationLease(lease);
+                return false;
+            }
+            if (await ConfirmPresentationConnectionLeaseAsync(lease.ConnectionEpoch, operation)
+                    .ConfigureAwait(true))
+            {
+                if (StillCurrent())
+                    return true;
+                RestoreAfterInvalidForwardPresentationLease(lease);
+                return false;
+            }
+
+            _deadlockUi.RestoreAfterConnectionLeaseLoss();
+            return false;
+        }
+        catch (OperationCanceledException) when (_stop.IsCancellationRequested)
+        {
+            return false;
+        }
+        finally
+        {
+            if (acquired)
+                _actionGate.Release();
+        }
+    }
+
+    private async Task<bool> ReassertMovieUiWithConnectionLeaseAsync(
+        ForwardPresentationLease lease,
+        long? processBoundaryEpoch = null)
+    {
+        static bool IsForwardMode(DeadlockUiMode mode) =>
+            mode is DeadlockUiMode.SmvmReplayUi or DeadlockUiMode.CleanFootage;
+
+        if (processBoundaryEpoch is { } expectedEpoch &&
+            !IsProcessBoundaryCurrent(expectedEpoch))
+        {
+            return false;
+        }
+        if (!IsForwardMode(_deadlockUi.ProfileStatus.DesiredMode))
+            return true;
+        return await ApplyForwardPresentationWithLeaseAsync(
+            lease,
+            stillCurrent => processBoundaryEpoch is { } processEpoch
+                ? RunForProcessBoundary(
+                    processEpoch,
+                    () => ReassertSuppressionForPresentationLease(
+                        replayActive: true,
+                        () => stillCurrent() && IsProcessBoundaryCurrent(processEpoch)))
+                : ReassertSuppressionForPresentationLease(
+                    replayActive: true, stillCurrent),
+            "transport recording-profile reassert",
+            processBoundaryEpoch is { } epoch
+                ? () => IsProcessBoundaryCurrent(epoch)
+                : null).ConfigureAwait(true);
+    }
+
+    private bool ReassertSuppressionForPresentationLease(
+        bool replayActive,
+        Func<bool> stillCurrent)
+    {
+        var profile = _deadlockUi.ProfileStatus;
+        return profile.DesiredMode == DeadlockUiMode.DeadlockUi
+            ? profile.Ui.Mode == DeadlockUiMode.DeadlockUi && !profile.RestorePending
+            : _deadlockUi.ApplyIfCurrent(
+                profile.DesiredMode,
+                replayActive,
+                stillCurrent);
+    }
+
+    private bool IsPresentationIntentCurrent(long expectedEpoch) =>
+        Volatile.Read(ref _presentationIntentEpoch) == expectedEpoch;
+
+    private bool IsProcessBoundaryCurrent(long expectedEpoch) =>
+        Volatile.Read(ref _processBoundaryEpoch) == expectedEpoch;
+
+    private bool RunForProcessBoundary(long expectedEpoch, Func<bool> action)
+    {
+        lock (_processBoundaryGate)
+            return IsProcessBoundaryCurrent(expectedEpoch) && action();
+    }
+
+    private bool IsAutomaticStartupLeaseCurrent(
+        int generation,
+        long processBoundaryEpoch,
+        string replayIdentity,
+        long presentationReplayEpoch)
+    {
+        if (!IsProcessBoundaryCurrent(processBoundaryEpoch) ||
+            !_demoStartup.IsCurrent(generation) ||
+            CurrentPresentationReplayEpoch != presentationReplayEpoch ||
+            !IsReplayIdentityCurrent(replayIdentity))
+        {
+            return false;
+        }
+
+        var replay = _controller.State;
+        return IsReplayActive(replay) && string.Equals(
+            DemoStartupPolicy.CreateReplayIdentity(
+                replay.ReplayName!,
+                replay.TotalTicks,
+                replay.ReplaySessionGeneration),
+            replayIdentity,
+            StringComparison.Ordinal);
+    }
+
+    private ForwardPresentationLease CaptureForwardPresentationLease() =>
+        new(
+            _native.ConnectionEpoch,
+            Volatile.Read(ref _presentationIntentEpoch),
+            CurrentPresentationReplayEpoch);
+
+    private bool IsForwardPresentationLeaseCurrent(ForwardPresentationLease lease) =>
+        IsForwardPresentationIntentAndReplayCurrent(lease) &&
+        IsReplayActive(_controller.State) &&
+        lease.ConnectionEpoch > 0 &&
+        lease.ConnectionEpoch == _native.ConnectionEpoch &&
+        _native.Connected;
+
+    private bool IsForwardPresentationIntentAndReplayCurrent(ForwardPresentationLease lease) =>
+        Volatile.Read(ref _stopping) == 0 &&
+        IsPresentationIntentCurrent(lease.IntentEpoch) &&
+        lease.ReplayEpoch == CurrentPresentationReplayEpoch;
+
+    private void RestoreAfterInvalidForwardPresentationLease(ForwardPresentationLease lease)
+    {
+        // Native host retirement is a physical transport boundary, not an owner
+        // request to show Deadlock UI. Preserve the movie-interface target so a
+        // same-replay reconnect can reassert it. F9, replay replacement/end, and
+        // shutdown invalidate the logical lease and deliberately clear it.
+        if (IsForwardPresentationIntentAndReplayCurrent(lease) &&
+            (lease.ConnectionEpoch != _native.ConnectionEpoch ||
+             !_native.Connected ||
+             !HasAuthoritativeReplayTelemetry(_controller.State)))
+        {
+            _deadlockUi.RestoreAfterConnectionLeaseLoss();
+            return;
+        }
+
+        _deadlockUi.Restore(force: true);
+    }
+
+    private long CurrentPresentationReplayEpoch
+    {
+        get
+        {
+            lock (_presentationReplayGate)
+                return _presentationReplayEpoch;
+        }
+    }
+
+    private bool UpdatePresentationReplayEpoch(ReplayState replay)
+    {
+        // Disconnect and the marker-fenced reconnect snapshot are provisional,
+        // not a replay transition. Retain the prior identity until Deadlock
+        // reports an authoritative position again so same-demo recovery leases
+        // cannot be invalidated by transport noise alone.
+        if (!HasAuthoritativeReplayTelemetry(replay))
+            return false;
+
+        var identity = IsReplayActive(replay)
+            ? DemoStartupPolicy.CreateReplayIdentity(
+                replay.ReplayName!,
+                replay.TotalTicks,
+                replay.ReplaySessionGeneration)
+            : string.Empty;
+        lock (_presentationReplayGate)
+        {
+            // StateChanged can be raised concurrently by command readback and
+            // VConsole output. Recheck while holding the presentation writer
+            // lock: if B committed first, stale A is rejected; if B commits
+            // after this check, B's synchronous callback waits here and then
+            // becomes the final writer.
+            if (!ReferenceEquals(replay, _controller.State))
+                return false;
+            if (string.Equals(identity, _presentationReplayIdentity, StringComparison.Ordinal))
+                return false;
+            _presentationReplayIdentity = identity;
+            ++_presentationReplayEpoch;
+            return !string.IsNullOrWhiteSpace(identity);
+        }
+    }
+
+    private bool IsReplayIdentityCurrent(string expectedIdentity)
+    {
+        lock (_presentationReplayGate)
+            return string.Equals(
+                expectedIdentity,
+                _presentationReplayIdentity,
+                StringComparison.Ordinal);
+    }
+
+    private bool TryCaptureReplayCommandLease(
+        string expectedReplayIdentity,
+        out ReplayCommandLease lease)
+    {
+        var snapshot = _controller.CaptureReplayTelemetrySnapshot();
+        var replay = snapshot.State;
+        if (!HasAuthoritativeReplayTelemetry(replay) || !IsReplayActive(replay) ||
+            !string.Equals(
+                DemoStartupPolicy.CreateReplayIdentity(
+                    replay.ReplayName!,
+                    replay.TotalTicks,
+                    replay.ReplaySessionGeneration),
+                expectedReplayIdentity,
+                StringComparison.Ordinal))
+        {
+            lease = default;
+            return false;
+        }
+
+        lease = new ReplayCommandLease(
+            snapshot.ConnectionGeneration,
+            replay.ReplaySessionGeneration,
+            replay.ReplayName!.Trim());
+        return true;
+    }
+
+    private static ulong RecoveryGeneration(SmvmAction action) => action.Tick switch
+    {
+        > 0 => checked((ulong)action.Tick),
+        < 0 when action.Type == SmvmActionType.SetDeadlockUiMode =>
+            checked((ulong)-action.Tick),
+        _ => 0,
+    };
+
+    private async Task ExecuteKeyframeSeekAsync()
+    {
+        Interlocked.Increment(ref _replaySeekInFlight);
+        try
+        {
+            await _campath.GoToAsync().ConfigureAwait(true);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _replaySeekInFlight);
         }
     }
 
@@ -1346,18 +2358,24 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        _deadlockUi.Restore(force: true);
+        if (Interlocked.Exchange(ref _stopping, 1) != 0)
+            return;
         _native.SmvmActionReceived -= OnActionReceived;
         _native.StatusChanged -= OnNativeStatusChanged;
         _native.SmvmSnapshotProvider = null;
         _campath.EditorStateChanged -= OnEditorStateChanged;
         _native.CampathStateChanged -= OnCampathStateChanged;
         _controller.StateChanged -= OnReplayStateChanged;
+        // Invalidate every captured forward lease before cancellation/drain.
+        // The final inverse must be the last presentation transaction, not the
+        // middle of a forward operation that was already waiting on the gate.
+        Interlocked.Increment(ref _presentationIntentEpoch);
         _stop.Cancel();
         await _actionGate.WaitAsync().ConfigureAwait(false);
         _actionGate.Release();
         await _pathPublishGate.WaitAsync().ConfigureAwait(false);
         _pathPublishGate.Release();
+        _deadlockUi.Restore(force: true);
         _actionGate.Dispose();
         _pathPublishGate.Dispose();
         _stop.Dispose();

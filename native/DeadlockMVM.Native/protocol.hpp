@@ -8,7 +8,7 @@
 namespace deadlock_mvm {
 
 constexpr std::uint32_t kProtocolMagic = 0x4D564D43; // "CMVM" little-endian
-constexpr std::uint16_t kProtocolVersion = 11;
+constexpr std::uint16_t kProtocolVersion = 15;
 constexpr std::size_t kMaxCampathKeyframes = 128;
 constexpr double kMinFov = 5.0;
 constexpr double kMaxFov = 170.0;
@@ -238,6 +238,9 @@ enum SmvmSnapshotFlags : std::uint32_t {
     smvm_snapshot_restore_workspace = 1u << 24,
     smvm_snapshot_capture_diagnostics = 1u << 25,
     smvm_snapshot_show_status_hud = 1u << 26,
+    smvm_snapshot_replay_seek_in_progress = 1u << 27,
+    smvm_snapshot_recording_profile_restore_pending = 1u << 28,
+    smvm_snapshot_recording_profile_transaction_in_progress = 1u << 29,
 };
 
 enum class SmvmCampathSession : std::uint32_t {
@@ -407,6 +410,7 @@ struct MessageHeader final {
     MessageType type;
     std::uint32_t payload_size;
     std::uint64_t sequence;
+    std::uint64_t replay_session_generation;
 };
 
 struct HelloPayload final {
@@ -522,6 +526,8 @@ struct SmvmSnapshotPayload final {
     SmvmNotificationAnchor status_hud_anchor;
     double status_hud_scale;
     double status_hud_opacity;
+    std::uint64_t recording_profile_ack_generation;
+    std::uint64_t replay_session_generation;
 };
 
 constexpr std::size_t kMaxCampathDocuments = 32;
@@ -551,6 +557,7 @@ struct SmvmActionPayload final {
     double value;
     CameraSample camera;
     std::array<char, 64> text;
+    std::uint64_t replay_session_generation;
 };
 
 struct StatusPayload final {
@@ -571,15 +578,15 @@ struct StatusPayload final {
 };
 #pragma pack(pop)
 
-static_assert(sizeof(MessageHeader) == 20);
+static_assert(sizeof(MessageHeader) == 28);
 static_assert(sizeof(HeartbeatPayload) == 24);
 static_assert(sizeof(CameraSample) == 56);
 static_assert(sizeof(RollPayload) == 8);
 static_assert(sizeof(CampathKeyframe) == 64);
 static_assert(sizeof(CampathPayloadHeader) == 16);
-static_assert(sizeof(SmvmSnapshotPayload) == 728);
-static_assert(sizeof(SmvmActionPayload) == 144);
-static_assert(sizeof(StatusPayload) == 264);
+static_assert(sizeof(SmvmSnapshotPayload) == 744);
+static_assert(sizeof(SmvmActionPayload) == 152);
+static_assert(sizeof(StatusPayload) == 272);
 static_assert(sizeof(CampathDocumentEntry) == 144);
 
 constexpr std::size_t kMaxMessageBytes =
@@ -614,7 +621,39 @@ constexpr std::size_t kMaxMessageBytes =
     return header.magic == kProtocolMagic &&
            header.version == kProtocolVersion &&
            IsKnownMessageType(header.type) &&
-           header.payload_size <= kMaxMessageBytes;
+           header.payload_size <= kMaxMessageBytes &&
+           header.replay_session_generation <= 0x7FFFFFFFFFFFFFFFULL;
+}
+
+[[nodiscard]] constexpr bool IsReplayScopedCameraRequest(const MessageType type) noexcept {
+    switch (type) {
+        case MessageType::enable_override:
+        case MessageType::disable_override:
+        case MessageType::set_camera_sample:
+        case MessageType::set_campath:
+        case MessageType::clear_campath:
+        case MessageType::prepare_camera_observation:
+        case MessageType::set_editor_campath:
+        case MessageType::clear_editor_campath:
+        case MessageType::set_roll_override:
+        case MessageType::enable_manual_camera:
+        case MessageType::disable_manual_camera:
+        case MessageType::set_campath_documents:
+            return true;
+        default:
+            return false;
+    }
+}
+
+[[nodiscard]] constexpr bool IsReplaySessionRequestCurrent(
+    const MessageType type,
+    const std::uint64_t request_replay_session_generation,
+    const bool snapshot_available,
+    const std::uint64_t snapshot_replay_session_generation) noexcept {
+    return !IsReplayScopedCameraRequest(type) ||
+           request_replay_session_generation == 0 ||
+           (snapshot_available && snapshot_replay_session_generation != 0 &&
+            request_replay_session_generation == snapshot_replay_session_generation);
 }
 
 [[nodiscard]] inline bool ValidateSample(const CameraSample& sample) noexcept {
@@ -670,14 +709,17 @@ constexpr std::size_t kMaxMessageBytes =
         smvm_snapshot_show_minimal_pill | smvm_snapshot_notifications |
         smvm_snapshot_hide_path_while_playing | smvm_snapshot_campath_unsaved |
         smvm_snapshot_campath_recovery_available | smvm_snapshot_restore_workspace |
-        smvm_snapshot_capture_diagnostics | smvm_snapshot_show_status_hud;
+        smvm_snapshot_capture_diagnostics | smvm_snapshot_show_status_hud |
+        smvm_snapshot_replay_seek_in_progress |
+        smvm_snapshot_recording_profile_restore_pending |
+        smvm_snapshot_recording_profile_transaction_in_progress;
     constexpr auto known_capabilities = smvm_capability_manual_camera | smvm_capability_rendered_roll |
         smvm_capability_path_visualization | smvm_capability_camera_self_test |
         smvm_capability_campath_self_test;
     constexpr auto known_ui_capabilities = deadlock_ui_capability_hide_panorama |
         deadlock_ui_capability_restore_panorama | deadlock_ui_capability_smvm_replay_ui |
         deadlock_ui_capability_clean_footage;
-    if (snapshot.snapshot_version != 6 || (snapshot.flags & ~known_flags) != 0 ||
+    if (snapshot.snapshot_version != 9 || (snapshot.flags & ~known_flags) != 0 ||
         (snapshot.capabilities & ~known_capabilities) != 0 ||
         snapshot.deadlock_ui_mode > DeadlockUiMode::death_notices_only ||
         snapshot.deadlock_ui_error > DeadlockUiError::restore_failed ||
@@ -693,6 +735,10 @@ constexpr std::size_t kMaxMessageBytes =
         snapshot.status_hud_scale < 0.75 || snapshot.status_hud_scale > 1.5 ||
         !std::isfinite(snapshot.status_hud_opacity) ||
         snapshot.status_hud_opacity < 0.35 || snapshot.status_hud_opacity > 1.0 ||
+        snapshot.recording_profile_ack_generation > 0x7FFFFFFFFFFFFFFFULL ||
+        snapshot.replay_session_generation > 0x7FFFFFFFFFFFFFFFULL ||
+        ((snapshot.flags & smvm_snapshot_replay_active) != 0 &&
+         snapshot.replay_session_generation == 0) ||
         snapshot.current_tick < -1 || snapshot.total_ticks < -1 ||
         snapshot.keyframe_count > kMaxCampathKeyframes ||
         snapshot.playback_state > max_playback_state || snapshot.start_failure > max_start_failure ||

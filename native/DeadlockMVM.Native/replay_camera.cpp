@@ -5,6 +5,8 @@
 #include "manual_camera_math.hpp"
 #include "pattern_scan.hpp"
 #include "protocol.hpp"
+#include "recording_visual_policy.hpp"
+#include "replay_session_transition.hpp"
 #include "smvm_action_queue.hpp"
 #include "smvm_overlay.hpp"
 
@@ -19,6 +21,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cwctype>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -50,7 +53,9 @@ constexpr std::ptrdiff_t kCameraRoamingPivot = 0x140;
 constexpr std::ptrdiff_t kControllerPawnHandle = 0x6BC;
 constexpr std::ptrdiff_t kPawnObserverServices = 0xF00;
 constexpr std::ptrdiff_t kObserverMode = 0x48;
+constexpr std::ptrdiff_t kGlobalVarsCurTime = 0x30;
 constexpr std::ptrdiff_t kGlobalVarsTick = 0x44;
+constexpr std::ptrdiff_t kGlobalVarsIntervalPerTick = 0x54;
 constexpr std::size_t kUpdateVtableIndex = 3;
 constexpr std::uint64_t kHeartbeatTimeoutMilliseconds = 1000;
 constexpr std::uint64_t kCameraObservationFreshMilliseconds = 500;
@@ -255,7 +260,7 @@ public:
     }
 
     [[nodiscard]] bool Evaluate(
-        const std::int64_t demo_tick, CameraSample& sample, std::uint64_t& sequence) const noexcept {
+        const double demo_tick, CameraSample& sample, std::uint64_t& sequence) const noexcept {
         for (int attempt = 0; attempt < 4; ++attempt) {
             const auto before = generation_.load(std::memory_order_acquire);
             if ((before & 1u) != 0)
@@ -292,7 +297,7 @@ public:
             } else if (demo_tick >= p2.demo_tick && right == count - 1) {
                 sample = p2.camera;
             } else {
-                auto amount = static_cast<double>(demo_tick - p1.demo_tick) /
+                auto amount = (demo_tick - static_cast<double>(p1.demo_tick)) /
                               static_cast<double>(p2.demo_tick - p1.demo_tick);
                 if (interpolation == CampathInterpolation::smooth) {
                     std::array<CampathKeyframe, kMaxCampathKeyframes> path{};
@@ -416,6 +421,7 @@ struct Backend final {
     // Keeping request+epoch in one atomic prevents reconnect/new-click races.
     std::atomic<std::uint64_t> internal_capture_epoch_token{0};
     std::atomic<std::uint64_t> internal_capture_requested_milliseconds{0};
+    std::atomic<std::uint64_t> internal_capture_replay_session_generation{0};
     std::atomic<SmvmRendererBackend> renderer_backend{SmvmRendererBackend::none};
     std::atomic<SmvmRendererError> renderer_error{SmvmRendererError::renderer_not_loaded};
     std::atomic<std::uint32_t> overlay_flags{0};
@@ -466,20 +472,28 @@ Backend* g_backend = nullptr;
            (snapshot.flags & smvm_snapshot_capture_diagnostics) != 0;
 }
 
+[[nodiscard]] std::uint64_t CurrentSnapshotReplaySessionGeneration(
+    const Backend& backend) noexcept {
+    SmvmSnapshotPayload snapshot{};
+    return backend.smvm_snapshot.Load(snapshot) ? snapshot.replay_session_generation : 0;
+}
+
 [[nodiscard]] bool QueueCaptureDiagnostic(
     Backend& backend,
     const SmvmCaptureStage stage,
     const SmvmCaptureRejection rejection,
-    const std::uint64_t action_generation) noexcept {
+    const std::uint64_t action_generation,
+    const std::uint64_t replay_session_generation) noexcept {
     if (stage != SmvmCaptureStage::capture_rejected && !CaptureDiagnosticsEnabled(backend))
         return true;
-    const SmvmActionPayload action{
+    SmvmActionPayload action{
         SmvmActionType::capture_diagnostic,
         static_cast<std::int32_t>(stage),
         static_cast<std::int64_t>(rejection),
         0.0,
         {},
         {}};
+    action.replay_session_generation = replay_session_generation;
     return backend.smvm_actions.TryPush(action, action_generation);
 }
 
@@ -488,10 +502,17 @@ void RejectPendingCapture(
     const SmvmCaptureRejection rejection) noexcept {
     const auto capture_token =
         backend.internal_capture_epoch_token.exchange(0, std::memory_order_acq_rel);
+    const auto replay_session_generation =
+        backend.internal_capture_replay_session_generation.load(std::memory_order_acquire);
     backend.internal_capture_requested_milliseconds.store(0, std::memory_order_release);
+    backend.internal_capture_replay_session_generation.store(0, std::memory_order_release);
     if (capture_token != 0)
         static_cast<void>(QueueCaptureDiagnostic(
-            backend, SmvmCaptureStage::capture_rejected, rejection, capture_token - 1));
+            backend,
+            SmvmCaptureStage::capture_rejected,
+            rejection,
+            capture_token - 1,
+            replay_session_generation));
 }
 
 void ExpirePendingCapture(Backend& backend) noexcept {
@@ -522,6 +543,7 @@ void RevokeCameraOwnership(Backend& backend, const ErrorCode error) noexcept {
     backend.camera_observed_milliseconds.store(0, std::memory_order_release);
     backend.internal_capture_epoch_token.store(0, std::memory_order_release);
     backend.internal_capture_requested_milliseconds.store(0, std::memory_order_release);
+    backend.internal_capture_replay_session_generation.store(0, std::memory_order_release);
     const auto existing_error = backend.error.load(std::memory_order_acquire);
     if (backend.state.load(std::memory_order_acquire) != BackendState::failed ||
         existing_error == ErrorCode::none || error == ErrorCode::protocol_error)
@@ -572,14 +594,20 @@ void RevokeCameraOwnership(Backend& backend, const ErrorCode error) noexcept {
 [[nodiscard]] bool OverlayQueueAction(void* context, const SmvmActionPayload& action) noexcept {
     auto* backend = static_cast<Backend*>(context);
     const auto action_generation = backend == nullptr ? 0 : backend->smvm_actions.Generation();
+    SmvmSnapshotPayload snapshot{};
     if (backend == nullptr || !backend->pipe_connected.load(std::memory_order_acquire) ||
-        !backend->replay_active.load(std::memory_order_acquire) ||
-        !HasFreshSmvmSnapshot(*backend))
+        (!backend->replay_active.load(std::memory_order_acquire) &&
+         !MayQueueRecordingVisualActionWithoutActiveReplay(action.type, action.index)) ||
+        !HasFreshSmvmSnapshot(*backend) || !backend->smvm_snapshot.Load(snapshot))
+        return false;
+    if (action.replay_session_generation != snapshot.replay_session_generation)
         return false;
     return backend->smvm_actions.TryPush(action, action_generation);
 }
 
-void OverlayRequestCameraCapture(void* context) noexcept {
+void OverlayRequestCameraCapture(
+    void* context,
+    const std::uint64_t replay_session_generation) noexcept {
     auto* backend = static_cast<Backend*>(context);
     const auto action_generation = backend == nullptr ? 0 : backend->smvm_actions.Generation();
     const auto observed_at = backend == nullptr
@@ -603,10 +631,19 @@ void OverlayRequestCameraCapture(void* context) noexcept {
         return;
     if (rejection != SmvmCaptureRejection::none) {
         static_cast<void>(QueueCaptureDiagnostic(
-            *backend, SmvmCaptureStage::capture_rejected, rejection, action_generation));
+            *backend,
+            SmvmCaptureStage::capture_rejected,
+            rejection,
+            action_generation,
+            replay_session_generation));
         return;
     }
 
+    if (replay_session_generation != CurrentSnapshotReplaySessionGeneration(*backend))
+        return;
+    backend->internal_capture_replay_session_generation.store(
+        replay_session_generation,
+        std::memory_order_release);
     backend->internal_capture_requested_milliseconds.store(now, std::memory_order_release);
     auto expected = std::uint64_t{0};
     if (!backend->internal_capture_epoch_token.compare_exchange_strong(
@@ -615,14 +652,16 @@ void OverlayRequestCameraCapture(void* context) noexcept {
             *backend,
             SmvmCaptureStage::capture_rejected,
             SmvmCaptureRejection::capture_already_pending,
-            action_generation));
+            action_generation,
+            replay_session_generation));
         return;
     }
     static_cast<void>(QueueCaptureDiagnostic(
         *backend,
         SmvmCaptureStage::native_frame_awaited,
         SmvmCaptureRejection::none,
-        action_generation));
+        action_generation,
+        replay_session_generation));
 }
 
 void OverlayPublishStatus(
@@ -1067,17 +1106,41 @@ void* __fastcall CameraUpdateHook(void* camera) noexcept {
     void* result = original != nullptr ? original(camera) : nullptr;
     const auto hook_call = backend->hook_calls.fetch_add(1, std::memory_order_relaxed) + 1;
 
+    auto campath_tick = -1.0;
     std::uintptr_t global_vars = 0;
     if (ReadPointer(backend->global_vars_slot, global_vars)) {
+        auto engine_tick = std::int32_t{};
+        auto tick_read = false;
         __try {
-            const auto engine_tick = *reinterpret_cast<const std::int32_t*>(global_vars + kGlobalVarsTick);
+            engine_tick = *reinterpret_cast<const std::int32_t*>(global_vars + kGlobalVarsTick);
+            tick_read = true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            tick_read = false;
+        }
+        if (tick_read) {
             backend->engine_tick.store(engine_tick, std::memory_order_release);
             const auto offset = backend->game_tick_offset.load(std::memory_order_acquire);
             backend->replay_tick.store(offset >= 0 ? engine_tick - offset : -1, std::memory_order_release);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            auto engine_curtime = std::numeric_limits<double>::quiet_NaN();
+            auto interval_per_tick = std::numeric_limits<double>::quiet_NaN();
+            __try {
+                engine_curtime =
+                    *reinterpret_cast<const float*>(global_vars + kGlobalVarsCurTime);
+                interval_per_tick =
+                    *reinterpret_cast<const float*>(global_vars + kGlobalVarsIntervalPerTick);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                engine_curtime = std::numeric_limits<double>::quiet_NaN();
+                interval_per_tick = std::numeric_limits<double>::quiet_NaN();
+            }
+            campath_tick = InterpolatedReplayTick(
+                engine_tick, offset, engine_curtime, interval_per_tick);
+        } else {
             backend->engine_tick.store(0, std::memory_order_release);
             backend->replay_tick.store(-1, std::memory_order_release);
         }
+    } else {
+        backend->engine_tick.store(0, std::memory_order_release);
+        backend->replay_tick.store(-1, std::memory_order_release);
     }
 
     const auto full_override_requested = backend->override_requested.load(std::memory_order_acquire);
@@ -1086,11 +1149,10 @@ void* __fastcall CameraUpdateHook(void* camera) noexcept {
         std::uint64_t sequence = 0;
         auto loaded = false;
         if (backend->campath_active.load(std::memory_order_acquire)) {
-            const auto demo_tick = backend->replay_tick.load(std::memory_order_acquire);
-            if (demo_tick < 0) {
+            if (campath_tick < 0.0) {
                 RevokeCameraOwnership(*backend, ErrorCode::replay_clock_unavailable);
             } else {
-                loaded = backend->campath.Evaluate(demo_tick, sample, sequence);
+                loaded = backend->campath.Evaluate(campath_tick, sample, sequence);
             }
         } else {
             loaded = backend->desired_sample.Load(sample, sequence);
@@ -1103,7 +1165,7 @@ void* __fastcall CameraUpdateHook(void* camera) noexcept {
                 backend->error.store(ErrorCode::none, std::memory_order_release);
                 if (backend->campath_active.load(std::memory_order_acquire) &&
                     backend->campath.EndBehavior() == CampathEndBehavior::stop_and_release &&
-                    backend->replay_tick.load(std::memory_order_acquire) >= backend->campath.EndTick()) {
+                    HasReachedCampathEnd(campath_tick, backend->campath.EndTick())) {
                     backend->campath_completed.store(true, std::memory_order_release);
                     backend->campath_active.store(false, std::memory_order_release);
                     backend->override_requested.store(false, std::memory_order_release);
@@ -1251,20 +1313,29 @@ void* __fastcall CameraUpdateHook(void* camera) noexcept {
                 const auto capture_token =
                     backend->internal_capture_epoch_token.exchange(0, std::memory_order_acq_rel);
                 if (capture_token != 0) {
+                    const auto capture_replay_session_generation =
+                        backend->internal_capture_replay_session_generation.load(
+                            std::memory_order_acquire);
                     backend->internal_capture_requested_milliseconds.store(0, std::memory_order_release);
+                    backend->internal_capture_replay_session_generation.store(0, std::memory_order_release);
                     const auto action_generation = capture_token - 1;
                     static_cast<void>(QueueCaptureDiagnostic(
                         *backend,
                         SmvmCaptureStage::native_frame_captured,
                         SmvmCaptureRejection::none,
-                        action_generation));
-                    const SmvmActionPayload action{
+                        action_generation,
+                        capture_replay_session_generation));
+                    SmvmActionPayload action{
                         SmvmActionType::add_keyframe, -1, tick, 0.0, observed};
+                    action.replay_session_generation = capture_replay_session_generation;
                     const auto queued = backend->smvm_actions.TryPush(action, action_generation);
                     if (!queued && action_generation == backend->smvm_actions.Generation() &&
                         backend->pipe_connected.load(std::memory_order_acquire)) {
                         backend->internal_capture_requested_milliseconds.store(
                             GetTickCount64(), std::memory_order_release);
+                        backend->internal_capture_replay_session_generation.store(
+                            capture_replay_session_generation,
+                            std::memory_order_release);
                         auto no_newer_capture = std::uint64_t{0};
                         static_cast<void>(backend->internal_capture_epoch_token.compare_exchange_strong(
                             no_newer_capture, capture_token, std::memory_order_acq_rel));
@@ -1515,13 +1586,16 @@ void* __fastcall CameraUpdateHook(void* camera) noexcept {
 [[nodiscard]] bool SendStatus(const HANDLE pipe, Backend& backend, const std::uint64_t sequence) noexcept {
     const auto status = BuildStatus(backend);
     const MessageHeader header{kProtocolMagic, kProtocolVersion, MessageType::status,
-                               static_cast<std::uint32_t>(sizeof(status)), sequence};
+                               static_cast<std::uint32_t>(sizeof(status)), sequence, 0};
     return WriteExact(pipe, &header, static_cast<DWORD>(sizeof(header))) &&
            WriteExact(pipe, &status, static_cast<DWORD>(sizeof(status)));
 }
 
 void ResetConnectionGate(Backend& backend) noexcept {
     backend.pipe_connected.store(false, std::memory_order_release);
+    // The recording profile is VConsole-owned, not pipe-owned. Restore it from
+    // the last validated snapshot even when Present never reached one frame.
+    NotifySmvmHostDisconnected();
     // Editor actions are scoped to an IPC connection, not to camera ownership.
     // Camera-gate revocation is expected outside Free Roam and must not discard
     // actions such as FREE ROAM or PAUSE before the host can consume them.
@@ -1552,6 +1626,7 @@ void ResetConnectionGate(Backend& backend) noexcept {
     backend.editor_campath_available.store(false, std::memory_order_release);
     backend.internal_capture_epoch_token.store(0, std::memory_order_release);
     backend.internal_capture_requested_milliseconds.store(0, std::memory_order_release);
+    backend.internal_capture_replay_session_generation.store(0, std::memory_order_release);
 }
 
 [[nodiscard]] bool ValidateSmvmSnapshot(const SmvmSnapshotPayload& snapshot) noexcept {
@@ -1596,6 +1671,23 @@ void ResetConnectionGate(Backend& backend) noexcept {
         std::array<std::uint8_t, kMaxMessageBytes> payload{};
         if (header.payload_size != 0 && !ReadExact(pipe, payload.data(), header.payload_size))
             break;
+
+        SmvmSnapshotPayload current_snapshot{};
+        const auto current_snapshot_available =
+            backend.smvm_snapshot_available.load(std::memory_order_acquire) &&
+            backend.smvm_snapshot.Load(current_snapshot);
+        if (!IsReplaySessionRequestCurrent(
+                header.type,
+                header.replay_session_generation,
+                current_snapshot_available,
+                current_snapshot.replay_session_generation)) {
+            // A command queued for an older replay must be observational only:
+            // acknowledge its sequence without changing camera ownership, path,
+            // samples, or diagnostics in the newly loaded replay.
+            if (!SendStatus(pipe, backend, header.sequence))
+                break;
+            continue;
+        }
 
         switch (header.type) {
             case MessageType::hello: {
@@ -1757,9 +1849,40 @@ void ResetConnectionGate(Backend& backend) noexcept {
                     RevokeCameraOwnership(backend, ErrorCode::protocol_error);
                     break;
                 }
+                SmvmSnapshotPayload previous_snapshot{};
+                const auto previous_snapshot_available =
+                    backend.smvm_snapshot_available.load(std::memory_order_acquire) &&
+                    backend.smvm_snapshot.Load(previous_snapshot);
+                static_cast<void>(InvalidateReplaySessionStateIfChanged(
+                    previous_snapshot_available,
+                    previous_snapshot.replay_session_generation,
+                    request.replay_session_generation,
+                    [&backend]() noexcept {
+                        // Close snapshot reads first. Overlay/hook work that
+                        // started on replay A cannot reacquire ownership while
+                        // its native state is being revoked ahead of replay B.
+                        backend.smvm_snapshot_available.store(false, std::memory_order_release);
+                        backend.smvm_snapshot_milliseconds.store(0, std::memory_order_release);
+                        backend.smvm_actions.Invalidate();
+                        RevokeCameraOwnership(backend, ErrorCode::replay_gate_closed);
+                    },
+                    [&backend]() noexcept {
+                        backend.editor_campath_available.store(false, std::memory_order_release);
+                    },
+                    [&backend]() noexcept {
+                        backend.smvm_documents_available.store(false, std::memory_order_release);
+                        backend.smvm_documents_milliseconds.store(0, std::memory_order_release);
+                    },
+                    []() noexcept {
+                        InvalidateSmvmReplaySessionState();
+                    }));
                 backend.smvm_snapshot.Store(request);
                 backend.smvm_snapshot_milliseconds.store(GetTickCount64(), std::memory_order_release);
                 backend.smvm_snapshot_available.store(true, std::memory_order_release);
+                // Publish the validated snapshot before reconciliation so a
+                // first post-reconnect profile action can be queued against the
+                // same fresh connection epoch without waiting one retry period.
+                ObserveSmvmRecordingVisualSnapshot(request);
                 if ((request.flags & smvm_snapshot_internal_enabled) != 0 &&
                     backend.replay_active.load(std::memory_order_acquire) &&
                     backend.free_roam.load(std::memory_order_acquire) && InstallHook(backend)) {
@@ -1879,8 +2002,15 @@ void ServePipe(Backend& backend) noexcept {
         // boundary rather than unloading reachable executable code.
         backend.state.store(BackendState::failed, std::memory_order_release);
         backend.error.store(ErrorCode::hook_runtime_invalid, std::memory_order_release);
-        for (;;)
-            Sleep(1000);
+        for (;;) {
+            // StopSmvmOverlay intentionally returns false after its bounded
+            // synchronous batch when VConsole is still unavailable. Keep the
+            // retained module useful: a later VConsole recovery must still
+            // restore X-ray, near-fade and Panorama instead of stranding them
+            // until Deadlock exits.
+            PumpSmvmOverlayResidentRecovery();
+            Sleep(100);
+        }
     }
     g_backend = nullptr;
     FreeLibraryAndExitThread(self_module, 0);

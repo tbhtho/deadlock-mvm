@@ -4,19 +4,40 @@ using DeadlockMVM.Core.Native.InProcess;
 namespace DeadlockMVM.Core.Services;
 
 /// <summary>
-/// Owns the small, live-proven Deadlock UI command surface. It deliberately
-/// does not expose arbitrary cvars: every transition is typed, reversible and
-/// restores Panorama after a partial or failed suppression attempt.
+/// Owns the fixed Deadlock replay-presentation command surface. It deliberately
+/// does not expose arbitrary cvars: every transition is typed, has a known
+/// inverse, and restores the complete presentation after a partial failure.
 /// </summary>
 public sealed class DeadlockUiController
 {
-    private const string HidePanoramaCommand = "r_drawpanorama false";
-    private const string RestorePanoramaCommand = "r_drawpanorama true";
+    public static IReadOnlyList<string> ReplayPresentationCommands { get; } = Array.AsReadOnly(
+    new[]
+    {
+        "citadel_player_glow_disabled true",
+        "citadel_camera_fade_viewed_near_opacity 1",
+        "citadel_camera_fade_other_near_opacity 1",
+        "r_drawpanorama false",
+    });
+
+    public static IReadOnlyList<string> DeadlockPresentationRestoreCommands { get; } = Array.AsReadOnly(
+    new[]
+    {
+        "citadel_player_glow_disabled false",
+        "citadel_camera_fade_viewed_near_opacity 0.4",
+        "citadel_camera_fade_other_near_opacity 0.4",
+        "r_drawpanorama true",
+    });
 
     private readonly ReplayController _replay;
     private readonly ILogService _log;
     private readonly object _gate = new();
+    private readonly object _profileTransactionGate = new();
     private DeadlockUiState _state = DeadlockUiState.Default;
+    private bool _profileRestorePending;
+    private bool _profileTransactionInProgress;
+    private ulong _profileAcknowledgementGeneration;
+    private DeadlockUiMode _desiredMode = DeadlockUiMode.DeadlockUi;
+    private DeadlockUiMode _desiredPreviousVisibleMode = DeadlockUiMode.DeadlockUi;
 
     public DeadlockUiController(ReplayController replay, ILogService log)
     {
@@ -29,29 +50,71 @@ public sealed class DeadlockUiController
         get { lock (_gate) return _state; }
     }
 
-    public bool Apply(DeadlockUiMode mode, bool replayActive)
+    public DeadlockUiProfileStatus ProfileStatus
     {
+        get
+        {
+            lock (_gate)
+                return new DeadlockUiProfileStatus(
+                    _state,
+                    _profileRestorePending,
+                    _profileTransactionInProgress,
+                    _profileAcknowledgementGeneration,
+                    _desiredMode,
+                    _desiredPreviousVisibleMode);
+        }
+    }
+
+    internal bool ProfileRestorePending
+    {
+        get { lock (_gate) return _profileRestorePending; }
+    }
+
+    public bool Apply(
+        DeadlockUiMode mode,
+        bool replayActive,
+        ulong recoveryGeneration = 0)
+        => ApplyIfCurrent(mode, replayActive, static () => true, recoveryGeneration);
+
+    /// <summary>
+    /// Atomically validates owner intent under the same transaction gate that
+    /// serializes the four VConsole commands. An emergency F9 either runs after
+    /// this whole forward batch, or invalidates it before the first command.
+    /// </summary>
+    public bool ApplyIfCurrent(
+        DeadlockUiMode mode,
+        bool replayActive,
+        Func<bool> stillCurrent,
+        ulong recoveryGeneration = 0)
+    {
+        ArgumentNullException.ThrowIfNull(stillCurrent);
         if (!Enum.IsDefined(mode) || mode == DeadlockUiMode.DeathNoticesOnly)
             return Fail(DeadlockUiError.UnsupportedMode, "Death Notices Only is not independently controllable.");
         if (mode != DeadlockUiMode.DeadlockUi && !replayActive)
             return Fail(DeadlockUiError.ReplayUnavailable, "A live replay is required before hiding Deadlock UI.");
-        if (!_replay.IsConnected)
-            return Fail(DeadlockUiError.CommandChannelUnavailable, "Deadlock's command channel is unavailable.");
+        lock (_profileTransactionGate)
+        {
+            if (!stillCurrent())
+                return false;
+            if (mode == DeadlockUiMode.DeadlockUi)
+                return RestoreLocked(force: true, recoveryGeneration);
+            if (!_replay.IsConnected)
+                return Fail(DeadlockUiError.CommandChannelUnavailable, "Deadlock's command channel is unavailable.");
 
-        try
-        {
-            _replay.SendRaw(mode == DeadlockUiMode.DeadlockUi
-                ? RestorePanoramaCommand
-                : HidePanoramaCommand);
-            SetMode(mode, DeadlockUiError.None, string.Empty);
-            _log.Info($"Deadlock UI mode applied: {mode}.");
-            return true;
-        }
-        catch (Exception ex)
-        {
-            if (mode != DeadlockUiMode.DeadlockUi)
-                TryRestoreAfterFailure();
-            return Fail(DeadlockUiError.ApplyFailed, $"Could not apply {mode}: {ex.Message}");
+            SetDesiredForwardMode(mode);
+            BeginProfileApply();
+            try
+            {
+                SendProfile(ReplayPresentationCommands);
+                CompleteProfileApply(mode, recoveryGeneration);
+                _log.Info($"Deadlock UI mode applied: {mode}.");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                TryRestoreAfterFailureLocked();
+                return Fail(DeadlockUiError.ApplyFailed, $"Could not apply {mode}: {ex.Message}");
+            }
         }
     }
 
@@ -62,8 +125,10 @@ public sealed class DeadlockUiController
     /// </summary>
     public bool ReassertSuppression(bool replayActive)
     {
-        var mode = State.Mode;
-        return mode == DeadlockUiMode.DeadlockUi || Apply(mode, replayActive);
+        var profile = ProfileStatus;
+        return profile.DesiredMode == DeadlockUiMode.DeadlockUi
+            ? profile.Ui.Mode == DeadlockUiMode.DeadlockUi && !profile.RestorePending
+            : Apply(profile.DesiredMode, replayActive);
     }
 
     /// <summary>
@@ -78,40 +143,233 @@ public sealed class DeadlockUiController
         return Apply(NormalizeVisibleMode(state.PreviousVisibleMode), replayActive);
     }
 
-    public bool Restore(bool force = false)
+    public bool Restore(bool force = false, ulong recoveryGeneration = 0)
     {
-        if (!force && State.Mode == DeadlockUiMode.DeadlockUi)
-            return true;
-        if (!_replay.IsConnected)
-            return Fail(DeadlockUiError.CommandChannelUnavailable, "Deadlock UI restore is waiting for the command channel.");
+        lock (_profileTransactionGate)
+            return RestoreLocked(force, recoveryGeneration);
+    }
 
-        try
+    public bool RetryPendingRestore()
+    {
+        lock (_profileTransactionGate)
+            return RestoreLocked(force: false, preserveDesired: true);
+    }
+
+    /// <summary>
+    /// Clean Footage is a rolling-recording state, never a startup preference.
+    /// A true replay/process boundary returns to the visible mode that preceded
+    /// it. SMVM UI uses the same physical recording profile, while Deadlock UI
+    /// requires the full inverse transaction.
+    /// </summary>
+    public DeadlockUiMode NormalizeTransientCleanForNewReplay()
+    {
+        lock (_profileTransactionGate)
         {
-            _replay.SendRaw(RestorePanoramaCommand);
+            var profile = ProfileStatus;
+            if (profile.DesiredMode != DeadlockUiMode.CleanFootage)
+                return profile.DesiredMode;
+
+            var target = NormalizeVisibleMode(profile.DesiredPreviousVisibleMode);
+            if (target == DeadlockUiMode.DeadlockUi)
+            {
+                _ = RestoreLocked(force: true);
+                return DeadlockUiMode.DeadlockUi;
+            }
+
+            lock (_gate)
+            {
+                _desiredMode = target;
+                _desiredPreviousVisibleMode = target;
+                if (_state.Mode == DeadlockUiMode.CleanFootage)
+                {
+                    _state = _state with
+                    {
+                        Mode = target,
+                        PreviousVisibleMode = target,
+                    };
+                }
+            }
+            return target;
+        }
+    }
+
+    /// <summary>
+    /// Restores the physical profile after the native connection lease changes,
+    /// while retaining a visible error marker so reconnect recovery does not
+    /// mistake this safety rollback for an intentional owner selection.
+    /// </summary>
+    public bool RestoreAfterConnectionLeaseLoss()
+    {
+        lock (_profileTransactionGate)
+        {
+            if (!RestoreLocked(force: true, preserveDesired: true))
+                return false;
             SetState(
                 DeadlockUiMode.DeadlockUi,
                 DeadlockUiMode.DeadlockUi,
-                DeadlockUiError.None,
-                string.Empty);
+                DeadlockUiError.CommandChannelUnavailable,
+                "The native presentation connection changed; SMVM safely restored Deadlock UI and will reassert after reconnect.");
+            return true;
+        }
+    }
+
+    private bool RestoreLocked(
+        bool force,
+        ulong recoveryGeneration = 0,
+        bool preserveDesired = false)
+    {
+        if (!preserveDesired)
+            ClearDesiredMode();
+        var profile = ProfileStatus;
+        if (recoveryGeneration != 0 &&
+            profile.AcknowledgementGeneration == recoveryGeneration &&
+            !profile.RequiresRestore &&
+            !profile.TransactionInProgress)
+        {
+            return true;
+        }
+        if (!force && !profile.RequiresRestore)
+            return true;
+        BeginProfileRestore();
+        if (!_replay.IsConnected)
+        {
+            MarkProfileRestoreFailed();
+            return Fail(DeadlockUiError.CommandChannelUnavailable, "Deadlock UI restore is waiting for the command channel.");
+        }
+
+        try
+        {
+            SendProfile(DeadlockPresentationRestoreCommands);
+            CompleteProfileRestore(recoveryGeneration);
             _log.Info("Deadlock UI restored.");
             return true;
         }
         catch (Exception ex)
         {
+            MarkProfileRestoreFailed();
             return Fail(DeadlockUiError.RestoreFailed, $"Could not restore Deadlock UI: {ex.Message}");
         }
     }
 
-    private void TryRestoreAfterFailure()
+    private void TryRestoreAfterFailureLocked()
     {
+        BeginProfileRestore();
         try
         {
             if (_replay.IsConnected)
-                _replay.SendRaw(RestorePanoramaCommand);
+            {
+                SendProfile(DeadlockPresentationRestoreCommands);
+                CompleteProfileRestore();
+            }
+            else
+            {
+                MarkProfileRestoreFailed();
+            }
         }
         catch
         {
+            MarkProfileRestoreFailed();
             // The native F9 fallback owns the final fail-closed attempt.
+        }
+    }
+
+    private void SendProfile(IReadOnlyList<string> commands)
+    {
+        foreach (var command in commands)
+            _replay.SendRaw(command);
+    }
+
+    private void BeginProfileApply()
+    {
+        lock (_gate)
+        {
+            _profileRestorePending = true;
+            _profileTransactionInProgress = true;
+        }
+    }
+
+    private void CompleteProfileApply(DeadlockUiMode mode, ulong recoveryGeneration)
+    {
+        lock (_gate)
+        {
+            _state = new DeadlockUiState(
+                mode,
+                mode == DeadlockUiMode.CleanFootage
+                    ? _desiredPreviousVisibleMode
+                    : NormalizeVisibleMode(mode),
+                Capabilities,
+                DeadlockUiError.None,
+                string.Empty);
+            _profileTransactionInProgress = false;
+            if (recoveryGeneration != 0)
+                _profileAcknowledgementGeneration = recoveryGeneration;
+        }
+    }
+
+    private void BeginProfileRestore()
+    {
+        lock (_gate)
+        {
+            _state = new DeadlockUiState(
+                DeadlockUiMode.DeadlockUi,
+                DeadlockUiMode.DeadlockUi,
+                Capabilities,
+                DeadlockUiError.None,
+                string.Empty);
+            _profileRestorePending = true;
+            _profileTransactionInProgress = true;
+        }
+    }
+
+    private void MarkProfileRestoreFailed()
+    {
+        lock (_gate)
+        {
+            _profileRestorePending = true;
+            _profileTransactionInProgress = false;
+        }
+    }
+
+    private void CompleteProfileRestore(ulong recoveryGeneration = 0)
+    {
+        lock (_gate)
+        {
+            _state = new DeadlockUiState(
+                DeadlockUiMode.DeadlockUi,
+                DeadlockUiMode.DeadlockUi,
+                Capabilities,
+                DeadlockUiError.None,
+                string.Empty);
+            _profileRestorePending = false;
+            _profileTransactionInProgress = false;
+            if (recoveryGeneration != 0)
+                _profileAcknowledgementGeneration = recoveryGeneration;
+        }
+    }
+
+    private void SetDesiredForwardMode(DeadlockUiMode mode)
+    {
+        lock (_gate)
+        {
+            if (_desiredMode != mode)
+            {
+                _desiredPreviousVisibleMode = mode == DeadlockUiMode.CleanFootage
+                    ? NormalizeVisibleMode(
+                        _state.Mode == DeadlockUiMode.CleanFootage
+                            ? _state.PreviousVisibleMode
+                            : _state.Mode)
+                    : NormalizeVisibleMode(mode);
+            }
+            _desiredMode = mode;
+        }
+    }
+
+    private void ClearDesiredMode()
+    {
+        lock (_gate)
+        {
+            _desiredMode = DeadlockUiMode.DeadlockUi;
+            _desiredPreviousVisibleMode = DeadlockUiMode.DeadlockUi;
         }
     }
 
@@ -123,17 +381,14 @@ public sealed class DeadlockUiController
         return false;
     }
 
-    private void SetMode(DeadlockUiMode mode, DeadlockUiError error, string detail)
+    private void SetModeLocked(DeadlockUiMode mode, DeadlockUiError error, string detail)
     {
-        lock (_gate)
-        {
-            var previousVisible = mode == DeadlockUiMode.CleanFootage
-                ? NormalizeVisibleMode(_state.Mode == DeadlockUiMode.CleanFootage
-                    ? _state.PreviousVisibleMode
-                    : _state.Mode)
-                : NormalizeVisibleMode(mode);
-            _state = new DeadlockUiState(mode, previousVisible, Capabilities, error, detail);
-        }
+        var previousVisible = mode == DeadlockUiMode.CleanFootage
+            ? NormalizeVisibleMode(_state.Mode == DeadlockUiMode.CleanFootage
+                ? _state.PreviousVisibleMode
+                : _state.Mode)
+            : NormalizeVisibleMode(mode);
+        _state = new DeadlockUiState(mode, previousVisible, Capabilities, error, detail);
     }
 
     private void SetState(
@@ -143,12 +398,14 @@ public sealed class DeadlockUiController
         string detail)
     {
         lock (_gate)
+        {
             _state = new DeadlockUiState(
                 mode,
                 NormalizeVisibleMode(previousVisibleMode),
                 Capabilities,
                 error,
                 detail);
+        }
     }
 
     private static DeadlockUiMode NormalizeVisibleMode(DeadlockUiMode mode) =>
@@ -161,6 +418,29 @@ public sealed class DeadlockUiController
         DeadlockUiCapabilities.RestorePanorama |
         DeadlockUiCapabilities.SmvmReplayUi |
         DeadlockUiCapabilities.CleanFootage;
+}
+
+public sealed record DeadlockUiProfileStatus(
+    DeadlockUiState Ui,
+    bool RestorePending,
+    bool TransactionInProgress,
+    ulong AcknowledgementGeneration = 0,
+    DeadlockUiMode DesiredMode = DeadlockUiMode.DeadlockUi,
+    DeadlockUiMode DesiredPreviousVisibleMode = DeadlockUiMode.DeadlockUi)
+{
+    public bool RequiresRestore =>
+        Ui.Mode != DeadlockUiMode.DeadlockUi || RestorePending;
+
+    public bool ShouldRetryRestore =>
+        Ui.Mode == DeadlockUiMode.DeadlockUi &&
+        RestorePending &&
+        !TransactionInProgress;
+
+    public bool ShouldRetryForwardProfile =>
+        (DesiredMode is DeadlockUiMode.SmvmReplayUi or DeadlockUiMode.CleanFootage) &&
+        Ui.Mode == DeadlockUiMode.DeadlockUi &&
+        !RestorePending &&
+        !TransactionInProgress;
 }
 
 public sealed record DeadlockUiState(

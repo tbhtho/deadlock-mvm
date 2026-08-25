@@ -26,6 +26,7 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
     private readonly string _dllPath;
     private readonly CancellationTokenSource _stop = new();
     private readonly SemaphoreSlim _operationGate = new(1, 1);
+    private readonly AsyncLocal<QueuedActionContext?> _queuedActionContext = new();
     private readonly object _manualIntentGate = new();
     private readonly Task _monitorTask;
     private readonly CampathPlaybackStateMachine _playback = new();
@@ -36,9 +37,12 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
     private bool _holdingKeyframe;
     private bool _manualCameraDesired;
     private int _ownershipCleanupQueued;
-    private int _manualRecoveryQueued;
+    private long _manualRecoveryClaim;
+    private long _manualRecoveryClaimConnectionEpoch;
+    private long _nextManualRecoveryClaim;
     private int _cameraTransferDepth;
     private long _explicitExitEpoch;
+    private long _connectionEpoch;
     private CampathPath? _activePath;
     private CampathEndBehavior _endBehavior = CampathEndBehavior.StopAndRelease;
     private SmvmRendererBackend _loggedRendererBackend;
@@ -62,7 +66,7 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
 
     public event EventHandler? StatusChanged;
     public event EventHandler<CampathPlaybackStatus>? CampathStateChanged;
-    public event EventHandler<SmvmAction>? SmvmActionReceived;
+    public event EventHandler<SmvmActionDispatch>? SmvmActionReceived;
     public event EventHandler<SmvmSelfTestResult>? SelfTestStateChanged;
 
     /// <summary>
@@ -76,6 +80,18 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
     public InProcessCameraStatus? Status => _status;
     public string Message => _message;
     public bool Connected => _client?.Connected == true;
+    public long ConnectionEpoch => Volatile.Read(ref _connectionEpoch);
+    public bool IsConnectionLeaseCurrent(long expectedEpoch)
+    {
+        var client = Volatile.Read(ref _client);
+        var observedEpoch = ConnectionEpoch;
+        return IsConnectionLeaseCurrent(
+                   expectedEpoch,
+                   observedEpoch,
+                   client?.Connected == true) &&
+               ReferenceEquals(client, Volatile.Read(ref _client)) &&
+               observedEpoch == ConnectionEpoch;
+    }
     public bool Available => Connected && _status?.Flags.HasFlag(InProcessStatusFlags.Resolved) == true;
     public bool CampathPlaying => _campathPlaying;
     public bool ManualCameraDesired => Volatile.Read(ref _manualCameraDesired);
@@ -94,6 +110,65 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
     public SmvmSelfTestResult SelfTestStatus => _selfTestStatus;
 
     /// <summary>
+    /// Carries the immutable overlay action lease through asynchronous native
+    /// camera work. Public operations revalidate it only after acquiring the
+    /// serialized operation gate, so work queued on replay A cannot recapture
+    /// and mutate replacement replay B.
+    /// </summary>
+    public IDisposable BeginQueuedActionLease(
+        Func<bool> stillCurrent,
+        ReplayCommandLease? replayLease)
+    {
+        ArgumentNullException.ThrowIfNull(stillCurrent);
+        var previous = _queuedActionContext.Value;
+        var current = new QueuedActionContext(stillCurrent, replayLease);
+        _queuedActionContext.Value = current;
+        return new QueuedActionScope(this, previous, current);
+    }
+
+    /// <summary>
+    /// Performs a real round trip on the exact native connection that issued a
+    /// queued presentation action. This fences independent VConsole profile
+    /// writes against native host-loss restoration.
+    /// </summary>
+    public async Task<bool> ConfirmConnectionEpochAsync(
+        long expectedEpoch,
+        CancellationToken cancellationToken = default)
+    {
+        var client = Volatile.Read(ref _client);
+        if (!IsConnectionLeaseCurrent(
+                expectedEpoch,
+                ConnectionEpoch,
+                client?.Connected == true))
+            return false;
+
+        try
+        {
+            var status = await client!.GetStatusAsync(cancellationToken).ConfigureAwait(false);
+            if (!ReferenceEquals(client, Volatile.Read(ref _client)) ||
+                !IsConnectionLeaseCurrent(expectedEpoch, ConnectionEpoch, client.Connected))
+                return false;
+            UpdateStatus(status);
+            return true;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return false;
+        }
+        catch (Exception ex) when (ex is IOException or InvalidDataException or
+                                   InvalidOperationException or ObjectDisposedException)
+        {
+            return false;
+        }
+    }
+
+    internal static bool IsConnectionLeaseCurrent(
+        long expectedEpoch,
+        long currentEpoch,
+        bool connected) =>
+        connected && expectedEpoch > 0 && expectedEpoch == currentEpoch;
+
+    /// <summary>
     /// Atomically cancels durable Free Camera intent before serialized cleanup.
     /// Escape/F9 call this at action ingress so a seek or self-test cannot
     /// reacquire ownership while the explicit exit waits for the operation gate.
@@ -106,7 +181,7 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             Interlocked.Increment(ref _explicitExitEpoch);
             changed = _manualCameraDesired;
             Volatile.Write(ref _manualCameraDesired, false);
-            Interlocked.Exchange(ref _manualRecoveryQueued, 1);
+            BlockAutomaticRecoveryLocked();
         }
         if (changed)
             OnStatusChanged();
@@ -125,6 +200,7 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         EnterCameraTransfer();
         try
         {
+            ThrowIfQueuedActionLeaseExpired();
             ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
             var client = _client;
             if (client?.Connected != true)
@@ -191,7 +267,10 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                 _camera.Selection.Mode,
                 _status?.Error ?? InProcessErrorCode.None,
                 forceInternalFreeRoam))
-            await _camera.EnterFreeRoamAsync(cancellationToken).ConfigureAwait(false);
+        {
+            ThrowIfQueuedActionLeaseExpired();
+            await EnterFreeRoamForCurrentOperationAsync(cancellationToken).ConfigureAwait(false);
+        }
         ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
         if (!ManualCameraDesired)
             throw new InvalidOperationException("SMVM Free Camera activation was superseded by an explicit exit.");
@@ -225,7 +304,8 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             beforeHookCalls,
             status,
             cancellationToken).ConfigureAwait(false);
-        if (!CompleteManualCameraAcquisitionForEpoch(ownershipEpoch, status))
+        if (!RunQueuedEffectForCurrentOperation(
+                () => CompleteManualCameraAcquisitionForEpoch(ownershipEpoch, status)))
             throw new InvalidOperationException(
                 "SMVM Free Camera activation was superseded by an explicit exit.");
         _message = "SMVM Free Camera active on a validated game-thread frame.";
@@ -292,8 +372,12 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         // window a render turn so SMVM can install its camera hook. Once the
         // hook exists, manual movement and capture continue on render frames
         // without advancing the replay clock.
-        await _camera.EnterFreeRoamAsync(cancellationToken).ConfigureAwait(false);
-        _controller.StepTick();
+        ThrowIfQueuedActionLeaseExpired();
+        await EnterFreeRoamForCurrentOperationAsync(cancellationToken).ConfigureAwait(false);
+        ThrowIfQueuedActionLeaseExpired();
+        if (!StepReplayForCurrentOperation())
+            throw new InvalidOperationException(
+                "Replay changed before the paused Free Camera bootstrap could step it.");
         await Task.Delay(PausedManualCameraBootstrapDelay, cancellationToken).ConfigureAwait(false);
         ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
         _log.Info("Native camera: bootstrapped the paused replay camera with one paused tick step.");
@@ -324,10 +408,12 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
     /// </summary>
     public async Task DisableManualCameraAsync(CancellationToken cancellationToken = default)
     {
-        CancelManualCameraIntent();
+        if (_queuedActionContext.Value is null)
+            CancelManualCameraIntent();
         await _operationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            ThrowIfQueuedActionLeaseExpired();
             var client = _client;
             if (client?.Connected == true)
             {
@@ -359,11 +445,13 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
     /// </summary>
     public async Task ExitFreeCameraAsync(CancellationToken cancellationToken = default)
     {
-        CancelManualCameraIntent();
+        if (_queuedActionContext.Value is null)
+            CancelManualCameraIntent();
         await _operationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         EnterCameraTransfer();
         try
         {
+            ThrowIfQueuedActionLeaseExpired();
             var hadCampathOwnership = CampathCameraOwned ||
                                        _status?.Flags.HasFlag(InProcessStatusFlags.CampathActive) == true;
             _campathPlaying = false;
@@ -470,6 +558,7 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         NativeReplayCameraClient? client = null;
         try
         {
+            ThrowIfQueuedActionLeaseExpired();
             ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
             PublishSelfTest(kind, SmvmSelfTestStage.Validating, "Validating replay and native camera gates.");
             client = _client;
@@ -702,6 +791,7 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         await _operationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            ThrowIfQueuedActionLeaseExpired();
             var client = _client ?? throw new InvalidOperationException(_message);
             if (_campathPlaying)
                 throw new InvalidOperationException("Stop Campath playback before adding a keyframe.");
@@ -753,6 +843,7 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         await _operationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            ThrowIfQueuedActionLeaseExpired();
             ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
             var client = _client ?? throw new InvalidOperationException(_message);
             if (_campathPlaying || _status?.OverrideActive == true)
@@ -815,6 +906,7 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         var playbackCommitted = false;
         try
         {
+            ThrowIfQueuedActionLeaseExpired();
             ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
             Transition(CampathPlaybackState.Validating, "Validating replay, path, and native backend.");
             if (!path.IsValid)
@@ -885,8 +977,8 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                 {
                     Transition(CampathPlaybackState.SeekingToStart,
                         "SKIPPING TO CAMPATH START", startTick, currentTick);
-                    if (originalState.IsPaused != true)
-                        _controller.Pause();
+                    if (originalState.IsPaused != true && !PauseReplayForCurrentOperation())
+                        throw new InvalidOperationException("Replay changed before Campath start could pause it.");
                     Transition(CampathPlaybackState.WaitingForLandedTick,
                         "Waiting for Deadlock to report the landed replay tick.", startTick, currentTick);
                     int landed;
@@ -907,12 +999,14 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                         throw;
                     }
                     observationExpectedTick = landed;
-                    _controller.Pause();
+                    if (!PauseReplayForCurrentOperation())
+                        throw new InvalidOperationException("Replay changed while Campath was landing at its start tick.");
                     Transition(CampathPlaybackState.ReacquiringFreeRoam,
                         "Reacquiring Free Roam after the landed seek.", startTick, landed);
                     try
                     {
-                        await _camera.EnterFreeRoamAsync(cancellationToken).ConfigureAwait(false);
+                        ThrowIfQueuedActionLeaseExpired();
+                        await EnterFreeRoamForCurrentOperationAsync(cancellationToken).ConfigureAwait(false);
                     }
                     catch (Exception ex) when (ex is not OperationCanceledException)
                     {
@@ -997,7 +1091,8 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             _holdingKeyframe = false;
             _activePath = path;
             _endBehavior = endBehavior;
-            _controller.Play();
+            if (!PlayReplayForCurrentOperation())
+                throw new InvalidOperationException("Replay changed before Campath playback could start.");
             ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
             playbackCommitted = true;
             Transition(CampathPlaybackState.Playing,
@@ -1077,6 +1172,7 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         EnterCameraTransfer();
         try
         {
+            ThrowIfQueuedActionLeaseExpired();
             ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
             var client = _client ?? throw new InvalidOperationException(_message);
             if (!IsConfirmedReplay(_controller.State) || _controller.GameTickOffset is null)
@@ -1090,13 +1186,16 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             if (CampathCameraOwned)
                 await StopCampathCoreAsync(cancellationToken).ConfigureAwait(false);
 
-            _controller.Pause();
+            if (!PauseReplayForCurrentOperation())
+                throw new InvalidOperationException("Replay changed before Go To could pause it.");
             var landed = await SeekToPathStartAsync(
                 checked((int)keyframe.DemoTick),
                 cancellationToken).ConfigureAwait(false);
-            _controller.Pause();
+            if (!PauseReplayForCurrentOperation())
+                throw new InvalidOperationException("Replay changed before the active Campath seek could pause it.");
             ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
-            await _camera.EnterFreeRoamAsync(cancellationToken).ConfigureAwait(false);
+            ThrowIfQueuedActionLeaseExpired();
+            await EnterFreeRoamForCurrentOperationAsync(cancellationToken).ConfigureAwait(false);
             // EnterFreeRoamAsync completes from authoritative spectator state, but
             // the renderer camera can still be between observer instances for a
             // few frames after demo_gototick. Prove that the post-seek instance is
@@ -1145,6 +1244,7 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         await _operationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            ThrowIfQueuedActionLeaseExpired();
             await StopCampathCoreAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
@@ -1173,14 +1273,15 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         bool? protectedTransportWasPaused = null;
         try
         {
+            ThrowIfQueuedActionLeaseExpired();
             ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
             if (!_campathPlaying || _activePath is not { } path)
             {
                 var releasingHeldCamera = CampathCameraOwned;
                 if (!ManualCameraDesired && !releasingHeldCamera)
                 {
-                    _controller.SeekToTick(tick);
-                    return null;
+                    return await SeekReplayAndWaitForLandingAsync(tick, cancellationToken)
+                        .ConfigureAwait(false);
                 }
 
                 EnterCameraTransfer();
@@ -1189,8 +1290,8 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                     await StopCampathCoreAsync(cancellationToken).ConfigureAwait(false);
                 if (!ManualCameraDesired)
                 {
-                    _controller.SeekToTick(tick);
-                    return null;
+                    return await SeekReplayAndWaitForLandingAsync(tick, cancellationToken)
+                        .ConfigureAwait(false);
                 }
 
                 protectedManualSeek = true;
@@ -1208,7 +1309,8 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                 var manualWasPaused = _controller.State.IsPaused;
                 protectedTransportWasPaused = manualWasPaused;
                 restoreProtectedTransport = true;
-                _controller.Pause();
+                if (!PauseReplayForCurrentOperation())
+                    throw new InvalidOperationException("Replay changed before the Free Camera seek could pause it.");
                 int manualLanded;
                 try
                 {
@@ -1220,11 +1322,13 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                         $"Deadlock did not land at requested tick {tick} within 15 seconds.", ex);
                 }
 
-                _controller.Pause();
+                if (!PauseReplayForCurrentOperation())
+                    throw new InvalidOperationException("Replay changed while the Free Camera seek was landing.");
                 if (!ManualCameraDesired)
                     throw new InvalidOperationException(
                         "Replay seek landed after an explicit SMVM Free Camera exit; camera ownership will remain released.");
-                await _camera.EnterFreeRoamAsync(cancellationToken).ConfigureAwait(false);
+                ThrowIfQueuedActionLeaseExpired();
+                await EnterFreeRoamForCurrentOperationAsync(cancellationToken).ConfigureAwait(false);
                 var manualGateStatus = await SendHeartbeatAsync(manualClient, cancellationToken).ConfigureAwait(false);
                 manualGateStatus = await WaitForNativeAsync(
                     manualClient,
@@ -1264,7 +1368,8 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             var wasPaused = _controller.State.IsPaused;
             protectedTransportWasPaused = wasPaused;
             restoreProtectedTransport = true;
-            _controller.Pause();
+            if (!PauseReplayForCurrentOperation())
+                throw new InvalidOperationException("Replay changed while the active Campath seek was landing.");
             var beforeTick = _controller.State.CurrentTick;
             Transition(
                 CampathPlaybackState.WaitingForLandedTick,
@@ -1297,10 +1402,12 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                 $"Landed at tick {landed}; reacquiring Free Roam before camera writes resume.",
                 tick,
                 landed);
-            _controller.Pause();
+            if (!PauseReplayForCurrentOperation())
+                throw new InvalidOperationException("Replay changed while the active Campath seek was landing.");
             try
             {
-                await _camera.EnterFreeRoamAsync(cancellationToken).ConfigureAwait(false);
+                ThrowIfQueuedActionLeaseExpired();
+                await EnterFreeRoamForCurrentOperationAsync(cancellationToken).ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -1447,9 +1554,9 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
     private void RestoreReplayTransportState(bool? wasPaused)
     {
         if (wasPaused == true)
-            _controller.Pause();
+            _ = PauseReplayForCurrentOperation();
         else if (wasPaused == false)
-            _controller.Play();
+            _ = PlayReplayForCurrentOperation();
     }
 
     private async Task<InProcessCameraStatus> RebaseManualCameraAtSampleAsync(
@@ -1963,20 +2070,37 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         await RunMonitorLoopAsync(
             async token =>
             {
+                var observedClient = Volatile.Read(ref _client);
+                if (ShouldRetireDisconnectedClient(
+                        observedClient is not null,
+                        observedClient?.Connected == true))
+                {
+                    await HandleMonitorFailureAsync(
+                        new IOException("The native presentation pipe was retired."),
+                        token).ConfigureAwait(false);
+                }
                 if (_client?.Connected != true)
                     await TryConnectAsync(token).ConfigureAwait(false);
                 else
                 {
                     await SendHeartbeatAsync(_client, token).ConfigureAwait(false);
                     if (SmvmSnapshotProvider?.Invoke() is { } snapshot)
+                    {
+                        using var snapshotLease = BeginSmvmSnapshotPublicationLease(snapshot);
                         UpdateStatus(await _client.UpdateSmvmSnapshotAsync(snapshot, token)
                             .ConfigureAwait(false));
+                    }
                 }
             },
             HandleMonitorFailureAsync,
             token => timer.WaitForNextTickAsync(token),
             cancellationToken).ConfigureAwait(false);
     }
+
+    internal static bool ShouldRetireDisconnectedClient(
+        bool clientPresent,
+        bool connected) =>
+        clientPresent && !connected;
 
     internal static async Task RunMonitorLoopAsync(
         Func<CancellationToken, Task> runIteration,
@@ -2013,6 +2137,12 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
 
     private async Task HandleMonitorFailureAsync(Exception ex, CancellationToken _)
     {
+        if (ex is StaleConnectionLeaseException)
+        {
+            _log.Info($"Native camera: ignored retired heartbeat lease: {ex.Message}");
+            return;
+        }
+
         var preserveManualIntent = ManualCameraDesired;
         var campathInterrupted = _campathPlaying || _holdingKeyframe ||
                                  _playback.Status.State == CampathPlaybackState.Playing;
@@ -2029,8 +2159,10 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             };
         }
 
-        var client = _client;
-        _client = null;
+        var failedConnectionEpoch = ConnectionEpoch;
+        Interlocked.Increment(ref _connectionEpoch);
+        var client = Interlocked.Exchange(ref _client, null);
+        RetireAutomaticRecoveryClaimForConnection(failedConnectionEpoch);
         if (client is not null)
         {
             try
@@ -2062,6 +2194,8 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         var replay = _controller.State;
         if (!IsConfirmedReplay(replay) || _controller.GameTickOffset is null)
             return;
+        if (SmvmSnapshotProvider is null)
+            return;
         if (!File.Exists(_dllPath))
         {
             _message = $"Native backend unavailable: {Path.GetFileName(_dllPath)} is missing.";
@@ -2091,12 +2225,38 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         }
 
         var client = new NativeReplayCameraClient();
+        client.ExpectedReplaySessionGenerationProvider =
+            ExpectedReplaySessionGenerationForCurrentRequest;
+        var connectionEpoch = Interlocked.Increment(ref _connectionEpoch);
+        client.BindSessionConnectionEpoch(connectionEpoch);
+        client.SmvmActionReceived += OnClientSmvmActionReceived;
         try
         {
             var status = await client.ConnectAsync(process.Id, TimeSpan.FromSeconds(10), cancellationToken)
                 .ConfigureAwait(false);
-            _client = client;
-            UpdateStatus(status);
+            var snapshotProvider = SmvmSnapshotProvider ??
+                throw new InvalidOperationException(
+                    "The SMVM editor snapshot is not ready for native connection publication.");
+            // Native host-loss restoration must be armed before managed code
+            // can observe Connected and issue any forward recording-profile
+            // command. The first periodic monitor snapshot is too late for
+            // this publication boundary.
+            var initialSnapshot = snapshotProvider();
+            using (BeginSmvmSnapshotPublicationLease(initialSnapshot))
+            {
+                status = await client.UpdateSmvmSnapshotAsync(initialSnapshot, cancellationToken)
+                    .ConfigureAwait(false);
+                if (!RunQueuedEffectForCurrentOperation(() =>
+                    {
+                        _client = client;
+                        UpdateStatusCore(status);
+                        return true;
+                    }))
+                {
+                    throw new InvalidOperationException(
+                        "Replay changed before the native connection could be published.");
+                }
+            }
             _message = status.Error == InProcessErrorCode.None
                 ? ManualCameraDesired
                     ? "Native backend reconnected; automatic SMVM Free Camera recovery is starting."
@@ -2104,17 +2264,11 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                 : $"Native backend connected with error: {status.Error}.";
             _log.Info($"Native camera: {load.Message} Protocol v{InProcessProtocol.Version} connected.");
             await SendHeartbeatAsync(client, cancellationToken).ConfigureAwait(false);
-            if (!ManualCameraEstablished && ResetAutomaticRecoveryLatchIfDesired())
-            {
-                QueueAutomaticManualCameraRecovery(
-                    "Native backend reconnected; automatic SMVM Free Camera recovery is starting.",
-                    releaseManualCamera: false,
-                    releaseFullOverride: false,
-                    forceInternalFreeRoam: true);
-            }
         }
         catch
         {
+            Interlocked.CompareExchange(ref _client, null, client);
+            client.SmvmActionReceived -= OnClientSmvmActionReceived;
             await client.DisposeAsync().ConfigureAwait(false);
             throw;
         }
@@ -2124,6 +2278,13 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         NativeReplayCameraClient client,
         CancellationToken cancellationToken)
     {
+        var heartbeatReplayLease = _queuedActionContext.Value is null
+            ? CaptureCurrentReplayCommandLease()
+            : null;
+        using var heartbeatActionLease = heartbeatReplayLease is { } replayLease
+            ? BeginQueuedActionLease(static () => true, replayLease)
+            : null;
+        ThrowIfQueuedActionLeaseExpired();
         var replay = _controller.State;
         var replayActive = IsConfirmedReplay(replay);
         var freeRoam = _camera.Selection.Mode == SpecCameraMode.FreeRoam;
@@ -2138,19 +2299,62 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             replay.CurrentTick ?? -1,
             _controller.GameTickOffset ?? -1,
             cancellationToken).ConfigureAwait(false);
+        var responseReplayLease =
+            _queuedActionContext.Value?.ReplayLease ?? heartbeatReplayLease;
+
+        void ApplyHeartbeatResponse()
+        {
+        if (!IsHeartbeatResponseCurrent(
+                ReferenceEquals(client, Volatile.Read(ref _client)),
+                client.Connected,
+                status.SourceConnectionEpoch,
+                ConnectionEpoch))
+        {
+            throw new StaleConnectionLeaseException(
+                "A native heartbeat completed after its connection lease was retired.");
+        }
         UpdateStatus(status);
+        if (!IsHeartbeatResponseCurrent(
+                ReferenceEquals(client, Volatile.Read(ref _client)),
+                client.Connected,
+                status.SourceConnectionEpoch,
+                ConnectionEpoch))
+        {
+            throw new StaleConnectionLeaseException(
+                "A native heartbeat connection lease was retired while its status was being applied.");
+        }
+        var currentReplay = _controller.State;
+        var currentGameTickOffset = _controller.GameTickOffset;
+        var currentReplayActive = IsConfirmedReplay(currentReplay);
+        if (ShouldQueueManualCameraRecoveryAfterHeartbeat(
+                currentReplay,
+                currentGameTickOffset,
+                ManualCameraDesired,
+                _campathPlaying,
+                _holdingKeyframe,
+                Volatile.Read(ref _cameraTransferDepth) > 0,
+                Volatile.Read(ref _manualRecoveryClaim) != 0,
+                status))
+        {
+            QueueAutomaticManualCameraRecovery(
+                "Replay telemetry recovered; automatic SMVM Free Camera recovery is starting.",
+                releaseManualCamera: false,
+                releaseFullOverride: false,
+                forceInternalFreeRoam: true);
+        }
         if (_campathPlaying && _activePath is { } activePath &&
             _playback.Status.State == CampathPlaybackState.Playing)
         {
             if (_endBehavior == CampathEndBehavior.StopAndRelease &&
-                status.ReplayTick >= activePath.Keyframes[^1].DemoTick)
+                status.CampathCompleted)
             {
                 _campathPlaying = false;
                 Transition(CampathPlaybackState.Completed,
                     $"Campath reached final tick {activePath.Keyframes[^1].DemoTick}.",
                     activePath.Keyframes[^1].DemoTick,
                     status.ReplayTick);
-                _ = CompleteAndReleaseAsync();
+                if (CaptureCurrentReplayCommandLease() is { } completionLease)
+                    _ = CompleteAndReleaseAsync(completionLease);
             }
             else if (!status.OverrideActive &&
                      _playback.Status.State == CampathPlaybackState.Playing &&
@@ -2160,16 +2364,22 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                 _playback.Fail(failure,
                     $"Campath lost native camera ownership ({DescribeNativeStatus(status)})." );
                 RaiseCampathState();
-                _ = StopAfterOwnershipLossAsync(_playback.Status.Detail);
+                if (CaptureCurrentReplayCommandLease() is { } ownershipLossLease)
+                    _ = StopAfterOwnershipLossAsync(_playback.Status.Detail, ownershipLossLease);
             }
         }
-        if (_holdingKeyframe && replayActive && !status.OverrideActive &&
+        if (_holdingKeyframe && currentReplayActive && !status.OverrideActive &&
             _camera.Selection.Mode == SpecCameraMode.FreeRoam &&
             Interlocked.Exchange(ref _ownershipCleanupQueued, 1) == 0)
         {
-            _ = StopAfterOwnershipLossAsync("Held keyframe lost native camera ownership.");
+            if (CaptureCurrentReplayCommandLease() is { } heldKeyframeLease)
+                _ = StopAfterOwnershipLossAsync(
+                    "Held keyframe lost native camera ownership.",
+                    heldKeyframeLease);
+            else
+                Interlocked.Exchange(ref _ownershipCleanupQueued, 0);
         }
-        if (!replayActive &&
+        if (HasConfirmedReplayEnded(currentReplay) &&
             (hadManualCamera || _campathPlaying || _holdingKeyframe || playbackInterrupted))
         {
             CancelManualCameraIntent();
@@ -2194,23 +2404,264 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         {
             OnSelectionChanged(this, EventArgs.Empty);
         }
+        }
+
+        if (responseReplayLease is { } exactReplayLease)
+        {
+            if (!_controller.RunIfCurrent(exactReplayLease, ApplyHeartbeatResponse))
+                throw new InvalidOperationException(
+                    "The replay session changed while a native heartbeat was in flight.");
+        }
+        else
+        {
+            ApplyHeartbeatResponse();
+        }
         return status;
+    }
+
+    internal static bool HasConfirmedReplayEnded(ReplayState replay) =>
+        replay.Connected &&
+        !string.IsNullOrWhiteSpace(replay.ReplayName) &&
+        replay.CurrentTick is { } currentTick &&
+        replay.TotalTicks is { } totalTicks &&
+        currentTick >= totalTicks;
+
+    internal static bool ShouldQueueManualCameraRecoveryAfterHeartbeat(
+        ReplayState replay,
+        int? gameTickOffset,
+        bool manualCameraDesired,
+        bool campathPlaying,
+        bool holdingKeyframe,
+        bool cameraTransferInProgress,
+        bool recoveryAlreadyQueued,
+        InProcessCameraStatus status) =>
+        IsConfirmedReplay(replay) && gameTickOffset is not null && manualCameraDesired &&
+        !campathPlaying && !holdingKeyframe &&
+        !cameraTransferInProgress && !recoveryAlreadyQueued &&
+        !status.ManualCameraRequested && !status.ManualCameraActive;
+
+    internal static bool IsHeartbeatResponseCurrent(
+        bool samePublishedClient,
+        bool clientConnected,
+        long responseConnectionEpoch,
+        long currentConnectionEpoch) =>
+        samePublishedClient &&
+        IsConnectionLeaseCurrent(
+            responseConnectionEpoch,
+            currentConnectionEpoch,
+            clientConnected);
+
+    private void ThrowIfQueuedActionLeaseExpired()
+    {
+        var context = _queuedActionContext.Value;
+        if (context is null)
+            return;
+        if (!context.StillCurrent() ||
+            context.ReplayLease is { } replayLease &&
+            !_controller.IsReplayCommandLeaseCurrent(replayLease))
+        {
+            throw new InvalidOperationException(
+                "The queued SMVM action expired before native camera access began.");
+        }
+    }
+
+    private long ExpectedReplaySessionGenerationForCurrentRequest()
+    {
+        var context = _queuedActionContext.Value;
+        if (context is null)
+            return 0;
+
+        // NativeReplayCameraClient calls this only after acquiring its request
+        // gate and immediately before serializing the request. Revalidate the
+        // captured managed lease at that final send boundary, then stamp the
+        // same immutable replay generation for the native server's fence.
+        ThrowIfQueuedActionLeaseExpired();
+        return context.ReplayLease?.ReplaySessionGeneration ?? 0;
+    }
+
+    private IDisposable BeginSmvmSnapshotPublicationLease(SmvmSnapshot snapshot)
+    {
+        var captured = _controller.CaptureReplayTelemetrySnapshot();
+        var expectedConnectionGeneration = captured.ConnectionGeneration;
+        var expectedReplaySessionGeneration = snapshot.ReplaySessionGeneration;
+        var replay = captured.State;
+        var replayLease = expectedReplaySessionGeneration > 0 &&
+                          replay.ReplaySessionGeneration == expectedReplaySessionGeneration &&
+                          replay.Connected && replay.CurrentTick is not null &&
+                          !string.IsNullOrWhiteSpace(replay.ReplayName)
+            ? new ReplayCommandLease(
+                expectedConnectionGeneration,
+                expectedReplaySessionGeneration,
+                replay.ReplayName.Trim())
+            : (ReplayCommandLease?)null;
+
+        bool StillCurrent()
+        {
+            var current = _controller.CaptureReplayTelemetrySnapshot();
+            return expectedConnectionGeneration > 0 &&
+                   current.ConnectionGeneration == expectedConnectionGeneration &&
+                   current.State.ReplaySessionGeneration == expectedReplaySessionGeneration;
+        }
+
+        return BeginQueuedActionLease(StillCurrent, replayLease);
+    }
+
+    private Task<CameraState?> EnterFreeRoamForCurrentOperationAsync(
+        CancellationToken cancellationToken) =>
+        _camera.EnterFreeRoamIfCurrentAsync(RunCameraEffectForCurrentOperation, cancellationToken);
+
+    private bool RunCameraEffectForCurrentOperation(Action effect)
+    {
+        ArgumentNullException.ThrowIfNull(effect);
+        var context = _queuedActionContext.Value;
+        if (context is null)
+        {
+            effect();
+            return true;
+        }
+        if (!context.StillCurrent())
+            return false;
+        return context.ReplayLease is { } replayLease
+            ? _controller.RunIfCurrent(replayLease, effect)
+            : RunUnchecked(effect);
+    }
+
+    private bool RunQueuedEffectForCurrentOperation(Func<bool> effect)
+    {
+        ArgumentNullException.ThrowIfNull(effect);
+        var context = _queuedActionContext.Value;
+        if (context is null)
+            return effect();
+        if (!context.StillCurrent())
+            return false;
+        if (context.ReplayLease is not { } replayLease)
+            return effect();
+
+        var result = false;
+        return _controller.RunIfCurrent(replayLease, () => result = effect()) && result;
+    }
+
+    private static bool RunUnchecked(Action effect)
+    {
+        effect();
+        return true;
+    }
+
+    private ReplaySeekLease CaptureReplaySeekLease()
+    {
+        if (_queuedActionContext.Value?.ReplayLease is { } queuedLease)
+        {
+            ThrowIfQueuedActionLeaseExpired();
+            return new ReplaySeekLease(
+                queuedLease.ConnectionGeneration,
+                queuedLease.ReplaySessionGeneration,
+                queuedLease.ReplayName.Trim());
+        }
+
+        var captured = _controller.CaptureReplayTelemetrySnapshot();
+        return TryCreateReplaySeekLease(captured.ConnectionGeneration, captured.State) ??
+               throw new InvalidOperationException(
+                   "Replay playback must be confirmed before seeking a Campath.");
+    }
+
+    private ReplayCommandLease? CaptureCurrentReplayCommandLease()
+    {
+        var captured = _controller.CaptureReplayTelemetrySnapshot();
+        var replay = captured.State;
+        if (captured.ConnectionGeneration <= 0 ||
+            replay.ReplaySessionGeneration <= 0 ||
+            !replay.Connected ||
+            replay.CurrentTick is null ||
+            string.IsNullOrWhiteSpace(replay.ReplayName))
+        {
+            return null;
+        }
+
+        // A terminal replay still owns an authoritative identity. Heartbeat
+        // cleanup must remain fenced to it while a replacement demo loads.
+        return new ReplayCommandLease(
+            captured.ConnectionGeneration,
+            replay.ReplaySessionGeneration,
+            replay.ReplayName.Trim());
+    }
+
+    private bool PauseReplayForCurrentOperation()
+    {
+        var lease = _queuedActionContext.Value?.ReplayLease;
+        if (lease is null)
+        {
+            _controller.Pause();
+            return true;
+        }
+        return _controller.PauseIfCurrent(lease.Value);
+    }
+
+    private bool PlayReplayForCurrentOperation()
+    {
+        var lease = _queuedActionContext.Value?.ReplayLease;
+        if (lease is null)
+        {
+            _controller.Play();
+            return true;
+        }
+        return _controller.PlayIfCurrent(lease.Value);
+    }
+
+    private bool StepReplayForCurrentOperation(int count = 1)
+    {
+        var lease = _queuedActionContext.Value?.ReplayLease;
+        if (lease is null)
+        {
+            _controller.StepTick(count);
+            return true;
+        }
+        return _controller.StepTickIfCurrent(lease.Value, count);
+    }
+
+    private async Task<int> SeekReplayAndWaitForLandingAsync(
+        int tick,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await SeekToPathStartAsync(tick, cancellationToken).ConfigureAwait(false);
+        }
+        catch (TimeoutException ex)
+        {
+            throw new InvalidOperationException(
+                $"Deadlock did not land at requested tick {tick} within 15 seconds.",
+                ex);
+        }
     }
 
     private async Task<int> SeekToPathStartAsync(int tick, CancellationToken cancellationToken)
     {
-        if (TryGetLandedReplayTick(_controller.State, tick, out var landed))
-            return landed;
+        var lease = CaptureReplaySeekLease();
+        var captured = _controller.CaptureReplayTelemetrySnapshot();
 
-        var landing = new ReplaySeekLandingAwaiter(tick);
+        if (TryGetLandedReplayTick(captured.State, tick, out var landed))
+        {
+            ThrowIfReplaySeekLeaseExpired(lease);
+            return landed;
+        }
+
+        var landing = new ReplaySeekLandingAwaiter(tick, lease);
         void OnCompleted(object? sender, int completedTick)
         {
-            landing.ObserveSeekCompleted(completedTick);
+            var current = _controller.CaptureReplayTelemetrySnapshot();
+            landing.ObserveSeekCompleted(
+                completedTick,
+                current.ConnectionGeneration,
+                current.State);
         }
 
         void OnStateChanged(object? sender, ReplayState state)
         {
-            landing.ObserveAuthoritativeState(state);
+            var current = _controller.CaptureReplayTelemetrySnapshot();
+            landing.ObserveAuthoritativeState(
+                state,
+                current.ConnectionGeneration,
+                current.State);
         }
 
         _controller.SeekCompleted += OnCompleted;
@@ -2220,12 +2671,37 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             // Close the small read/subscribe race before issuing a command. A
             // current-tick Go To is already complete and Deadlock may emit no
             // seek-finished console line for that no-op.
-            if (TryGetLandedReplayTick(_controller.State, tick, out landed))
+            var current = _controller.CaptureReplayTelemetrySnapshot();
+            if (!IsReplaySeekLeaseCurrent(
+                    lease,
+                    current.ConnectionGeneration,
+                    current.State))
+            {
+                landing.Expire();
+                return await landing.Completion.ConfigureAwait(false);
+            }
+            if (TryGetLandedReplayTick(current.State, tick, out landed))
                 return landed;
 
-            _controller.SeekToTick(tick);
-            OnStateChanged(_controller, _controller.State);
-            return await landing.Completion.WaitAsync(TimeSpan.FromSeconds(15), cancellationToken).ConfigureAwait(false);
+            if (!_controller.SeekToTickIfCurrent(
+                    tick,
+                    lease.ConnectionGeneration,
+                    lease.ReplaySessionGeneration,
+                    lease.ReplayName))
+            {
+                landing.Expire();
+                return await landing.Completion.ConfigureAwait(false);
+            }
+            current = _controller.CaptureReplayTelemetrySnapshot();
+            landing.ObserveAuthoritativeState(
+                current.State,
+                current.ConnectionGeneration,
+                current.State);
+            landed = await landing.Completion
+                .WaitAsync(TimeSpan.FromSeconds(15), cancellationToken)
+                .ConfigureAwait(false);
+            ThrowIfReplaySeekLeaseExpired(lease);
+            return landed;
         }
         finally
         {
@@ -2242,6 +2718,44 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
 
     internal static bool IsTickWithinTolerance(int candidateTick, int requestedTick) =>
         Math.Abs((long)candidateTick - requestedTick) <= SeekTickTolerance;
+
+    internal static ReplaySeekLease? TryCreateReplaySeekLease(
+        long connectionGeneration,
+        ReplayState state)
+    {
+        if (connectionGeneration <= 0 || state.ReplaySessionGeneration <= 0 || !IsConfirmedReplay(state))
+            return null;
+
+        return new ReplaySeekLease(
+            connectionGeneration,
+            state.ReplaySessionGeneration,
+            state.ReplayName!.Trim());
+    }
+
+    internal static bool IsReplaySeekLeaseCurrent(
+        ReplaySeekLease lease,
+        long connectionGeneration,
+        ReplayState state) =>
+        connectionGeneration == lease.ConnectionGeneration &&
+        state.ReplaySessionGeneration == lease.ReplaySessionGeneration &&
+        IsConfirmedReplay(state) &&
+        string.Equals(
+            state.ReplayName!.Trim(),
+            lease.ReplayName,
+            StringComparison.OrdinalIgnoreCase);
+
+    private void ThrowIfReplaySeekLeaseExpired(ReplaySeekLease lease)
+    {
+        var current = _controller.CaptureReplayTelemetrySnapshot();
+        if (!IsReplaySeekLeaseCurrent(
+                lease,
+                current.ConnectionGeneration,
+                current.State))
+        {
+            throw new InvalidOperationException(
+                ReplaySeekLandingAwaiter.ReplaySessionChangedMessage);
+        }
+    }
 
     private void OnSelectionChanged(object? sender, EventArgs e)
     {
@@ -2274,12 +2788,20 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         }
         else if (Interlocked.Exchange(ref _ownershipCleanupQueued, 1) == 0)
         {
-            _ = StopAfterPovLossAsync(
-                message,
-                releaseManualCamera,
-                releaseFullOverride,
-                automaticRecoveryClaimed: false,
-                ownershipEpoch: CaptureOwnershipEpoch());
+            if (CaptureCurrentReplayCommandLease() is { } cleanupReplayLease)
+            {
+                _ = StopAfterPovLossAsync(
+                    message,
+                    releaseManualCamera,
+                    releaseFullOverride,
+                    automaticRecoveryClaimed: false,
+                    ownershipEpoch: CaptureOwnershipEpoch(),
+                    cleanupReplayLease: cleanupReplayLease);
+            }
+            else
+            {
+                Interlocked.Exchange(ref _ownershipCleanupQueued, 0);
+            }
         }
     }
 
@@ -2290,11 +2812,27 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         bool forceInternalFreeRoam = false)
     {
         var ownershipEpoch = CaptureOwnershipEpoch();
-        if (!CanQueueAutomaticManualCameraRecovery(
-                ManualCameraDesired,
-                Volatile.Read(ref _manualRecoveryQueued) != 0) ||
-            Interlocked.Exchange(ref _manualRecoveryQueued, 1) != 0)
+        var replaySnapshot = _controller.CaptureReplayTelemetrySnapshot();
+        var replaySeekLease = TryCreateReplaySeekLease(
+            replaySnapshot.ConnectionGeneration,
+            replaySnapshot.State);
+        if (replaySeekLease is not { } capturedReplay)
             return;
+        var replayLease = new ReplayCommandLease(
+            capturedReplay.ConnectionGeneration,
+            capturedReplay.ReplaySessionGeneration,
+            capturedReplay.ReplayName);
+        long recoveryClaim;
+        lock (_manualIntentGate)
+        {
+            if (!CanQueueAutomaticManualCameraRecovery(
+                    _manualCameraDesired,
+                    _manualRecoveryClaim != 0))
+                return;
+            recoveryClaim = NextManualRecoveryClaimLocked();
+            _manualRecoveryClaim = recoveryClaim;
+            _manualRecoveryClaimConnectionEpoch = ConnectionEpoch;
+        }
 
         _ = StopAfterPovLossAsync(
             message,
@@ -2302,7 +2840,9 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             releaseFullOverride,
             automaticRecoveryClaimed: true,
             ownershipEpoch: ownershipEpoch,
-            forceInternalFreeRoam: forceInternalFreeRoam);
+            forceInternalFreeRoam: forceInternalFreeRoam,
+            automaticRecoveryClaim: recoveryClaim,
+            automaticRecoveryReplayLease: replayLease);
     }
 
     private async Task StopAfterPovLossAsync(
@@ -2311,8 +2851,22 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         bool releaseFullOverride,
         bool automaticRecoveryClaimed,
         long ownershipEpoch,
-        bool forceInternalFreeRoam = false)
+        bool forceInternalFreeRoam = false,
+        long automaticRecoveryClaim = 0,
+        ReplayCommandLease? automaticRecoveryReplayLease = null,
+        ReplayCommandLease? cleanupReplayLease = null)
     {
+        var operationReplayLease = automaticRecoveryReplayLease ?? cleanupReplayLease;
+        using var recoveryActionLease = operationReplayLease is { } replayLease
+            ? BeginQueuedActionLease(
+                () => !automaticRecoveryClaimed ||
+                      IsOwnershipOperationCurrent(ownershipEpoch, CaptureOwnershipEpoch()) &&
+                      IsAutomaticRecoveryClaimCurrent(automaticRecoveryClaim),
+                replayLease)
+            : null;
+        var automaticRecoveryAttempted = false;
+        NativeReplayCameraClient? automaticRecoveryClient = null;
+        var automaticRecoveryConnectionEpoch = 0L;
         using var recoveryTimeout = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
         if (automaticRecoveryClaimed)
             recoveryTimeout.CancelAfter(AutomaticRecoveryTimeout);
@@ -2324,7 +2878,11 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             EnterCameraTransfer();
             try
             {
+                ThrowIfQueuedActionLeaseExpired();
                 var client = _client;
+                if (automaticRecoveryClaimed &&
+                    !IsAutomaticRecoveryClaimCurrent(automaticRecoveryClaim))
+                    return;
                 if (releaseManualCamera && client?.Connected == true)
                     await TryDisableManualCameraAsync(client, recoveryToken).ConfigureAwait(false);
                 if (releaseFullOverride)
@@ -2337,6 +2895,12 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                         _controller.GameTickOffset) &&
                     !CampathCameraOwned)
                 {
+                    automaticRecoveryAttempted = true;
+                    automaticRecoveryClient = client;
+                    automaticRecoveryConnectionEpoch = ConnectionEpoch;
+                    ScopeAutomaticRecoveryClaimToConnection(
+                        automaticRecoveryClaim,
+                        automaticRecoveryConnectionEpoch);
                     try
                     {
                         await AcquireManualCameraCoreAsync(
@@ -2401,8 +2965,39 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         {
             if (!automaticRecoveryClaimed)
                 Interlocked.Exchange(ref _ownershipCleanupQueued, 0);
+            else if (ManualCameraDesired &&
+                     IsOwnershipOperationCurrent(ownershipEpoch, CaptureOwnershipEpoch()) &&
+                     ShouldReleaseAutomaticRecoveryClaim(
+                         automaticRecoveryAttempted,
+                         automaticRecoveryClient is not null &&
+                         IsHeartbeatResponseCurrent(
+                             ReferenceEquals(automaticRecoveryClient, Volatile.Read(ref _client)),
+                             automaticRecoveryClient.Connected,
+                             automaticRecoveryConnectionEpoch,
+                             ConnectionEpoch),
+                         CanAutoRecoverManualCamera(
+                             ManualCameraDesired,
+                             _client?.Connected == true,
+                             _controller.State,
+                             _controller.GameTickOffset)))
+                ReleaseAutomaticRecoveryClaim(automaticRecoveryClaim);
         }
     }
+
+    internal static bool ShouldReleaseAutomaticRecoveryClaim(
+        bool recoveryAttempted,
+        bool attemptedConnectionLeaseCurrent,
+        bool currentReplayCanRecover) =>
+        !recoveryAttempted || !attemptedConnectionLeaseCurrent || !currentReplayCanRecover;
+
+    internal static bool IsAutomaticRecoveryClaimOwnedByConnection(
+        long claim,
+        long claimConnectionEpoch,
+        long connectionEpoch) =>
+        claim > 0 && claimConnectionEpoch > 0 && claimConnectionEpoch == connectionEpoch;
+
+    internal static bool IsSameAutomaticRecoveryClaim(long currentClaim, long candidateClaim) =>
+        candidateClaim > 0 && currentClaim == candidateClaim;
 
     internal static bool CanQueueAutomaticManualCameraRecovery(
         bool manualCameraDesired,
@@ -2416,8 +3011,11 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         int? gameTickOffset) =>
         manualCameraDesired && nativeConnected && IsConfirmedReplay(replay) && gameTickOffset is not null;
 
-    private async Task StopAfterOwnershipLossAsync(string message)
+    private async Task StopAfterOwnershipLossAsync(
+        string message,
+        ReplayCommandLease replayLease)
     {
+        using var actionLease = BeginQueuedActionLease(static () => true, replayLease);
         try
         {
             await StopCampathAsync(_stop.Token).ConfigureAwait(false);
@@ -2501,7 +3099,7 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             changed = _manualCameraDesired != desired;
             Volatile.Write(ref _manualCameraDesired, desired);
             if (!desired)
-                Interlocked.Exchange(ref _manualRecoveryQueued, 1);
+                BlockAutomaticRecoveryLocked();
         }
         if (changed)
             OnStatusChanged();
@@ -2516,6 +3114,11 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                 return false;
             changed = !_manualCameraDesired;
             Volatile.Write(ref _manualCameraDesired, true);
+            // A current explicit F2 activation supersedes the scope-zero exit
+            // blocker. If this acquisition loses its client, the next live
+            // connection may claim automatic recovery normally.
+            _manualRecoveryClaim = 0;
+            _manualRecoveryClaimConnectionEpoch = 0;
         }
         if (changed)
             OnStatusChanged();
@@ -2531,7 +3134,8 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             if (!IsOwnershipOperationCurrent(ownershipEpoch, _explicitExitEpoch) ||
                 !IsManualCameraEstablished(_manualCameraDesired, status))
                 return false;
-            Interlocked.Exchange(ref _manualRecoveryQueued, 0);
+            _manualRecoveryClaim = 0;
+            _manualRecoveryClaimConnectionEpoch = 0;
             return true;
         }
     }
@@ -2541,18 +3145,72 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         lock (_manualIntentGate)
         {
             if (IsManualCameraEstablished(_manualCameraDesired, status))
-                Interlocked.Exchange(ref _manualRecoveryQueued, 0);
+            {
+                _manualRecoveryClaim = 0;
+                _manualRecoveryClaimConnectionEpoch = 0;
+            }
         }
     }
 
-    private bool ResetAutomaticRecoveryLatchIfDesired()
+    private long NextManualRecoveryClaimLocked()
+    {
+        _nextManualRecoveryClaim++;
+        if (_nextManualRecoveryClaim <= 0)
+            _nextManualRecoveryClaim = 1;
+        return _nextManualRecoveryClaim;
+    }
+
+    private void BlockAutomaticRecoveryLocked()
+    {
+        _manualRecoveryClaim = NextManualRecoveryClaimLocked();
+        _manualRecoveryClaimConnectionEpoch = 0;
+    }
+
+    private void ReleaseAutomaticRecoveryClaim(long recoveryClaim)
+    {
+        if (recoveryClaim <= 0)
+            return;
+        lock (_manualIntentGate)
+        {
+            if (_manualRecoveryClaim != recoveryClaim)
+                return;
+            _manualRecoveryClaim = 0;
+            _manualRecoveryClaimConnectionEpoch = 0;
+        }
+    }
+
+    private bool IsAutomaticRecoveryClaimCurrent(long recoveryClaim)
+    {
+        if (recoveryClaim <= 0)
+            return false;
+        lock (_manualIntentGate)
+            return IsSameAutomaticRecoveryClaim(_manualRecoveryClaim, recoveryClaim);
+    }
+
+    private void ScopeAutomaticRecoveryClaimToConnection(
+        long recoveryClaim,
+        long connectionEpoch)
+    {
+        if (recoveryClaim <= 0 || connectionEpoch <= 0)
+            return;
+        lock (_manualIntentGate)
+        {
+            if (_manualRecoveryClaim == recoveryClaim)
+                _manualRecoveryClaimConnectionEpoch = connectionEpoch;
+        }
+    }
+
+    private void RetireAutomaticRecoveryClaimForConnection(long connectionEpoch)
     {
         lock (_manualIntentGate)
         {
-            if (!_manualCameraDesired)
-                return false;
-            Interlocked.Exchange(ref _manualRecoveryQueued, 0);
-            return true;
+            if (!IsAutomaticRecoveryClaimOwnedByConnection(
+                    _manualRecoveryClaim,
+                    _manualRecoveryClaimConnectionEpoch,
+                    connectionEpoch))
+                return;
+            _manualRecoveryClaim = 0;
+            _manualRecoveryClaimConnectionEpoch = 0;
         }
     }
 
@@ -2565,8 +3223,9 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             OnSelectionChanged(this, EventArgs.Empty);
     }
 
-    private async Task CompleteAndReleaseAsync()
+    private async Task CompleteAndReleaseAsync(ReplayCommandLease replayLease)
     {
+        using var actionLease = BeginQueuedActionLease(static () => true, replayLease);
         try
         {
             await StopCampathAsync(_stop.Token).ConfigureAwait(false);
@@ -2765,7 +3424,7 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         _selfTestStatus = result;
         _message = result.Detail;
         _log.Info($"Native camera: {result.Kind} self-test {result.Stage}: {result.Detail}");
-        SelfTestStateChanged?.Invoke(this, result);
+        RaiseWithoutQueuedActionContext(() => SelfTestStateChanged?.Invoke(this, result));
         OnStatusChanged();
     }
 
@@ -2898,10 +3557,39 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         OnStatusChanged();
     }
 
-    private void RaiseCampathState() => CampathStateChanged?.Invoke(this, _playback.Status);
+    private void RaiseCampathState() =>
+        RaiseWithoutQueuedActionContext(() => CampathStateChanged?.Invoke(this, _playback.Status));
 
     private void UpdateStatus(InProcessCameraStatus status)
     {
+        var context = _queuedActionContext.Value;
+        if (context is null)
+        {
+            UpdateStatusCore(status);
+            return;
+        }
+        if (!context.StillCurrent())
+            throw new InvalidOperationException(
+                "The queued SMVM action expired before its native response could be applied.");
+        if (context.ReplayLease is { } replayLease)
+        {
+            if (!_controller.RunIfCurrent(replayLease, () => UpdateStatusCore(status)))
+                throw new InvalidOperationException(
+                    "The replay session changed before a native response could be applied.");
+            return;
+        }
+        UpdateStatusCore(status);
+    }
+
+    private void UpdateStatusCore(InProcessCameraStatus status)
+    {
+        // A request can finish after its pipe was retired. Never let that stale
+        // response replace current status or deliver an action under a newer
+        // connection lease.
+        if (status.SourceConnectionEpoch > 0 &&
+            status.SourceConnectionEpoch != ConnectionEpoch)
+            return;
+
         var previous = _status;
         var manualCameraInterrupted = ShouldReportManualCameraInterruption(
             ManualCameraDesired,
@@ -2912,14 +3600,24 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         MarkManualCameraEstablished(status);
         if (manualCameraInterrupted)
         {
+            var canRecoverNow = CanAutoRecoverManualCamera(
+                ManualCameraDesired,
+                _client?.Connected == true,
+                _controller.State,
+                _controller.GameTickOffset);
             _message = $"SMVM Free Camera was interrupted by the native backend " +
                        $"({DescribeNativeStatus(status)}). Camera writes are fail-closed; " +
-                       "automatic recovery is starting.";
+                       (canRecoverNow
+                           ? "automatic recovery is starting."
+                           : "automatic recovery is waiting for confirmed replay telemetry.");
             _log.Warn($"Native camera: {_message}");
-            QueueAutomaticManualCameraRecovery(
-                _message,
-                releaseManualCamera: true,
-                releaseFullOverride: false);
+            if (canRecoverNow)
+            {
+                QueueAutomaticManualCameraRecovery(
+                    _message,
+                    releaseManualCamera: true,
+                    releaseFullOverride: false);
+            }
         }
         var lifecycle = status.OverlayFlags &
             (SmvmOverlayFlags.HookInstalled | SmvmOverlayFlags.PresentObserved | SmvmOverlayFlags.Ready |
@@ -2943,9 +3641,27 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             else
                 _log.Warn(detail);
         }
-        if (status.Action.Type != SmvmActionType.None)
-            SmvmActionReceived?.Invoke(this, status.Action);
         OnStatusChanged();
+    }
+
+    private void OnClientSmvmActionReceived(object? sender, SmvmActionDispatch dispatch)
+    {
+        // The client stamps provenance before releasing its request gate, so
+        // this event is FIFO for a connection. A retired client can still be
+        // unwinding; its old epoch is rejected here and again by the host lease.
+        if (dispatch.ConnectionEpoch != ConnectionEpoch)
+            return;
+        try
+        {
+            RaiseWithoutQueuedActionContext(() => SmvmActionReceived?.Invoke(this, dispatch));
+        }
+        catch (Exception ex)
+        {
+            // A host callback failure is not a framing failure and must not
+            // invalidate an otherwise healthy native pipe. F9 still has its
+            // independent native inverse path.
+            _log.Warn($"Native camera: SMVM action dispatch failed: {ex.Message}");
+        }
     }
 
     public async Task PublishEditorCampathAsync(
@@ -2955,20 +3671,48 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(keyframes);
-        var client = _client;
-        if (client?.Connected != true)
-            return;
+        var publicationReplayLease = _queuedActionContext.Value is null
+            ? CaptureCurrentReplayCommandLease() ??
+              throw new InvalidOperationException(
+                  "A confirmed replay identity is required to publish the editor path.")
+            : (ReplayCommandLease?)null;
+        using var publicationActionLease = publicationReplayLease is { } replayLease
+            ? BeginQueuedActionLease(static () => true, replayLease)
+            : null;
+        ThrowIfQueuedActionLeaseExpired();
+        var client = Volatile.Read(ref _client);
+        var connectionEpoch = ConnectionEpoch;
+        if (!IsPublicationResponseCurrent(
+                ReferenceEquals(client, Volatile.Read(ref _client)),
+                client?.Connected == true,
+                connectionEpoch,
+                connectionEpoch,
+                ConnectionEpoch))
+        {
+            throw new StaleConnectionLeaseException(
+                "The native editor-path connection was retired before publication started.");
+        }
         InProcessCameraStatus status;
         if (keyframes.Count == 0)
         {
-            status = await client.ClearEditorCampathAsync(cancellationToken).ConfigureAwait(false);
+            status = await client!.ClearEditorCampathAsync(cancellationToken).ConfigureAwait(false);
         }
         else
         {
-            status = await client.SetEditorCampathAsync(keyframes, interpolation, easing, cancellationToken)
+            status = await client!.SetEditorCampathAsync(keyframes, interpolation, easing, cancellationToken)
                 .ConfigureAwait(false);
         }
+        ThrowIfPublicationResponseRetired(
+            client,
+            connectionEpoch,
+            status,
+            "The native editor-path connection was retired during publication.");
         UpdateStatus(status);
+        ThrowIfPublicationResponseRetired(
+            client,
+            connectionEpoch,
+            status,
+            "The native editor-path connection was retired while its response was being applied.");
     }
 
     /// <summary>Publishes the bounded saved-path picker list for the internal Load UI.</summary>
@@ -2978,19 +3722,91 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(documents);
-        var client = _client;
-        if (client?.Connected != true)
-            return;
-        var status = await client.SetCampathDocumentsAsync(
+        var publicationReplayLease = _queuedActionContext.Value is null
+            ? CaptureCurrentReplayCommandLease() ??
+              throw new InvalidOperationException(
+                  "A confirmed replay identity is required to publish Campath documents.")
+            : (ReplayCommandLease?)null;
+        using var publicationActionLease = publicationReplayLease is { } replayLease
+            ? BeginQueuedActionLease(static () => true, replayLease)
+            : null;
+        ThrowIfQueuedActionLeaseExpired();
+        var client = Volatile.Read(ref _client);
+        var connectionEpoch = ConnectionEpoch;
+        if (!IsPublicationResponseCurrent(
+                ReferenceEquals(client, Volatile.Read(ref _client)),
+                client?.Connected == true,
+                connectionEpoch,
+                connectionEpoch,
+                ConnectionEpoch))
+        {
+            throw new StaleConnectionLeaseException(
+                "The native path-list connection was retired before publication started.");
+        }
+        var status = await client!.SetCampathDocumentsAsync(
             documents.Count > InProcessProtocol.MaxCampathDocuments
                 ? documents.Take(InProcessProtocol.MaxCampathDocuments).ToArray()
                 : documents,
             currentReplay,
             cancellationToken).ConfigureAwait(false);
+        ThrowIfPublicationResponseRetired(
+            client,
+            connectionEpoch,
+            status,
+            "The native path-list connection was retired during publication.");
         UpdateStatus(status);
+        ThrowIfPublicationResponseRetired(
+            client,
+            connectionEpoch,
+            status,
+            "The native path-list connection was retired while its response was being applied.");
     }
 
-    private void OnStatusChanged() => StatusChanged?.Invoke(this, EventArgs.Empty);
+    private void ThrowIfPublicationResponseRetired(
+        NativeReplayCameraClient client,
+        long capturedConnectionEpoch,
+        InProcessCameraStatus status,
+        string message)
+    {
+        if (!IsPublicationResponseCurrent(
+                ReferenceEquals(client, Volatile.Read(ref _client)),
+                client.Connected,
+                capturedConnectionEpoch,
+                status.SourceConnectionEpoch,
+                ConnectionEpoch))
+        {
+            throw new StaleConnectionLeaseException(message);
+        }
+    }
+
+    internal static bool IsPublicationResponseCurrent(
+        bool samePublishedClient,
+        bool clientConnected,
+        long capturedConnectionEpoch,
+        long responseConnectionEpoch,
+        long currentConnectionEpoch) =>
+        samePublishedClient &&
+        clientConnected &&
+        capturedConnectionEpoch > 0 &&
+        responseConnectionEpoch == capturedConnectionEpoch &&
+        capturedConnectionEpoch == currentConnectionEpoch;
+
+    private void OnStatusChanged() =>
+        RaiseWithoutQueuedActionContext(() => StatusChanged?.Invoke(this, EventArgs.Empty));
+
+    private void RaiseWithoutQueuedActionContext(Action raise)
+    {
+        var previous = _queuedActionContext.Value;
+        _queuedActionContext.Value = null;
+        try
+        {
+            raise();
+        }
+        finally
+        {
+            _queuedActionContext.Value = previous;
+        }
+    }
 
     private static bool IsConfirmedReplay(ReplayState replay) =>
         replay.Connected && !string.IsNullOrWhiteSpace(replay.ReplayName) && replay.CurrentTick is not null &&
@@ -3000,6 +3816,8 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         Process.GetProcessesByName("deadlock").FirstOrDefault() ??
         Process.GetProcessesByName("project8").FirstOrDefault();
 
+    private sealed class StaleConnectionLeaseException(string message) : IOException(message);
+
     public async ValueTask DisposeAsync()
     {
         _camera.SelectionChanged -= OnSelectionChanged;
@@ -3008,27 +3826,49 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         _stop.Cancel();
         try { await _monitorTask.ConfigureAwait(false); } catch (OperationCanceledException) { }
 
-        await _operationGate.WaitAsync().ConfigureAwait(false);
+        var operationGateEntered = false;
+        using var shutdownTimeout = new CancellationTokenSource(BestEffortCleanupTimeout);
         try
         {
-            var client = _client;
-            _client = null;
+            try
+            {
+                await _operationGate.WaitAsync(shutdownTimeout.Token).ConfigureAwait(false);
+                operationGateEntered = true;
+            }
+            catch (OperationCanceledException) when (shutdownTimeout.IsCancellationRequested)
+            {
+                _log.Warn(
+                    "Native camera: shutdown operation gate timed out; retiring the pipe so host-loss recovery can restore Deadlock.");
+            }
+
+            Interlocked.Increment(ref _connectionEpoch);
+            var client = Interlocked.Exchange(ref _client, null);
             if (client is not null)
             {
                 try
                 {
-                    if (client.Connected)
+                    if (operationGateEntered && client.Connected)
                     {
-                        UpdateStatus(await client.DisableManualCameraAsync().ConfigureAwait(false));
-                        UpdateStatus(await client.DisableOverrideAsync().ConfigureAwait(false));
-                        UpdateStatus(await client.ShutdownAsync().ConfigureAwait(false));
+                        UpdateStatus(await client.DisableManualCameraAsync(shutdownTimeout.Token)
+                            .ConfigureAwait(false));
+                        UpdateStatus(await client.DisableOverrideAsync(shutdownTimeout.Token)
+                            .ConfigureAwait(false));
+                        UpdateStatus(await client.ShutdownAsync(shutdownTimeout.Token)
+                            .ConfigureAwait(false));
                     }
                 }
-                catch (Exception ex) when (ex is IOException or InvalidOperationException)
+                catch (Exception ex) when (ex is IOException or InvalidOperationException or
+                                           OperationCanceledException)
                 {
                     _log.Warn($"Native camera: shutdown response unavailable: {ex.Message}");
                 }
-                await client.DisposeAsync().ConfigureAwait(false);
+                finally
+                {
+                    // Closing the pipe is the bounded fallback. Native host-loss
+                    // recovery owns the exact inverse if graceful shutdown did
+                    // not acknowledge within the shared budget.
+                    await client.DisposeAsync().ConfigureAwait(false);
+                }
             }
 
             _campathPlaying = false;
@@ -3049,9 +3889,12 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         }
         finally
         {
-            _operationGate.Release();
-            _operationGate.Dispose();
-            _stop.Dispose();
+            if (operationGateEntered)
+            {
+                _operationGate.Release();
+                _operationGate.Dispose();
+                _stop.Dispose();
+            }
         }
     }
 
@@ -3062,32 +3905,95 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         if (delta < -180.0) delta += 360.0;
         return delta;
     }
+
+    private sealed record QueuedActionContext(
+        Func<bool> StillCurrent,
+        ReplayCommandLease? ReplayLease);
+
+    private sealed class QueuedActionScope(
+        NativeReplayCameraSession owner,
+        QueuedActionContext? previous,
+        QueuedActionContext current) : IDisposable
+    {
+        private int _disposed;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+                return;
+            if (ReferenceEquals(owner._queuedActionContext.Value, current))
+                owner._queuedActionContext.Value = previous;
+        }
+    }
 }
+
+internal readonly record struct ReplaySeekLease(
+    long ConnectionGeneration,
+    long ReplaySessionGeneration,
+    string ReplayName);
 
 internal sealed class ReplaySeekLandingAwaiter
 {
+    internal const string ReplaySessionChangedMessage =
+        "Replay session changed while waiting for seek landing.";
+
     private readonly int _requestedTick;
+    private readonly ReplaySeekLease _lease;
     private readonly TaskCompletionSource<int> _completion =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    public ReplaySeekLandingAwaiter(int requestedTick)
+    public ReplaySeekLandingAwaiter(int requestedTick, ReplaySeekLease lease)
     {
         _requestedTick = requestedTick;
+        _lease = lease;
     }
 
     public Task<int> Completion => _completion.Task;
 
-    public bool ObserveAuthoritativeState(ReplayState state)
+    public bool ObserveAuthoritativeState(
+        ReplayState state,
+        long currentConnectionGeneration,
+        ReplayState currentState)
     {
+        if (!EnsureLeaseCurrent(currentConnectionGeneration, currentState))
+            return false;
+
+        // StateChanged notifications are intentionally raised after the
+        // controller releases its telemetry lock. If a newer state won that
+        // race, the older event object is evidence only and cannot land this
+        // seek even when it contains the requested tick.
+        if (!ReferenceEquals(state, currentState))
+            return false;
+
         if (!NativeReplayCameraSession.TryGetLandedReplayTick(state, _requestedTick, out var landedTick))
             return false;
         return _completion.TrySetResult(landedTick);
     }
 
-    public bool ObserveSeekCompleted(int completedTick)
+    public bool ObserveSeekCompleted(
+        int completedTick,
+        long currentConnectionGeneration,
+        ReplayState currentState)
     {
+        if (!EnsureLeaseCurrent(currentConnectionGeneration, currentState))
+            return false;
         if (!NativeReplayCameraSession.IsTickWithinTolerance(completedTick, _requestedTick))
             return false;
         return _completion.TrySetResult(completedTick);
+    }
+
+    public bool Expire() => _completion.TrySetException(
+        new InvalidOperationException(ReplaySessionChangedMessage));
+
+    private bool EnsureLeaseCurrent(long currentConnectionGeneration, ReplayState currentState)
+    {
+        if (NativeReplayCameraSession.IsReplaySeekLeaseCurrent(
+                _lease,
+                currentConnectionGeneration,
+                currentState))
+            return true;
+
+        Expire();
+        return false;
     }
 }

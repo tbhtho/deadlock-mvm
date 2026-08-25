@@ -3,6 +3,7 @@
 #include "free_camera_input.hpp"
 #include "manual_camera_input_policy.hpp"
 #include "manual_mouse_fallback.hpp"
+#include "recording_visual_policy.hpp"
 #include "render_camera_policy.hpp"
 #include "replay_timeline_policy.hpp"
 #include "smvm_input_route.hpp"
@@ -34,6 +35,7 @@
 #include <cstdio>
 #include <cstring>
 #include <optional>
+#include <span>
 #include <string_view>
 
 namespace deadlock_mvm {
@@ -71,6 +73,17 @@ constexpr std::int32_t kFirstEditorBindingAction = kSmvmFirstEditorBindingAction
 constexpr std::int32_t kLastBindingAction = kSmvmLastBindingAction;
 constexpr auto kBindingResponseTimeoutMs = 1500ULL;
 constexpr auto kBindingFeedbackDurationMs = 2200ULL;
+constexpr std::uint32_t kRecordingProfileSoftRestoreDebt = 1u << 0;
+constexpr std::uint32_t kRecordingProfileHardRestoreDebt = 1u << 1;
+constexpr std::uint32_t kRecordingProfileAllRestoreDebt =
+    kRecordingProfileSoftRestoreDebt | kRecordingProfileHardRestoreDebt;
+enum class RecordingProfileRecoveryKind : std::uint32_t {
+    none = 0,
+    explicit_restore = 1,
+    reconnect_reassert = 2,
+    owner_transition = 3,
+    replay_end_restore = 4,
+};
 // Lock-free SPSC ring from the window thread to the render thread. The render
 // thread replays the events into ImGui before NewFrame; overflow drops input
 // rather than blocking Present.
@@ -252,13 +265,32 @@ struct OverlayState final {
     std::atomic<bool> cinematic_space_released{false};
     std::atomic<bool> cinematic_space_consumed{false};
     std::atomic<std::int64_t> cinematic_start_tick{-1};
+    std::atomic<std::uint64_t> cinematic_replay_session_generation{0};
     std::atomic<bool> clean_view{false};
-    std::atomic<bool> cancel_clean_hint{false};
     std::atomic<std::uint32_t> presentation_mode{
         static_cast<std::uint32_t>(DeadlockUiMode::deadlock_ui)};
     std::atomic<std::uint32_t> previous_visible_mode{
         static_cast<std::uint32_t>(DeadlockUiMode::deadlock_ui)};
     std::atomic<std::uint32_t> last_vconsole_port{29000};
+    std::atomic<bool> recording_profile_may_be_active{false};
+    std::atomic<std::uint32_t> recording_profile_restore_debt{0};
+    std::atomic<bool> recording_profile_native_restore_satisfied{false};
+    std::atomic<bool> recording_profile_replay_observed{false};
+    std::atomic<std::uint64_t> recording_profile_restore_request_epoch{0};
+    std::atomic<std::uint64_t> recording_profile_recovery_counter{0};
+    std::atomic<std::uint64_t> recording_profile_recovery_generation{0};
+    std::atomic<std::uint32_t> recording_profile_recovery_kind{
+        static_cast<std::uint32_t>(RecordingProfileRecoveryKind::none)};
+    std::atomic<std::uint32_t> recording_profile_recovery_target_mode{
+        static_cast<std::uint32_t>(DeadlockUiMode::deadlock_ui)};
+    std::atomic<bool> recording_profile_recovery_action_queued{false};
+    std::atomic<std::uint64_t> recording_profile_recovery_action_last_attempt_ms{0};
+    std::atomic<std::uint32_t> recording_profile_last_managed_mode{
+        static_cast<std::uint32_t>(DeadlockUiMode::deadlock_ui)};
+    std::atomic<bool> recording_profile_snapshot_observed{false};
+    std::atomic<bool> recording_profile_disconnect_restore_guard{false};
+    std::atomic<bool> recording_profile_lease_lost{false};
+    std::atomic<std::uint64_t> recording_profile_last_ack_generation{0};
     std::atomic<bool> emergency_restore_attempted{false};
     std::atomic<std::uint64_t> emergency_restore_last_attempt_ms{0};
     std::atomic<std::uint32_t> active_hooks{0};
@@ -317,6 +349,7 @@ struct OverlayState final {
     std::atomic<std::uint32_t> binding_modifier_chord_used{0};
     std::atomic_flag render_lock = ATOMIC_FLAG_INIT;
     SRWLOCK hook_lifecycle_lock = SRWLOCK_INIT;
+    SRWLOCK recording_profile_recovery_lock = SRWLOCK_INIT;
 
     IDXGIFactory* target_factory{};
     void** factory_original_vtable{};
@@ -468,22 +501,109 @@ void PublishStatus(
         state.callbacks.publish_status(state.callbacks.context, backend, error, flags, frame_microseconds);
 }
 
+void ObserveRecordingVisualSnapshotState(const SmvmSnapshotPayload& snapshot) noexcept {
+    auto& state = g_overlay;
+    const auto active_replay =
+        (snapshot.flags & smvm_snapshot_internal_enabled) != 0 &&
+        (snapshot.flags & smvm_snapshot_replay_active) != 0;
+    const auto managed_restore_pending =
+        (snapshot.flags & smvm_snapshot_recording_profile_restore_pending) != 0;
+    const auto managed_transaction_in_progress =
+        (snapshot.flags & smvm_snapshot_recording_profile_transaction_in_progress) != 0;
+    const auto deadlock_mode = snapshot.deadlock_ui_mode == DeadlockUiMode::deadlock_ui;
+    const auto restore_debt =
+        state.recording_profile_restore_debt.load(std::memory_order_acquire);
+    const auto hard_restore_pending =
+        (restore_debt & kRecordingProfileHardRestoreDebt) != 0;
+    state.recording_profile_replay_observed.store(active_replay, std::memory_order_release);
+    state.last_vconsole_port.store(snapshot.vconsole_port, std::memory_order_release);
+    state.recording_profile_last_managed_mode.store(
+        static_cast<std::uint32_t>(snapshot.deadlock_ui_mode), std::memory_order_release);
+    state.recording_profile_last_ack_generation.store(
+        snapshot.recording_profile_ack_generation, std::memory_order_release);
+    state.recording_profile_snapshot_observed.store(true, std::memory_order_release);
+
+    if (ManagedSnapshotMayHaveRecordingVisualProfile(
+            active_replay,
+            deadlock_mode,
+            managed_restore_pending,
+            managed_transaction_in_progress)) {
+        state.recording_profile_may_be_active.store(true, std::memory_order_release);
+    }
+
+    if (!managed_transaction_in_progress && deadlock_mode && !managed_restore_pending) {
+        // Managed mode changes to this stable state only after the complete
+        // inverse batch succeeds. It clears managed/soft recovery. An explicit
+        // F9 generation is retired separately only by its matching snapshot ack.
+        state.recording_profile_may_be_active.store(false, std::memory_order_release);
+        state.recording_profile_restore_debt.fetch_and(
+            ~kRecordingProfileSoftRestoreDebt, std::memory_order_acq_rel);
+    } else if (managed_transaction_in_progress || !deadlock_mode) {
+        state.recording_profile_native_restore_satisfied.store(false, std::memory_order_release);
+        if (ShouldClearObservedRecordingVisualRestoreDebt(
+                hard_restore_pending,
+                managed_restore_pending,
+                managed_transaction_in_progress,
+                deadlock_mode)) {
+            // A healthy managed transaction or stable active SMVM profile owns
+            // soft recovery. Hard F9/host-loss debt is never cleared here.
+            state.recording_profile_restore_debt.fetch_and(
+                ~kRecordingProfileSoftRestoreDebt, std::memory_order_acq_rel);
+        }
+    }
+
+    if (ShouldRequestManagedRecordingVisualRestore(
+            managed_restore_pending,
+            managed_transaction_in_progress,
+            deadlock_mode,
+            state.recording_profile_native_restore_satisfied.load(std::memory_order_acquire))) {
+        state.recording_profile_may_be_active.store(true, std::memory_order_release);
+        state.recording_profile_restore_debt.fetch_or(
+            kRecordingProfileSoftRestoreDebt, std::memory_order_acq_rel);
+    }
+}
+
 [[nodiscard]] bool ReadSnapshot(SmvmSnapshotPayload& snapshot) noexcept {
     const auto& callbacks = g_overlay.callbacks;
     const auto read = callbacks.read_snapshot != nullptr &&
         callbacks.read_snapshot(callbacks.context, snapshot);
     if (read) {
-        const auto current_mode = static_cast<std::uint32_t>(snapshot.deadlock_ui_mode);
+        const auto recovery_kind = static_cast<RecordingProfileRecoveryKind>(
+            g_overlay.recording_profile_recovery_kind.load(std::memory_order_acquire));
+        const auto owner_transition_pending =
+            recovery_kind == RecordingProfileRecoveryKind::owner_transition;
+        const auto explicit_restore_pending =
+            recovery_kind == RecordingProfileRecoveryKind::explicit_restore;
+        const auto connection_recovery_pending =
+            recovery_kind == RecordingProfileRecoveryKind::reconnect_reassert ||
+            recovery_kind == RecordingProfileRecoveryKind::replay_end_restore;
+        const auto hard_restore_pending =
+            (g_overlay.recording_profile_restore_debt.load(std::memory_order_acquire) &
+             kRecordingProfileHardRestoreDebt) != 0;
+        const auto owner_target = static_cast<DeadlockUiMode>(
+            g_overlay.recording_profile_recovery_target_mode.load(std::memory_order_acquire));
+        const auto current_mode_value = ResolveLocalRecordingPresentationMode(
+            snapshot.deadlock_ui_mode,
+            explicit_restore_pending,
+            hard_restore_pending,
+            connection_recovery_pending,
+            owner_transition_pending,
+            owner_target,
+            g_overlay.recording_profile_recovery_action_queued.load(std::memory_order_acquire),
+            (snapshot.flags & smvm_snapshot_internal_enabled) != 0 &&
+                (snapshot.flags & smvm_snapshot_replay_active) != 0,
+            snapshot.deadlock_ui_error != DeadlockUiError::none);
+        const auto current_mode = static_cast<std::uint32_t>(current_mode_value);
         const auto previous_mode = g_overlay.presentation_mode.exchange(
             current_mode, std::memory_order_acq_rel);
-        if (snapshot.deadlock_ui_mode == DeadlockUiMode::clean_footage) {
+        if (current_mode_value == DeadlockUiMode::clean_footage) {
             if (previous_mode == static_cast<std::uint32_t>(DeadlockUiMode::deadlock_ui) ||
                 previous_mode == static_cast<std::uint32_t>(DeadlockUiMode::smvm_replay_ui)) {
                 g_overlay.previous_visible_mode.store(previous_mode, std::memory_order_release);
             }
             g_overlay.clean_view.store(true, std::memory_order_release);
-        } else if (snapshot.deadlock_ui_mode == DeadlockUiMode::deadlock_ui ||
-                   snapshot.deadlock_ui_mode == DeadlockUiMode::smvm_replay_ui) {
+        } else if (current_mode_value == DeadlockUiMode::deadlock_ui ||
+                   current_mode_value == DeadlockUiMode::smvm_replay_ui) {
             g_overlay.previous_visible_mode.store(current_mode, std::memory_order_release);
             g_overlay.clean_view.store(false, std::memory_order_release);
         } else {
@@ -495,11 +615,12 @@ void PublishStatus(
                 std::memory_order_release);
             g_overlay.clean_view.store(false, std::memory_order_release);
         }
-        g_overlay.last_vconsole_port.store(snapshot.vconsole_port, std::memory_order_release);
-        if (snapshot.deadlock_ui_mode == DeadlockUiMode::deadlock_ui) {
-            g_overlay.emergency_restore_attempted.store(false, std::memory_order_release);
-            g_overlay.emergency_restore_last_attempt_ms.store(0, std::memory_order_release);
-        }
+        // Every render/input consumer must see the locally resolved mode. A
+        // stale managed SMVM snapshot must not redraw the timeline after F9,
+        // host loss, queue failure, or another hard inverse has already made
+        // Deadlock UI the authoritative local presentation.
+        snapshot.deadlock_ui_mode = static_cast<DeadlockUiMode>(
+            g_overlay.presentation_mode.load(std::memory_order_acquire));
     }
     return read;
 }
@@ -523,7 +644,30 @@ void PublishStatus(
     const auto& callbacks = g_overlay.callbacks;
     if (callbacks.queue_action == nullptr)
         return false;
+    SmvmSnapshotPayload snapshot{};
+    if (!ReadSnapshot(snapshot))
+        return false;
     SmvmActionPayload action{type, index, tick, value, camera, {}};
+    action.replay_session_generation = snapshot.replay_session_generation;
+    const auto text_length = std::min(text.size(), action.text.size() - 1);
+    if (text_length > 0)
+        std::memcpy(action.text.data(), text.data(), text_length);
+    return callbacks.queue_action(callbacks.context, action);
+}
+
+[[nodiscard]] bool QueueActionForSnapshot(
+    const SmvmSnapshotPayload& snapshot,
+    const SmvmActionType type,
+    const std::int32_t index = -1,
+    const std::int64_t tick = -1,
+    const double value = 0.0,
+    const CameraSample camera = {},
+    const std::string_view text = {}) noexcept {
+    const auto& callbacks = g_overlay.callbacks;
+    if (callbacks.queue_action == nullptr)
+        return false;
+    SmvmActionPayload action{type, index, tick, value, camera, {}};
+    action.replay_session_generation = snapshot.replay_session_generation;
     const auto text_length = std::min(text.size(), action.text.size() - 1);
     if (text_length > 0)
         std::memcpy(action.text.data(), text.data(), text_length);
@@ -537,7 +681,17 @@ void SetMenuOpen(bool open) noexcept;
     const SmvmSnapshotPayload& snapshot) noexcept;
 [[nodiscard]] bool CanConsumeManualCameraMouseInput(
     const SmvmSnapshotPayload& snapshot) noexcept;
-void EmergencyRestoreDeadlockUi() noexcept;
+void RequestEmergencyDeadlockUiRestore(bool hard_restore) noexcept;
+void ArmEmergencyDeadlockUiRestore(bool hard_restore) noexcept;
+void PumpEmergencyDeadlockUiRestore() noexcept;
+[[nodiscard]] std::uint64_t BeginRecordingProfileRecovery(
+    RecordingProfileRecoveryKind kind,
+    DeadlockUiMode target_mode) noexcept;
+void MarkRecordingProfileRecoveryActionQueued(std::uint64_t generation) noexcept;
+[[nodiscard]] bool RequestOwnerPresentationMode(
+    DeadlockUiMode target_mode,
+    const SmvmSnapshotPayload& snapshot) noexcept;
+void ReconcileRecordingProfileRecovery(const SmvmSnapshotPayload& snapshot) noexcept;
 
 [[nodiscard]] DeadlockUiMode PreviousVisibleMode() noexcept {
     const auto raw = g_overlay.previous_visible_mode.load(std::memory_order_acquire);
@@ -548,6 +702,10 @@ void EmergencyRestoreDeadlockUi() noexcept;
 
 void SetLocalPresentationMode(const DeadlockUiMode mode) noexcept {
     auto& state = g_overlay;
+    if (mode != DeadlockUiMode::deadlock_ui) {
+        state.recording_profile_may_be_active.store(true, std::memory_order_release);
+        state.recording_profile_native_restore_satisfied.store(false, std::memory_order_release);
+    }
     state.presentation_mode.store(static_cast<std::uint32_t>(mode), std::memory_order_release);
     if (mode != DeadlockUiMode::smvm_replay_ui &&
         state.replay_tick_input_active.exchange(false, std::memory_order_acq_rel)) {
@@ -561,9 +719,10 @@ void SetLocalPresentationMode(const DeadlockUiMode mode) noexcept {
     }
 }
 
-[[nodiscard]] bool ToggleCleanFootage(const bool restore_and_open_menu) noexcept {
+[[nodiscard]] bool ToggleCleanFootage(
+    const bool restore_and_open_menu,
+    const SmvmSnapshotPayload& snapshot) noexcept {
     auto& state = g_overlay;
-    state.cancel_clean_hint.store(true, std::memory_order_release);
     const auto clean = state.clean_view.load(std::memory_order_acquire);
     if (!clean) {
         const auto current = state.presentation_mode.load(std::memory_order_acquire);
@@ -574,23 +733,24 @@ void SetLocalPresentationMode(const DeadlockUiMode mode) noexcept {
         SetMenuOpen(false);
     }
     const auto target = clean ? PreviousVisibleMode() : DeadlockUiMode::clean_footage;
-    if (!QueueAction(SmvmActionType::set_deadlock_ui_mode, static_cast<std::int32_t>(target))) {
-        SetLocalPresentationMode(DeadlockUiMode::deadlock_ui);
-        EmergencyRestoreDeadlockUi();
+    if (!RequestOwnerPresentationMode(target, snapshot)) {
         return false;
     }
-    SetLocalPresentationMode(target);
     if (clean && restore_and_open_menu)
         SetMenuOpen(true);
     PublishStatus(SmvmRendererBackend::d3d11, SmvmRendererError::none);
     return true;
 }
 
-[[nodiscard]] bool SendEmergencyVConsoleCommand(
+[[nodiscard]] bool SendEmergencyVConsoleCommands(
     const std::uint32_t port,
-    const std::string_view command) noexcept {
-    if (port == 0 || port > 65535 || command.empty() || command.size() > 1024)
+    const std::span<const std::string_view> commands) noexcept {
+    if (port == 0 || port > 65535 || commands.empty())
         return false;
+    for (const auto command : commands) {
+        if (command.empty() || command.size() > 1024)
+            return false;
+    }
     WSADATA winsock{};
     if (WSAStartup(MAKEWORD(2, 2), &winsock) != 0)
         return false;
@@ -696,30 +856,487 @@ void SetLocalPresentationMode(const DeadlockUiMode mode) noexcept {
 
         const auto synchronized = send_command(sync_command.data()) &&
             wait_for_marker(sync_marker.data());
-        sent_all = synchronized && send_command(command) &&
-            send_command(done_command.data()) && wait_for_marker(done_marker.data());
+        sent_all = synchronized;
+        for (const auto command : commands)
+            sent_all = sent_all && send_command(command);
+        sent_all = sent_all && send_command(done_command.data()) &&
+            wait_for_marker(done_marker.data());
     }
     closesocket(socket_handle);
     WSACleanup();
     return sent_all;
 }
 
-void EmergencyRestoreDeadlockUi() noexcept {
+[[nodiscard]] std::uint64_t NextRecordingProfileRecoveryGeneration() noexcept {
+    auto& state = g_overlay;
+    const auto acknowledged = std::min(
+        state.recording_profile_last_ack_generation.load(std::memory_order_acquire),
+        0x7FFFFFFFFFFFFFFEULL);
+    auto counter = state.recording_profile_recovery_counter.load(std::memory_order_acquire);
+    while (counter < acknowledged &&
+           !state.recording_profile_recovery_counter.compare_exchange_weak(
+               counter, acknowledged, std::memory_order_acq_rel, std::memory_order_acquire)) {
+    }
+    auto generation = state.recording_profile_recovery_counter.fetch_add(
+        1, std::memory_order_acq_rel) + 1;
+    generation &= 0x7FFFFFFFFFFFFFFFULL;
+    if (generation == 0) {
+        generation = state.recording_profile_recovery_counter.fetch_add(
+            1, std::memory_order_acq_rel) + 1;
+        generation &= 0x7FFFFFFFFFFFFFFFULL;
+    }
+    return generation;
+}
+
+[[nodiscard]] std::uint64_t BeginRecordingProfileRecovery(
+    const RecordingProfileRecoveryKind kind,
+    const DeadlockUiMode target_mode) noexcept {
+    auto& state = g_overlay;
+    AcquireSRWLockExclusive(&state.recording_profile_recovery_lock);
+    const auto current_kind = static_cast<RecordingProfileRecoveryKind>(
+        state.recording_profile_recovery_kind.load(std::memory_order_relaxed));
+    if ((current_kind == RecordingProfileRecoveryKind::explicit_restore ||
+         current_kind == RecordingProfileRecoveryKind::owner_transition ||
+         current_kind == RecordingProfileRecoveryKind::replay_end_restore) &&
+        kind == RecordingProfileRecoveryKind::reconnect_reassert) {
+        const auto existing = state.recording_profile_recovery_generation.load(
+            std::memory_order_relaxed);
+        state.recording_profile_recovery_action_queued.store(false, std::memory_order_relaxed);
+        state.recording_profile_recovery_action_last_attempt_ms.store(0, std::memory_order_relaxed);
+        ReleaseSRWLockExclusive(&state.recording_profile_recovery_lock);
+        return existing;
+    }
+
+    const auto generation = state.recording_profile_snapshot_observed.load(
+        std::memory_order_acquire)
+        ? NextRecordingProfileRecoveryGeneration()
+        : 0;
+    state.recording_profile_recovery_target_mode.store(
+        static_cast<std::uint32_t>(target_mode), std::memory_order_relaxed);
+    state.recording_profile_recovery_generation.store(generation, std::memory_order_relaxed);
+    state.recording_profile_recovery_action_queued.store(false, std::memory_order_relaxed);
+    state.recording_profile_recovery_action_last_attempt_ms.store(0, std::memory_order_relaxed);
+    state.recording_profile_recovery_kind.store(
+        static_cast<std::uint32_t>(kind), std::memory_order_release);
+    ReleaseSRWLockExclusive(&state.recording_profile_recovery_lock);
+    return generation;
+}
+
+void MarkRecordingProfileRecoveryActionQueued(const std::uint64_t generation) noexcept {
+    auto& state = g_overlay;
+    AcquireSRWLockExclusive(&state.recording_profile_recovery_lock);
+    if (state.recording_profile_recovery_generation.load(std::memory_order_relaxed) == generation) {
+        state.recording_profile_recovery_action_queued.store(true, std::memory_order_relaxed);
+        state.recording_profile_recovery_action_last_attempt_ms.store(
+            GetTickCount64(), std::memory_order_relaxed);
+    }
+    ReleaseSRWLockExclusive(&state.recording_profile_recovery_lock);
+}
+
+[[nodiscard]] bool RequestOwnerPresentationMode(
+    const DeadlockUiMode target_mode,
+    const SmvmSnapshotPayload& snapshot) noexcept {
+    auto& state = g_overlay;
+    AcquireSRWLockExclusive(&state.recording_profile_recovery_lock);
+    const auto kind = static_cast<RecordingProfileRecoveryKind>(
+        state.recording_profile_recovery_kind.load(std::memory_order_relaxed));
+    if (kind == RecordingProfileRecoveryKind::explicit_restore) {
+        ReleaseSRWLockExclusive(&state.recording_profile_recovery_lock);
+        return false;
+    }
+    const auto generation = NextRecordingProfileRecoveryGeneration();
+    state.recording_profile_recovery_target_mode.store(
+        static_cast<std::uint32_t>(target_mode), std::memory_order_relaxed);
+    state.recording_profile_recovery_generation.store(generation, std::memory_order_relaxed);
+    state.recording_profile_recovery_action_queued.store(false, std::memory_order_relaxed);
+    state.recording_profile_recovery_action_last_attempt_ms.store(0, std::memory_order_relaxed);
+    state.recording_profile_recovery_kind.store(
+        static_cast<std::uint32_t>(RecordingProfileRecoveryKind::owner_transition),
+        std::memory_order_release);
+    const auto forward_target = target_mode != DeadlockUiMode::deadlock_ui;
+    const auto hard_restore_pending =
+        (state.recording_profile_restore_debt.load(std::memory_order_acquire) &
+         kRecordingProfileHardRestoreDebt) != 0;
+    const auto queued = ShouldQueueInitialOwnerPresentationAction(
+            forward_target, hard_restore_pending) &&
+        QueueActionForSnapshot(
+            snapshot,
+            SmvmActionType::set_deadlock_ui_mode,
+            static_cast<std::int32_t>(target_mode),
+            -static_cast<std::int64_t>(generation));
+    if (queued) {
+        state.recording_profile_recovery_action_queued.store(true, std::memory_order_relaxed);
+        state.recording_profile_recovery_action_last_attempt_ms.store(
+            GetTickCount64(), std::memory_order_relaxed);
+        SetLocalPresentationMode(target_mode);
+    } else {
+        // The new logical owner intent remains armed and will retry after the
+        // queue/pipe recovers. Fail physically to Deadlock in the meantime so
+        // an already-delivered older forward batch cannot become the last word.
+        SetLocalPresentationMode(DeadlockUiMode::deadlock_ui);
+    }
+    const auto needs_physical_restore =
+        !queued || target_mode == DeadlockUiMode::deadlock_ui;
+    if (needs_physical_restore)
+        ArmEmergencyDeadlockUiRestore(true);
+    ReleaseSRWLockExclusive(&state.recording_profile_recovery_lock);
+    if (needs_physical_restore)
+        PumpEmergencyDeadlockUiRestore();
+    // A queue-full or inverse-in-progress result is deferred, not dropped: the
+    // generation/target above remains the durable owner intent for Reconcile.
+    return true;
+}
+
+void ArmEmergencyDeadlockUiRestore(const bool hard_restore) noexcept {
+    auto& state = g_overlay;
+    state.recording_profile_restore_request_epoch.fetch_add(1, std::memory_order_acq_rel);
+    state.recording_profile_restore_debt.fetch_or(
+        hard_restore
+            ? kRecordingProfileAllRestoreDebt
+            : kRecordingProfileSoftRestoreDebt,
+        std::memory_order_acq_rel);
+}
+
+void RequestEmergencyDeadlockUiRestore(const bool hard_restore) noexcept {
+    ArmEmergencyDeadlockUiRestore(hard_restore);
+    PumpEmergencyDeadlockUiRestore();
+}
+
+void PumpEmergencyDeadlockUiRestore() noexcept {
     auto& state = g_overlay;
     const auto now = GetTickCount64();
     const auto previous = state.emergency_restore_last_attempt_ms.load(std::memory_order_acquire);
-    if (now - previous < 1000)
+    if (!ShouldAttemptRecordingVisualRestore(
+            state.recording_profile_restore_debt.load(std::memory_order_acquire) != 0,
+            state.emergency_restore_attempted.load(std::memory_order_acquire),
+            now,
+            previous))
         return;
-    state.emergency_restore_last_attempt_ms.store(now, std::memory_order_release);
     if (state.emergency_restore_attempted.exchange(true, std::memory_order_acq_rel))
         return;
-    const auto restored = SendEmergencyVConsoleCommand(
-        state.last_vconsole_port.load(std::memory_order_acquire), "r_drawpanorama true");
+    const auto attempted_debt =
+        state.recording_profile_restore_debt.load(std::memory_order_acquire);
+    const auto request_epoch =
+        state.recording_profile_restore_request_epoch.load(std::memory_order_acquire);
+    if (attempted_debt == 0) {
+        state.emergency_restore_attempted.store(false, std::memory_order_release);
+        return;
+    }
+    state.emergency_restore_last_attempt_ms.store(now, std::memory_order_release);
+    const auto restored = SendEmergencyVConsoleCommands(
+        state.last_vconsole_port.load(std::memory_order_acquire),
+        kDeadlockPresentationRestoreCommands);
     if (restored) {
+        state.recording_profile_may_be_active.store(false, std::memory_order_release);
+        if (CanRetireRecordingVisualRestoreAttempt(
+                request_epoch,
+                state.recording_profile_restore_request_epoch.load(std::memory_order_acquire),
+                state.recording_profile_disconnect_restore_guard.load(std::memory_order_acquire),
+                state.stop_requested.load(std::memory_order_acquire))) {
+            state.recording_profile_restore_debt.fetch_and(
+                ~attempted_debt, std::memory_order_acq_rel);
+        }
+        state.recording_profile_native_restore_satisfied.store(true, std::memory_order_release);
+        state.emergency_restore_attempted.store(false, std::memory_order_release);
         SetLocalPresentationMode(DeadlockUiMode::deadlock_ui);
     } else {
         state.emergency_restore_attempted.store(false, std::memory_order_release);
     }
+}
+
+void ReconcileRecordingProfileRecovery(const SmvmSnapshotPayload& snapshot) noexcept {
+    auto& state = g_overlay;
+    const auto managed_transaction_in_progress =
+        (snapshot.flags & smvm_snapshot_recording_profile_transaction_in_progress) != 0;
+    const auto managed_restore_pending =
+        (snapshot.flags & smvm_snapshot_recording_profile_restore_pending) != 0;
+    const auto active_replay =
+        (snapshot.flags & smvm_snapshot_internal_enabled) != 0 &&
+        (snapshot.flags & smvm_snapshot_replay_active) != 0;
+    const auto deadlock_mode = snapshot.deadlock_ui_mode == DeadlockUiMode::deadlock_ui;
+    const auto now = GetTickCount64();
+
+    SmvmActionType action_type = SmvmActionType::none;
+    auto action_index = -1;
+    auto action_tick = std::int64_t{-1};
+    std::uint64_t generation = 0;
+    auto request_physical_restore = false;
+    auto physical_restore_already_armed = false;
+
+    AcquireSRWLockExclusive(&state.recording_profile_recovery_lock);
+    auto kind = static_cast<RecordingProfileRecoveryKind>(
+        state.recording_profile_recovery_kind.load(std::memory_order_relaxed));
+    if (kind == RecordingProfileRecoveryKind::none) {
+        const auto restore_debt =
+            state.recording_profile_restore_debt.load(std::memory_order_acquire);
+        const auto terminal_restore_required = !active_replay &&
+            ShouldRestoreRecordingVisualProfileOnHostLoss(
+                state.recording_profile_may_be_active.load(std::memory_order_acquire),
+                restore_debt != 0,
+                (restore_debt & kRecordingProfileHardRestoreDebt) != 0,
+                false);
+        if (!terminal_restore_required) {
+            ReleaseSRWLockExclusive(&state.recording_profile_recovery_lock);
+            return;
+        }
+
+        generation = NextRecordingProfileRecoveryGeneration();
+        state.recording_profile_recovery_generation.store(generation, std::memory_order_relaxed);
+        state.recording_profile_recovery_target_mode.store(
+            static_cast<std::uint32_t>(DeadlockUiMode::deadlock_ui),
+            std::memory_order_relaxed);
+        state.recording_profile_recovery_action_queued.store(false, std::memory_order_relaxed);
+        state.recording_profile_recovery_action_last_attempt_ms.store(0, std::memory_order_relaxed);
+        state.recording_profile_recovery_kind.store(
+            static_cast<std::uint32_t>(RecordingProfileRecoveryKind::replay_end_restore),
+            std::memory_order_release);
+        kind = RecordingProfileRecoveryKind::replay_end_restore;
+        SetLocalPresentationMode(DeadlockUiMode::deadlock_ui);
+        ArmEmergencyDeadlockUiRestore(true);
+        request_physical_restore = true;
+        physical_restore_already_armed = true;
+    }
+
+    generation = state.recording_profile_recovery_generation.load(std::memory_order_relaxed);
+    if (generation == 0) {
+        generation = NextRecordingProfileRecoveryGeneration();
+        state.recording_profile_recovery_generation.store(generation, std::memory_order_relaxed);
+        state.recording_profile_recovery_action_queued.store(false, std::memory_order_relaxed);
+        state.recording_profile_recovery_action_last_attempt_ms.store(0, std::memory_order_relaxed);
+    }
+
+    if (kind == RecordingProfileRecoveryKind::explicit_restore) {
+        const auto acknowledged = IsExplicitRecordingVisualRecoveryAcknowledged(
+            generation,
+            snapshot.recording_profile_ack_generation,
+            deadlock_mode,
+            managed_restore_pending,
+            managed_transaction_in_progress);
+        if (acknowledged) {
+            state.recording_profile_recovery_kind.store(
+                static_cast<std::uint32_t>(RecordingProfileRecoveryKind::none),
+                std::memory_order_release);
+            state.recording_profile_recovery_action_queued.store(false, std::memory_order_relaxed);
+            state.recording_profile_recovery_action_last_attempt_ms.store(0, std::memory_order_relaxed);
+            ReleaseSRWLockExclusive(&state.recording_profile_recovery_lock);
+            state.recording_profile_restore_debt.fetch_and(
+                ~kRecordingProfileAllRestoreDebt, std::memory_order_acq_rel);
+            state.recording_profile_may_be_active.store(false, std::memory_order_release);
+            state.recording_profile_native_restore_satisfied.store(true, std::memory_order_release);
+            return;
+        }
+
+        if (managed_transaction_in_progress || !deadlock_mode) {
+            const auto satisfied = state.recording_profile_native_restore_satisfied.exchange(
+                false, std::memory_order_acq_rel);
+            request_physical_restore = satisfied ||
+                state.recording_profile_restore_debt.load(std::memory_order_acquire) == 0;
+        }
+        action_type = SmvmActionType::restore_deadlock_ui;
+        action_tick = static_cast<std::int64_t>(generation);
+    } else if (kind == RecordingProfileRecoveryKind::owner_transition) {
+        const auto profile_error = snapshot.deadlock_ui_error != DeadlockUiError::none;
+        const auto target_mode = static_cast<DeadlockUiMode>(
+            state.recording_profile_recovery_target_mode.load(std::memory_order_relaxed));
+        const auto target_matches = snapshot.deadlock_ui_mode == target_mode;
+        const auto target_is_deadlock = target_mode == DeadlockUiMode::deadlock_ui;
+        if (!active_replay && !target_is_deadlock) {
+            // Replay end wins over even an acknowledged forward owner target.
+            // Convert the canceled forward target into terminal replay cleanup.
+            // This is deliberately distinct from F9: it restores physically
+            // now, but never delivers an old replay's owner-exit action into a
+            // newly started replay.
+            generation = NextRecordingProfileRecoveryGeneration();
+            state.recording_profile_recovery_generation.store(generation, std::memory_order_relaxed);
+            state.recording_profile_recovery_target_mode.store(
+                static_cast<std::uint32_t>(DeadlockUiMode::deadlock_ui),
+                std::memory_order_relaxed);
+            state.recording_profile_recovery_kind.store(
+                static_cast<std::uint32_t>(RecordingProfileRecoveryKind::replay_end_restore),
+                std::memory_order_release);
+            state.recording_profile_recovery_action_queued.store(false, std::memory_order_relaxed);
+            state.recording_profile_recovery_action_last_attempt_ms.store(0, std::memory_order_relaxed);
+            SetLocalPresentationMode(DeadlockUiMode::deadlock_ui);
+            request_physical_restore = true;
+        } else {
+            if (IsOwnerPresentationTransitionComplete(
+                    generation,
+                    snapshot.recording_profile_ack_generation,
+                    target_matches,
+                    target_is_deadlock,
+                    managed_restore_pending,
+                    managed_transaction_in_progress,
+                    profile_error)) {
+                state.recording_profile_recovery_kind.store(
+                    static_cast<std::uint32_t>(RecordingProfileRecoveryKind::none),
+                    std::memory_order_release);
+                state.recording_profile_recovery_action_queued.store(false, std::memory_order_relaxed);
+                state.recording_profile_recovery_action_last_attempt_ms.store(0, std::memory_order_relaxed);
+                ReleaseSRWLockExclusive(&state.recording_profile_recovery_lock);
+                state.recording_profile_restore_debt.fetch_and(
+                    ~kRecordingProfileAllRestoreDebt, std::memory_order_acq_rel);
+                state.recording_profile_may_be_active.store(!target_is_deadlock, std::memory_order_release);
+                state.recording_profile_native_restore_satisfied.store(
+                    target_is_deadlock, std::memory_order_release);
+                return;
+            }
+
+            if (target_mode == DeadlockUiMode::deadlock_ui &&
+                (managed_transaction_in_progress || managed_restore_pending || !deadlock_mode)) {
+                const auto satisfied = state.recording_profile_native_restore_satisfied.exchange(
+                    false, std::memory_order_acq_rel);
+                request_physical_restore = satisfied ||
+                    state.recording_profile_restore_debt.load(std::memory_order_acquire) == 0;
+            }
+            action_type = SmvmActionType::set_deadlock_ui_mode;
+            action_index = static_cast<std::int32_t>(target_mode);
+            // A negative generation identifies owner intent while its magnitude is
+            // acknowledged by managed code. Retrying the same generation both
+            // invalidates older forward work and prevents a stale matching snapshot
+            // from retiring a rapid A -> B selection before B is actually applied.
+            action_tick = -static_cast<std::int64_t>(generation);
+        }
+    } else if (kind == RecordingProfileRecoveryKind::replay_end_restore) {
+        const auto hard_restore_pending =
+            (state.recording_profile_restore_debt.load(std::memory_order_acquire) &
+             kRecordingProfileHardRestoreDebt) != 0;
+        const auto disposition = ResolveReplayEndRecordingVisualDisposition(
+            active_replay,
+            hard_restore_pending,
+            deadlock_mode,
+            managed_restore_pending,
+            managed_transaction_in_progress);
+        if (disposition == ReplayEndRecordingVisualDisposition::retire_deadlock) {
+            // Terminal replay cleanup may retire from the two independent
+            // proofs: the native inverse debt completed and managed now reports
+            // a stable Deadlock profile. F9 remains exact-generation-only.
+            state.recording_profile_recovery_kind.store(
+                static_cast<std::uint32_t>(RecordingProfileRecoveryKind::none),
+                std::memory_order_release);
+            state.recording_profile_recovery_action_queued.store(false, std::memory_order_relaxed);
+            state.recording_profile_recovery_action_last_attempt_ms.store(0, std::memory_order_relaxed);
+            ReleaseSRWLockExclusive(&state.recording_profile_recovery_lock);
+            state.recording_profile_restore_debt.fetch_and(
+                ~kRecordingProfileAllRestoreDebt, std::memory_order_acq_rel);
+            state.recording_profile_may_be_active.store(false, std::memory_order_release);
+            state.recording_profile_native_restore_satisfied.store(true, std::memory_order_release);
+            return;
+        }
+        if (disposition == ReplayEndRecordingVisualDisposition::reassert_active) {
+            // A new replay already established its own SMVM/Clean mode while
+            // terminal cleanup was finishing. Reassert that fresh managed mode
+            // after the inverse using a non-owner recovery generation.
+            generation = NextRecordingProfileRecoveryGeneration();
+            state.recording_profile_recovery_generation.store(generation, std::memory_order_relaxed);
+            state.recording_profile_recovery_target_mode.store(
+                static_cast<std::uint32_t>(snapshot.deadlock_ui_mode),
+                std::memory_order_relaxed);
+            state.recording_profile_recovery_kind.store(
+                static_cast<std::uint32_t>(RecordingProfileRecoveryKind::reconnect_reassert),
+                std::memory_order_release);
+            state.recording_profile_recovery_action_queued.store(false, std::memory_order_relaxed);
+            state.recording_profile_recovery_action_last_attempt_ms.store(0, std::memory_order_relaxed);
+            action_type = SmvmActionType::set_deadlock_ui_mode;
+            action_index = static_cast<std::int32_t>(snapshot.deadlock_ui_mode);
+            action_tick = static_cast<std::int64_t>(generation);
+        }
+    } else {
+        const auto profile_error = snapshot.deadlock_ui_error != DeadlockUiError::none;
+        const auto managed_restore_proven = ManagedSnapshotProvesRecordingVisualRestore(
+            deadlock_mode,
+            managed_restore_pending,
+            managed_transaction_in_progress,
+            profile_error);
+        if (ShouldCancelRecordingVisualReassert(
+                active_replay,
+                managed_restore_proven)) {
+            // The managed owner deliberately selected Deadlock UI while the pipe
+            // was away, or the replay ended. Keep the already-restored profile
+            // instead of reviving a stale SMVM/Clean intent. A failed forward
+            // apply carries an error and deliberately does not enter this path.
+            state.recording_profile_recovery_kind.store(
+                static_cast<std::uint32_t>(RecordingProfileRecoveryKind::none),
+                std::memory_order_release);
+            state.recording_profile_recovery_action_queued.store(false, std::memory_order_relaxed);
+            state.recording_profile_recovery_action_last_attempt_ms.store(0, std::memory_order_relaxed);
+            ReleaseSRWLockExclusive(&state.recording_profile_recovery_lock);
+            state.recording_profile_restore_debt.fetch_and(
+                managed_restore_proven
+                    ? ~kRecordingProfileAllRestoreDebt
+                    : ~kRecordingProfileSoftRestoreDebt,
+                std::memory_order_acq_rel);
+            return;
+        }
+
+        if (!deadlock_mode) {
+            const auto target_mode = static_cast<std::uint32_t>(snapshot.deadlock_ui_mode);
+            const auto previous_target = state.recording_profile_recovery_target_mode.exchange(
+                target_mode, std::memory_order_relaxed);
+            if (previous_target != target_mode) {
+                generation = NextRecordingProfileRecoveryGeneration();
+                state.recording_profile_recovery_generation.store(generation, std::memory_order_relaxed);
+                state.recording_profile_recovery_action_queued.store(false, std::memory_order_relaxed);
+                state.recording_profile_recovery_action_last_attempt_ms.store(0, std::memory_order_relaxed);
+            }
+            const auto acknowledged = IsRecordingVisualReassertAcknowledged(
+                generation,
+                snapshot.recording_profile_ack_generation,
+                deadlock_mode,
+                managed_transaction_in_progress);
+            if (acknowledged) {
+                state.recording_profile_recovery_kind.store(
+                    static_cast<std::uint32_t>(RecordingProfileRecoveryKind::none),
+                    std::memory_order_release);
+                state.recording_profile_recovery_action_queued.store(false, std::memory_order_relaxed);
+                state.recording_profile_recovery_action_last_attempt_ms.store(0, std::memory_order_relaxed);
+                ReleaseSRWLockExclusive(&state.recording_profile_recovery_lock);
+                state.recording_profile_restore_debt.fetch_and(
+                    ~kRecordingProfileAllRestoreDebt, std::memory_order_acq_rel);
+                state.recording_profile_may_be_active.store(true, std::memory_order_release);
+                state.recording_profile_native_restore_satisfied.store(false, std::memory_order_release);
+                return;
+            }
+        }
+        // When a forward transaction fails, managed rollback publishes stable
+        // Deadlock UI plus an error and leaves the acknowledgement unchanged.
+        // Retain the original target and retry the same generation.
+        action_type = SmvmActionType::set_deadlock_ui_mode;
+        action_index = static_cast<std::int32_t>(
+            state.recording_profile_recovery_target_mode.load(std::memory_order_relaxed));
+        action_tick = static_cast<std::int64_t>(generation);
+    }
+
+    const auto last_attempt = state.recording_profile_recovery_action_last_attempt_ms.load(
+        std::memory_order_relaxed);
+    const auto hard_restore_pending =
+        (state.recording_profile_restore_debt.load(std::memory_order_acquire) &
+         kRecordingProfileHardRestoreDebt) != 0;
+    const auto forward_recovery =
+        action_type == SmvmActionType::set_deadlock_ui_mode &&
+        action_index != static_cast<std::int32_t>(DeadlockUiMode::deadlock_ui);
+    const auto should_queue = action_type != SmvmActionType::none &&
+        ShouldQueueRecordingVisualRecoveryAction(
+            forward_recovery,
+            hard_restore_pending,
+            active_replay,
+            managed_transaction_in_progress,
+            now,
+            last_attempt);
+    if (should_queue) {
+        state.recording_profile_recovery_action_last_attempt_ms.store(now, std::memory_order_relaxed);
+        const auto queued = QueueActionForSnapshot(
+            snapshot,
+            action_type,
+            action_index,
+            action_tick);
+        state.recording_profile_recovery_action_queued.store(queued, std::memory_order_relaxed);
+    }
+    if (request_physical_restore && !physical_restore_already_armed)
+        ArmEmergencyDeadlockUiRestore(true);
+    ReleaseSRWLockExclusive(&state.recording_profile_recovery_lock);
+
+    if (request_physical_restore)
+        PumpEmergencyDeadlockUiRestore();
 }
 
 void QueueCaptureDiagnostic(
@@ -729,7 +1346,8 @@ void QueueCaptureDiagnostic(
     if ((snapshot.flags & smvm_snapshot_capture_diagnostics) == 0 &&
         stage != SmvmCaptureStage::capture_rejected)
         return;
-    static_cast<void>(QueueAction(
+    static_cast<void>(QueueActionForSnapshot(
+        snapshot,
         SmvmActionType::capture_diagnostic,
         static_cast<std::int32_t>(stage),
         static_cast<std::int64_t>(rejection)));
@@ -2558,7 +3176,8 @@ void SetMenuOpen(const bool open) noexcept {
         // the user's selected presentation mode.
         static_cast<void>(QueueAction(
             SmvmActionType::set_deadlock_ui_mode,
-            static_cast<std::int32_t>(DeadlockUiMode::smvm_replay_ui)));
+            static_cast<std::int32_t>(DeadlockUiMode::smvm_replay_ui),
+            0));
     }
 }
 
@@ -2824,7 +3443,8 @@ void RequestManualPointerState(const bool enabled) noexcept {
         state.menu_open.load(std::memory_order_acquire),
         state.manual_pointer_requested.load(std::memory_order_acquire),
         CanUseManualCamera(snapshot),
-        readiness);
+        readiness,
+        (snapshot.flags & smvm_snapshot_replay_seek_in_progress) != 0);
 }
 
 [[nodiscard]] bool CanConsumeManualCameraKeyboardInput(
@@ -2838,7 +3458,8 @@ void RequestManualPointerState(const bool enabled) noexcept {
         state.menu_open.load(std::memory_order_acquire),
         state.manual_pointer_requested.load(std::memory_order_acquire),
         CanUseManualCamera(snapshot),
-        CurrentFreeCameraInputReadiness(state.output_window));
+        CurrentFreeCameraInputReadiness(state.output_window),
+        (snapshot.flags & smvm_snapshot_replay_seek_in_progress) != 0);
 }
 
 [[nodiscard]] bool CanConsumeManualCameraMouseInput(
@@ -2850,7 +3471,8 @@ void RequestManualPointerState(const bool enabled) noexcept {
                state.menu_open.load(std::memory_order_acquire),
                state.manual_pointer_requested.load(std::memory_order_acquire),
                CanUseManualCamera(snapshot),
-               CurrentFreeCameraInputReadiness(state.output_window));
+               CurrentFreeCameraInputReadiness(state.output_window),
+               (snapshot.flags & smvm_snapshot_replay_seek_in_progress) != 0);
 }
 
 [[nodiscard]] bool ManualBindingOwnsKey(
@@ -2922,6 +3544,7 @@ void ResetCinematicStartGate(const bool reset_consumed_space = false) noexcept {
     state.cinematic_start_ready.store(false, std::memory_order_release);
     state.cinematic_space_released.store(false, std::memory_order_release);
     state.cinematic_start_tick.store(-1, std::memory_order_release);
+    state.cinematic_replay_session_generation.store(0, std::memory_order_release);
     if (reset_consumed_space)
         state.cinematic_space_consumed.store(false, std::memory_order_release);
 }
@@ -2935,6 +3558,12 @@ void UpdateCinematicStartGate(
     const auto armed = state.cinematic_start_armed.load(std::memory_order_acquire);
     if (!armed)
         return;
+    if (snapshot.replay_session_generation == 0 ||
+        snapshot.replay_session_generation !=
+            state.cinematic_replay_session_generation.load(std::memory_order_acquire)) {
+        ResetCinematicStartGate();
+        return;
+    }
 
     const auto count = has_path
         ? std::min<std::uint32_t>(header.keyframe_count, kMaxCampathKeyframes)
@@ -3008,7 +3637,14 @@ void UpdateCinematicStartGate(
 
     state.cinematic_space_released.store(false, std::memory_order_release);
     state.cinematic_space_consumed.store(true, std::memory_order_release);
-    if (QueueAction(SmvmActionType::play_from_start))
+    SmvmSnapshotPayload snapshot{};
+    const auto replay_session_generation =
+        state.cinematic_replay_session_generation.load(std::memory_order_acquire);
+    if (ReadSnapshot(snapshot) &&
+        snapshot.replay_session_generation == replay_session_generation &&
+        QueueActionForSnapshot(snapshot, SmvmActionType::play_from_start))
+        ResetCinematicStartGate();
+    else
         ResetCinematicStartGate();
     return true;
 }
@@ -3153,13 +3789,13 @@ void ResetConsumedReleaseRoutes() noexcept {
 
     if (action == ManualCameraShortcutAction::exit) {
         ResetCinematicStartGate();
-        if (QueueAction(SmvmActionType::toggle_manual_camera)) {
+        if (QueueActionForSnapshot(snapshot, SmvmActionType::toggle_manual_camera)) {
             shortcut_queued.store(true, std::memory_order_release);
             ResetSmvmManualInput();
             ClearManualInputReadiness();
         }
     } else if (action == ManualCameraShortcutAction::enter_or_reacquire) {
-        if (QueueAction(SmvmActionType::reacquire_camera))
+        if (QueueActionForSnapshot(snapshot, SmvmActionType::reacquire_camera))
             shortcut_queued.store(true, std::memory_order_release);
     } else if (action == ManualCameraShortcutAction::consume) {
         // Keep a consumed F2 latched until physical key-up. Otherwise an
@@ -3418,37 +4054,37 @@ void RefreshMenuCursorPosition(const HWND window) noexcept {
     const SmvmSnapshotPayload& snapshot) noexcept {
     if (InputMatchesMouse(snapshot.play_start_key, message, wparam) &&
         CanTriggerCampathPlayback(snapshot)) {
-        static_cast<void>(SmvmArmCinematicStart());
+        static_cast<void>(SmvmArmCinematicStart(snapshot.replay_session_generation));
         return true;
     }
     if (InputMatchesMouse(snapshot.play_current_key, message, wparam) &&
         CanTriggerCampathPlayback(snapshot)) {
-        static_cast<void>(QueueAction(SmvmActionType::play_from_current));
+        static_cast<void>(QueueActionForSnapshot(snapshot, SmvmActionType::play_from_current));
         return true;
     }
     if (InputMatchesMouse(snapshot.stop_key, message, wparam) &&
         (snapshot.flags & smvm_snapshot_campath_playing) != 0) {
-        static_cast<void>(QueueAction(SmvmActionType::stop_campath));
+        static_cast<void>(QueueActionForSnapshot(snapshot, SmvmActionType::stop_campath));
         return true;
     }
     if (InputMatchesMouse(snapshot.undo_key, message, wparam) &&
         CanTriggerCampathEditAction(snapshot)) {
-        static_cast<void>(QueueAction(SmvmActionType::undo_edit));
+        static_cast<void>(QueueActionForSnapshot(snapshot, SmvmActionType::undo_edit));
         return true;
     }
     if (InputMatchesMouse(snapshot.redo_key, message, wparam) &&
         CanTriggerCampathEditAction(snapshot)) {
-        static_cast<void>(QueueAction(SmvmActionType::redo_edit));
+        static_cast<void>(QueueActionForSnapshot(snapshot, SmvmActionType::redo_edit));
         return true;
     }
     if (InputMatchesMouse(snapshot.show_path_key, message, wparam) &&
         (snapshot.flags & smvm_snapshot_internal_enabled) != 0) {
-        static_cast<void>(QueueAction(SmvmActionType::toggle_show_path));
+        static_cast<void>(QueueActionForSnapshot(snapshot, SmvmActionType::toggle_show_path));
         return true;
     }
     if (InputMatchesMouse(snapshot.show_cameras_key, message, wparam) &&
         (snapshot.flags & smvm_snapshot_internal_enabled) != 0) {
-        static_cast<void>(QueueAction(SmvmActionType::toggle_show_cameras));
+        static_cast<void>(QueueActionForSnapshot(snapshot, SmvmActionType::toggle_show_cameras));
         return true;
     }
     return false;
@@ -3459,51 +4095,59 @@ void RefreshMenuCursorPosition(const HWND window) noexcept {
     const SmvmSnapshotPayload& snapshot) noexcept {
     if (InputMatchesKeyboard(snapshot.cycle_ui_key, key) &&
         (snapshot.flags & smvm_snapshot_replay_active) != 0) {
-        static_cast<void>(QueueAction(SmvmActionType::cycle_replay_interface));
+        const auto current = static_cast<DeadlockUiMode>(
+            g_overlay.presentation_mode.load(std::memory_order_acquire));
+        const auto visible = current == DeadlockUiMode::clean_footage
+            ? PreviousVisibleMode()
+            : current;
+        const auto target = visible == DeadlockUiMode::deadlock_ui
+            ? DeadlockUiMode::smvm_replay_ui
+            : DeadlockUiMode::deadlock_ui;
+        static_cast<void>(RequestOwnerPresentationMode(target, snapshot));
         return true;
     }
     if (InputMatchesKeyboard(snapshot.step_back_key, key) && snapshot.current_tick > 0) {
-        static_cast<void>(QueueAction(SmvmActionType::step_back));
+        static_cast<void>(QueueActionForSnapshot(snapshot, SmvmActionType::step_back));
         return true;
     }
     if (InputMatchesKeyboard(snapshot.step_forward_key, key) && snapshot.current_tick >= 0) {
-        static_cast<void>(QueueAction(SmvmActionType::step_forward));
+        static_cast<void>(QueueActionForSnapshot(snapshot, SmvmActionType::step_forward));
         return true;
     }
     if (InputMatchesKeyboard(snapshot.play_start_key, key) && CanTriggerCampathPlayback(snapshot)) {
-        static_cast<void>(SmvmArmCinematicStart());
+        static_cast<void>(SmvmArmCinematicStart(snapshot.replay_session_generation));
         return true;
     }
     if (InputMatchesKeyboard(snapshot.play_current_key, key) && CanTriggerCampathPlayback(snapshot)) {
-        static_cast<void>(QueueAction(SmvmActionType::play_from_current));
+        static_cast<void>(QueueActionForSnapshot(snapshot, SmvmActionType::play_from_current));
         return true;
     }
     if (InputMatchesKeyboard(snapshot.stop_key, key) &&
         (snapshot.flags & smvm_snapshot_campath_playing) != 0) {
-        static_cast<void>(QueueAction(SmvmActionType::stop_campath));
+        static_cast<void>(QueueActionForSnapshot(snapshot, SmvmActionType::stop_campath));
         return true;
     }
     if (InputMatchesKeyboard(snapshot.undo_key, key) && CanTriggerCampathEditAction(snapshot)) {
-        static_cast<void>(QueueAction(SmvmActionType::undo_edit));
+        static_cast<void>(QueueActionForSnapshot(snapshot, SmvmActionType::undo_edit));
         return true;
     }
     if (InputMatchesKeyboard(snapshot.redo_key, key) && CanTriggerCampathEditAction(snapshot)) {
-        static_cast<void>(QueueAction(SmvmActionType::redo_edit));
+        static_cast<void>(QueueActionForSnapshot(snapshot, SmvmActionType::redo_edit));
         return true;
     }
     if (InputMatchesKeyboard(snapshot.show_path_key, key) &&
         (snapshot.flags & smvm_snapshot_internal_enabled) != 0) {
-        static_cast<void>(QueueAction(SmvmActionType::toggle_show_path));
+        static_cast<void>(QueueActionForSnapshot(snapshot, SmvmActionType::toggle_show_path));
         return true;
     }
     if (InputMatchesKeyboard(snapshot.show_cameras_key, key) &&
         (snapshot.flags & smvm_snapshot_internal_enabled) != 0) {
-        static_cast<void>(QueueAction(SmvmActionType::toggle_show_cameras));
+        static_cast<void>(QueueActionForSnapshot(snapshot, SmvmActionType::toggle_show_cameras));
         return true;
     }
     if (InputMatchesKeyboard(snapshot.show_labels_key, key) &&
         (snapshot.flags & smvm_snapshot_internal_enabled) != 0) {
-        static_cast<void>(QueueAction(SmvmActionType::toggle_show_labels));
+        static_cast<void>(QueueActionForSnapshot(snapshot, SmvmActionType::toggle_show_labels));
         return true;
     }
     return false;
@@ -3524,12 +4168,13 @@ void RefreshMenuCursorPosition(const HWND window) noexcept {
         CanUseManualCamera(snapshot),
         (CurrentModifiers(key) & ~4u) == 0);
     if (action == MovieMakerShortcutAction::toggle_replay_pause) {
-        static_cast<void>(QueueAction(SmvmActionType::toggle_replay_pause));
+        static_cast<void>(QueueActionForSnapshot(snapshot, SmvmActionType::toggle_replay_pause));
         return true;
     }
     if (action == MovieMakerShortcutAction::none)
         return false;
-    return QueueAction(
+    return QueueActionForSnapshot(
+        snapshot,
         SmvmActionType::set_movement_speed,
         -1,
         -1,
@@ -3546,7 +4191,7 @@ void RefreshMenuCursorPosition(const HWND window) noexcept {
     if (InputMatchesMouse(snapshot.menu_key, message, wparam) &&
         ((snapshot.flags & smvm_snapshot_replay_active) != 0 || menu_open)) {
         if (g_overlay.clean_view.load(std::memory_order_acquire))
-            static_cast<void>(ToggleCleanFootage(true));
+            static_cast<void>(ToggleCleanFootage(true, snapshot));
         else
             SetMenuOpen(!menu_open);
         return true;
@@ -3563,7 +4208,9 @@ void RefreshMenuCursorPosition(const HWND window) noexcept {
         }
         QueueCaptureDiagnostic(snapshot, SmvmCaptureStage::capture_requested);
         if (g_overlay.callbacks.request_camera_capture != nullptr) {
-            g_overlay.callbacks.request_camera_capture(g_overlay.callbacks.context);
+            g_overlay.callbacks.request_camera_capture(
+                g_overlay.callbacks.context,
+                snapshot.replay_session_generation);
         } else {
             QueueCaptureDiagnostic(
                 snapshot,
@@ -3573,13 +4220,17 @@ void RefreshMenuCursorPosition(const HWND window) noexcept {
         return true;
     }
     if (InputMatchesMouse(snapshot.delete_key, message, wparam) && CanEditCampath(snapshot)) {
-        return QueueAction(SmvmActionType::delete_keyframe, snapshot.selected_keyframe);
+        return QueueActionForSnapshot(
+            snapshot,
+            SmvmActionType::delete_keyframe,
+            snapshot.selected_keyframe);
     }
     if (HandleCampathMouseBinding(message, wparam, snapshot))
         return true;
     if (InputMatchesMouse(snapshot.clean_view_key, message, wparam) &&
-        (snapshot.flags & smvm_snapshot_internal_enabled) != 0) {
-        static_cast<void>(ToggleCleanFootage(false));
+        (snapshot.flags & smvm_snapshot_internal_enabled) != 0 &&
+        (snapshot.flags & smvm_snapshot_replay_active) != 0) {
+        static_cast<void>(ToggleCleanFootage(false, snapshot));
         return true;
     }
     return false;
@@ -3781,13 +4432,21 @@ LRESULT CALLBACK SmvmWindowProcedure(
         ResetCinematicStartGate(true);
         SetMenuOpen(false);
         RequestManualPointerState(false);
-        state.cancel_clean_hint.store(true, std::memory_order_release);
         SetLocalPresentationMode(DeadlockUiMode::deadlock_ui);
-        static_cast<void>(QueueAction(SmvmActionType::restore_deadlock_ui));
-        // F9 is the hard emergency route: attempt Panorama restoration locally
-        // even when managed action delivery succeeds, because that action may
-        // be serialized behind a seek or self-test.
-        EmergencyRestoreDeadlockUi();
+        const auto recovery_generation = BeginRecordingProfileRecovery(
+            RecordingProfileRecoveryKind::explicit_restore,
+            DeadlockUiMode::deadlock_ui);
+        if (recovery_generation != 0 && QueueAction(
+                SmvmActionType::restore_deadlock_ui,
+                -1,
+                static_cast<std::int64_t>(recovery_generation))) {
+            MarkRecordingProfileRecoveryActionQueued(recovery_generation);
+        }
+        // F9 is the hard emergency route: restore the complete Deadlock
+        // presentation profile locally even when managed action delivery
+        // succeeds, because that action may be serialized behind a seek or
+        // self-test.
+        RequestEmergencyDeadlockUiRestore(true);
         PublishStatus(SmvmRendererBackend::d3d11, SmvmRendererError::none);
         return 0;
     }
@@ -3981,7 +4640,12 @@ LRESULT CALLBACK SmvmWindowProcedure(
                     direction = -direction;
                 const auto target = std::clamp(snapshot.camera.fov + (direction * snapshot.fov_step),
                                                kMinFov, kMaxFov);
-                static_cast<void>(QueueAction(SmvmActionType::set_fov, -1, -1, target));
+                static_cast<void>(QueueActionForSnapshot(
+                    snapshot,
+                    SmvmActionType::set_fov,
+                    -1,
+                    -1,
+                    target));
             }
             return 0;
         }
@@ -4005,16 +4669,17 @@ LRESULT CALLBACK SmvmWindowProcedure(
 
     if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) && has_snapshot) {
         const auto repeated = (lparam & (1LL << 30)) != 0;
-        if (!repeated && InputMatchesKeyboard(snapshot.clean_view_key, normalized_key)) {
+        if (!repeated && InputMatchesKeyboard(snapshot.clean_view_key, normalized_key) &&
+            (snapshot.flags & smvm_snapshot_replay_active) != 0) {
             TrackConsumedKeyDown(normalized_key, kMenuWindowKeyRoute);
-            static_cast<void>(ToggleCleanFootage(false));
+            static_cast<void>(ToggleCleanFootage(false, snapshot));
             return 0;
         }
         if (!repeated && InputMatchesKeyboard(snapshot.menu_key, normalized_key) &&
             (timeline_visible || menu_open)) {
             TrackConsumedKeyDown(normalized_key, kMenuWindowKeyRoute);
             if (state.clean_view.load(std::memory_order_acquire))
-                static_cast<void>(ToggleCleanFootage(true));
+                static_cast<void>(ToggleCleanFootage(true, snapshot));
             else
                 SetMenuOpen(!menu_open);
             return 0;
@@ -4048,7 +4713,9 @@ LRESULT CALLBACK SmvmWindowProcedure(
             }
             QueueCaptureDiagnostic(snapshot, SmvmCaptureStage::capture_requested);
             if (state.callbacks.request_camera_capture != nullptr) {
-                state.callbacks.request_camera_capture(state.callbacks.context);
+                state.callbacks.request_camera_capture(
+                    state.callbacks.context,
+                    snapshot.replay_session_generation);
             } else {
                 QueueCaptureDiagnostic(
                     snapshot,
@@ -4059,7 +4726,10 @@ LRESULT CALLBACK SmvmWindowProcedure(
         }
         if (!repeated && InputMatchesKeyboard(snapshot.delete_key, normalized_key) && CanEditCampath(snapshot)) {
             TrackConsumedKeyDown(normalized_key, kMenuWindowKeyRoute);
-            static_cast<void>(QueueAction(SmvmActionType::delete_keyframe, snapshot.selected_keyframe));
+            static_cast<void>(QueueActionForSnapshot(
+                snapshot,
+                SmvmActionType::delete_keyframe,
+                snapshot.selected_keyframe));
             return 0;
         }
         if (!repeated && HandleCampathKeyboardBinding(normalized_key, snapshot)) {
@@ -4349,13 +5019,24 @@ LRESULT CALLBACK SmvmWindowProcedure(
     }
     SmvmSnapshotPayload snapshot{};
     const auto snapshot_read = ReadSnapshot(snapshot);
+    smvm_ui::ObserveReplaySession(snapshot_read ? &snapshot : nullptr, state.ui);
+    if (!snapshot_read)
+        NotifySmvmHostDisconnected();
+    if (state.recording_profile_restore_debt.load(std::memory_order_acquire) != 0)
+        PumpEmergencyDeadlockUiRestore();
     if (!snapshot_read || (snapshot.flags & smvm_snapshot_internal_enabled) == 0 ||
         (snapshot.flags & smvm_snapshot_replay_active) == 0) {
         ResetCinematicStartGate(true);
         RequestManualPointerState(false);
-        if (!snapshot_read && state.presentation_mode.load(std::memory_order_acquire) !=
-            static_cast<std::uint32_t>(DeadlockUiMode::deadlock_ui))
-            EmergencyRestoreDeadlockUi();
+        if (snapshot_read) {
+            const auto restore_debt =
+                state.recording_profile_restore_debt.load(std::memory_order_acquire);
+            if ((state.recording_profile_may_be_active.load(std::memory_order_acquire) ||
+                 restore_debt != 0) &&
+                (restore_debt & kRecordingProfileHardRestoreDebt) == 0) {
+                RequestEmergencyDeadlockUiRestore(true);
+            }
+        }
         SetLocalPresentationMode(DeadlockUiMode::deadlock_ui);
         SetMenuOpen(false);
         state.vertex_count = 0;
@@ -4387,14 +5068,6 @@ LRESULT CALLBACK SmvmWindowProcedure(
     UpdateCinematicStartGate(snapshot, has_path, path_header, keys.data());
     const auto menu_open = state.menu_open.load(std::memory_order_acquire);
     const auto clean_view = state.clean_view.load(std::memory_order_acquire);
-    if (state.cancel_clean_hint.exchange(false, std::memory_order_acq_rel)) {
-        state.ui.clean_hint_pending = false;
-        state.ui.clean_hint_until_ms = 0;
-    }
-    if (clean_view) {
-        state.ui.clean_hint_pending = false;
-        state.ui.clean_hint_until_ms = 0;
-    }
     state.vertex_count = 0;
     state.world_label_count = 0;
 
@@ -4402,6 +5075,7 @@ LRESULT CALLBACK SmvmWindowProcedure(
     // placement workflow. Hide them during playback so Play Cinematic shows
     // the composed shot rather than editor guides.
     if (ShouldDrawCampathPlacementGuides(
+            snapshot.deadlock_ui_mode == DeadlockUiMode::smvm_replay_ui,
             clean_view,
             has_path,
             (snapshot.flags & smvm_snapshot_campath_playing) != 0,
@@ -4461,9 +5135,10 @@ LRESULT CALLBACK SmvmWindowProcedure(
             return queue != nullptr && queue(context, action);
         };
         params.request_capture = [context = state.callbacks.context,
-                                  capture = state.callbacks.request_camera_capture]() {
+                                  capture = state.callbacks.request_camera_capture](
+                                     const std::uint64_t replay_session_generation) {
             if (capture != nullptr)
-                capture(context);
+                capture(context, replay_session_generation);
         };
         smvm_ui::DrawFrame(params, state.ui);
         ImGui::Render();
@@ -4948,9 +5623,13 @@ DWORD InstallerThreadBody() noexcept {
     auto capture_attempted = false;
     std::optional<std::uintptr_t> renderer_global;
     while (!g_overlay.stop_requested.load(std::memory_order_acquire)) {
+        // Presentation cleanup is renderer-independent. Pump it during cold
+        // module discovery as well as after hook installation so a dead host
+        // cannot strand X-ray, near-fade, or Panorama state with zero Presents.
+        PumpEmergencyDeadlockUiRestore();
         if (GetModuleHandleW(L"rendersystemvulkan.dll") != nullptr) {
             PublishStatus(SmvmRendererBackend::unsupported, SmvmRendererError::unsupported_renderer);
-            return 0;
+            break;
         }
         const auto render_module = GetModuleHandleW(L"rendersystemdx11.dll");
         if (render_module != nullptr) {
@@ -4959,7 +5638,7 @@ DWORD InstallerThreadBody() noexcept {
                 renderer_global = ResolveRenderFactoryGlobal(render_module);
             if (renderer_global && InstallFactoryCaptureHook(*renderer_global)) {
                 PublishStatus(SmvmRendererBackend::d3d11, SmvmRendererError::present_not_observed);
-                return 0;
+                break;
             }
         }
         if (std::chrono::steady_clock::now() - started >= kInstallTimeout) {
@@ -4967,12 +5646,14 @@ DWORD InstallerThreadBody() noexcept {
                 capture_attempted ? SmvmRendererBackend::d3d11 : SmvmRendererBackend::none,
                 capture_attempted ? SmvmRendererError::swapchain_probe_failed
                                   : SmvmRendererError::renderer_not_loaded);
-            return 0;
+            break;
         }
         Sleep(static_cast<DWORD>(kInstallRetryInterval.count()));
     }
-    if (g_overlay.stop_requested.load(std::memory_order_acquire))
-        return 0;
+    while (!g_overlay.stop_requested.load(std::memory_order_acquire)) {
+        PumpEmergencyDeadlockUiRestore();
+        Sleep(100);
+    }
     return 0;
 }
 
@@ -5103,6 +5784,80 @@ HRESULT STDMETHODCALLTYPE ResizeBuffersHook(
 
 } // namespace
 
+void ObserveSmvmRecordingVisualSnapshot(const SmvmSnapshotPayload& snapshot) noexcept {
+    g_overlay.recording_profile_lease_lost.store(false, std::memory_order_release);
+    g_overlay.recording_profile_disconnect_restore_guard.store(false, std::memory_order_release);
+    ObserveRecordingVisualSnapshotState(snapshot);
+    ReconcileRecordingProfileRecovery(snapshot);
+    if ((g_overlay.recording_profile_restore_debt.load(std::memory_order_acquire) &
+         kRecordingProfileHardRestoreDebt) != 0) {
+        PumpEmergencyDeadlockUiRestore();
+    }
+}
+
+void NotifySmvmHostDisconnected() noexcept {
+    auto& state = g_overlay;
+    // Snapshot expiry and a closed pipe are the same presentation-lease loss.
+    // Edge-trigger the inverse/recovery boundary so a stalled render loop does
+    // not rotate generations or issue VConsole batches every frame.
+    if (state.recording_profile_lease_lost.exchange(true, std::memory_order_acq_rel))
+        return;
+    auto restore_required = false;
+    AcquireSRWLockExclusive(&state.recording_profile_recovery_lock);
+    const auto restore_debt =
+        state.recording_profile_restore_debt.load(std::memory_order_acquire);
+    auto recovery_kind = static_cast<RecordingProfileRecoveryKind>(
+        state.recording_profile_recovery_kind.load(std::memory_order_relaxed));
+    if (ShouldRestoreRecordingVisualProfileOnHostLoss(
+            state.recording_profile_may_be_active.load(std::memory_order_acquire),
+            restore_debt != 0,
+            (restore_debt & kRecordingProfileHardRestoreDebt) != 0,
+            recovery_kind != RecordingProfileRecoveryKind::none)) {
+        restore_required = true;
+        state.recording_profile_disconnect_restore_guard.store(true, std::memory_order_release);
+        // Establish the hard inverse barrier and the durable post-reconnect
+        // target under one lock before the blocking VConsole batch. A fresh
+        // snapshot can neither retire an owner target nor queue a forward batch
+        // in the gap.
+        ArmEmergencyDeadlockUiRestore(true);
+        if (recovery_kind == RecordingProfileRecoveryKind::none) {
+            const auto target_mode = static_cast<DeadlockUiMode>(
+                state.recording_profile_last_managed_mode.load(std::memory_order_acquire));
+            const auto generation = state.recording_profile_snapshot_observed.load(
+                std::memory_order_acquire)
+                ? NextRecordingProfileRecoveryGeneration()
+                : 0;
+            state.recording_profile_recovery_target_mode.store(
+                static_cast<std::uint32_t>(target_mode), std::memory_order_relaxed);
+            state.recording_profile_recovery_generation.store(generation, std::memory_order_relaxed);
+            state.recording_profile_recovery_kind.store(
+                static_cast<std::uint32_t>(RecordingProfileRecoveryKind::reconnect_reassert),
+                std::memory_order_release);
+        } else if (recovery_kind == RecordingProfileRecoveryKind::owner_transition ||
+                   recovery_kind == RecordingProfileRecoveryKind::reconnect_reassert) {
+            // Any acknowledgement for a forward profile before this boundary
+            // is older than the inverse. Preserve the durable target but rotate
+            // the generation so only a post-inverse application can retire it.
+            state.recording_profile_recovery_generation.store(
+                state.recording_profile_snapshot_observed.load(std::memory_order_acquire)
+                    ? NextRecordingProfileRecoveryGeneration()
+                    : 0,
+                std::memory_order_relaxed);
+        }
+        state.recording_profile_recovery_action_queued.store(false, std::memory_order_relaxed);
+        state.recording_profile_recovery_action_last_attempt_ms.store(0, std::memory_order_relaxed);
+    }
+    ReleaseSRWLockExclusive(&state.recording_profile_recovery_lock);
+
+    if (restore_required)
+        PumpEmergencyDeadlockUiRestore();
+}
+
+void PumpSmvmOverlayResidentRecovery() noexcept {
+    if (g_overlay.recording_profile_restore_debt.load(std::memory_order_acquire) != 0)
+        PumpEmergencyDeadlockUiRestore();
+}
+
 // --- smvm_ui hooks (declared in smvm_ui.hpp) --------------------------------
 // The UI renders the binding capture state machine owned here; SmvmPumpBindingRow
 // is a faithful port of the old per-row DrawBindingRow pending/feedback logic.
@@ -5160,8 +5915,14 @@ void SmvmOpenMenu() noexcept {
     SetMenuOpen(true);
 }
 
-bool SmvmArmCinematicStart() noexcept {
+bool SmvmArmCinematicStart(const std::uint64_t replay_session_generation) noexcept {
     auto& state = g_overlay;
+    SmvmSnapshotPayload snapshot{};
+    if (!ReadSnapshot(snapshot) ||
+        snapshot.replay_session_generation != replay_session_generation) {
+        ResetCinematicStartGate();
+        return false;
+    }
     CampathPayloadHeader header{};
     std::array<CampathKeyframe, kMaxCampathKeyframes> keyframes{};
     if (!ReadPath(header, keyframes.data(), keyframes.size()) ||
@@ -5173,10 +5934,13 @@ bool SmvmArmCinematicStart() noexcept {
 
     const auto first_tick = keyframes[0].demo_tick;
     state.cinematic_start_tick.store(first_tick, std::memory_order_release);
+    state.cinematic_replay_session_generation.store(
+        replay_session_generation,
+        std::memory_order_release);
     state.cinematic_start_ready.store(false, std::memory_order_release);
     state.cinematic_space_released.store(false, std::memory_order_release);
     state.cinematic_start_armed.store(true, std::memory_order_release);
-    if (QueueAction(SmvmActionType::go_to_keyframe, 0))
+    if (QueueActionForSnapshot(snapshot, SmvmActionType::go_to_keyframe, 0))
         return true;
 
     ResetCinematicStartGate();
@@ -5309,6 +6073,13 @@ void ResetSmvmManualInput() noexcept {
     ResetBindingCaptureState();
 }
 
+void InvalidateSmvmReplaySessionState() noexcept {
+    // Space-gate state is replay-owned. Clearing the consumed edge as well as
+    // the armed generation ensures replay B always requires a fresh prompt and
+    // key press even when it replaces replay A on the same pipe.
+    ResetCinematicStartGate(true);
+}
+
 bool StartSmvmOverlay(const HMODULE self_module, const SmvmOverlayCallbacks& callbacks) noexcept {
     auto& state = g_overlay;
     if (state.started.exchange(true, std::memory_order_acq_rel))
@@ -5332,7 +6103,6 @@ bool StartSmvmOverlay(const HMODULE self_module, const SmvmOverlayCallbacks& cal
     state.replay_tick_input_active.store(false, std::memory_order_release);
     ResetCinematicStartGate(true);
     state.clean_view.store(false, std::memory_order_release);
-    state.cancel_clean_hint.store(false, std::memory_order_release);
     state.manual_pointer_requested.store(false, std::memory_order_release);
     state.manual_pointer_active.store(false, std::memory_order_release);
     state.manual_mouse_observed.store(false, std::memory_order_release);
@@ -5358,6 +6128,28 @@ bool StartSmvmOverlay(const HMODULE self_module, const SmvmOverlayCallbacks& cal
     state.previous_visible_mode.store(
         static_cast<std::uint32_t>(DeadlockUiMode::deadlock_ui), std::memory_order_release);
     state.last_vconsole_port.store(29000, std::memory_order_release);
+    state.recording_profile_may_be_active.store(false, std::memory_order_release);
+    state.recording_profile_restore_debt.store(0, std::memory_order_release);
+    state.recording_profile_native_restore_satisfied.store(false, std::memory_order_release);
+    state.recording_profile_replay_observed.store(false, std::memory_order_release);
+    state.recording_profile_restore_request_epoch.store(0, std::memory_order_release);
+    state.recording_profile_recovery_counter.store(0, std::memory_order_release);
+    state.recording_profile_recovery_generation.store(0, std::memory_order_release);
+    state.recording_profile_recovery_kind.store(
+        static_cast<std::uint32_t>(RecordingProfileRecoveryKind::none),
+        std::memory_order_release);
+    state.recording_profile_recovery_target_mode.store(
+        static_cast<std::uint32_t>(DeadlockUiMode::deadlock_ui),
+        std::memory_order_release);
+    state.recording_profile_recovery_action_queued.store(false, std::memory_order_release);
+    state.recording_profile_recovery_action_last_attempt_ms.store(0, std::memory_order_release);
+    state.recording_profile_last_managed_mode.store(
+        static_cast<std::uint32_t>(DeadlockUiMode::deadlock_ui),
+        std::memory_order_release);
+    state.recording_profile_snapshot_observed.store(false, std::memory_order_release);
+    state.recording_profile_disconnect_restore_guard.store(false, std::memory_order_release);
+    state.recording_profile_lease_lost.store(false, std::memory_order_release);
+    state.recording_profile_last_ack_generation.store(0, std::memory_order_release);
     state.emergency_restore_attempted.store(false, std::memory_order_release);
     state.emergency_restore_last_attempt_ms.store(0, std::memory_order_release);
     state.input_system = nullptr;
@@ -5379,24 +6171,85 @@ bool StartSmvmOverlay(const HMODULE self_module, const SmvmOverlayCallbacks& cal
 
 bool StopSmvmOverlay() noexcept {
     auto& state = g_overlay;
-    if (!state.started.load(std::memory_order_acquire))
+    const auto was_started = state.started.load(std::memory_order_acquire);
+    const auto initial_restore_debt =
+        state.recording_profile_restore_debt.load(std::memory_order_acquire);
+    const auto recovery_pending = state.recording_profile_recovery_kind.load(
+        std::memory_order_acquire) !=
+        static_cast<std::uint32_t>(RecordingProfileRecoveryKind::none);
+    const auto needs_recording_restore = ShouldRestoreRecordingVisualProfileOnHostLoss(
+        state.recording_profile_may_be_active.load(std::memory_order_acquire),
+        initial_restore_debt != 0,
+        (initial_restore_debt & kRecordingProfileHardRestoreDebt) != 0,
+        recovery_pending);
+    if (!was_started && !needs_recording_restore) {
         return true;
+    }
+    if (needs_recording_restore) {
+        // Publish hard debt before stopping any worker or attempting renderer
+        // teardown. Every early-failure route below then leaves recoverable
+        // work for the retained backend's renderer-independent pump.
+        state.recording_profile_restore_request_epoch.fetch_add(1, std::memory_order_acq_rel);
+        state.recording_profile_restore_debt.fetch_or(
+            kRecordingProfileAllRestoreDebt, std::memory_order_acq_rel);
+    }
     state.stop_requested.store(true, std::memory_order_release);
     state.menu_open.store(false, std::memory_order_release);
     ResetCinematicStartGate(true);
     RequestManualPointerState(false);
-    if (state.presentation_mode.load(std::memory_order_acquire) !=
-        static_cast<std::uint32_t>(DeadlockUiMode::deadlock_ui))
-        EmergencyRestoreDeadlockUi();
-    SetLocalPresentationMode(DeadlockUiMode::deadlock_ui);
-    ResetSmvmManualInput();
-
     if (state.installer_thread != nullptr) {
         if (WaitForSingleObject(state.installer_thread, 31000) != WAIT_OBJECT_0)
             return false;
         CloseHandle(state.installer_thread);
         state.installer_thread = nullptr;
     }
+    if (state.recording_profile_restore_debt.load(std::memory_order_acquire) != 0) {
+        // Stop new rendering first, then take the render lock so no in-flight
+        // frame can race this bounded final restoration batch.
+        auto restore_lock_acquired = false;
+        const auto restore_lock_deadline =
+            std::chrono::steady_clock::now() + kCallbackDrainTimeout;
+        while (std::chrono::steady_clock::now() < restore_lock_deadline) {
+            if (!state.render_lock.test_and_set(std::memory_order_acquire)) {
+                restore_lock_acquired = true;
+                break;
+            }
+            Sleep(1);
+        }
+        if (!restore_lock_acquired)
+            return false;
+
+        std::uint32_t completed_attempts = 0;
+        for (;;) {
+            const auto action = RecordingVisualShutdownStep(
+                state.recording_profile_restore_debt.load(std::memory_order_acquire) != 0,
+                completed_attempts);
+            if (action == RecordingVisualShutdownAction::complete)
+                break;
+            if (action == RecordingVisualShutdownAction::keep_module_resident) {
+                state.render_lock.clear(std::memory_order_release);
+                return false;
+            }
+
+            const auto now = GetTickCount64();
+            const auto previous =
+                state.emergency_restore_last_attempt_ms.load(std::memory_order_acquire);
+            if (previous != 0 && now - previous < kRecordingVisualRestoreRetryMilliseconds) {
+                Sleep(static_cast<DWORD>(
+                    kRecordingVisualRestoreRetryMilliseconds - (now - previous)));
+            }
+            PumpEmergencyDeadlockUiRestore();
+            ++completed_attempts;
+        }
+        state.render_lock.clear(std::memory_order_release);
+    }
+    state.recording_profile_recovery_kind.store(
+        static_cast<std::uint32_t>(RecordingProfileRecoveryKind::none),
+        std::memory_order_release);
+    SetLocalPresentationMode(DeadlockUiMode::deadlock_ui);
+    ResetSmvmManualInput();
+    if (!was_started)
+        return true;
 
     // Unsubclass first so no new input callback can begin while renderer hooks
     // are being withdrawn. A later subclass above SMVM is deliberately treated

@@ -66,8 +66,12 @@ struct SmvmUiState final {
     bool replay_seek_pending{};
     std::int64_t replay_seek_target{};
     std::uint64_t replay_seek_retry_at_ms{};
-    float host_timescale_percent{100.0F};
-    bool host_timescale_initialized{};
+    std::uint64_t replay_seek_session_generation{};
+    float playback_speed_percent{100.0F};
+    bool playback_speed_initialized{};
+    bool playback_speed_input_active{};
+    double playback_speed_snapshot{1.0};
+    bool hide_ui_during_cinematic{};
     std::array<char, 64> save_as_name{};
     bool open_save_as_modal{};
     bool open_load_picker{};
@@ -84,8 +88,8 @@ struct SmvmUiState final {
     bool documents_valid{};
     std::int64_t replay_scrub_tick{};
     bool replay_scrubbing{};
-    bool clean_hint_pending{};
-    std::uint64_t clean_hint_until_ms{};
+    std::uint64_t replay_scrub_session_generation{};
+    std::uint64_t observed_replay_session_generation{};
     bool free_camera_activation_pending{};
     std::uint64_t free_camera_activation_started_ms{};
     std::uint64_t free_camera_activation_error_until_ms{};
@@ -111,13 +115,16 @@ struct SmvmUiFrameParams final {
     std::uint32_t free_camera_input_failure{};
     std::uint32_t raw_registration_disposition{};
     std::function<bool(const SmvmActionPayload&)> queue_action{};
-    std::function<void()> request_capture{};
+    std::function<void(std::uint64_t)> request_capture{};
 };
 
 namespace smvm_ui {
 
 // Retained for protocol/source compatibility with the dormant legacy editor.
 void UpdateToasts(const SmvmSnapshotPayload& snapshot, SmvmUiState& state) noexcept;
+void ObserveReplaySession(
+    const SmvmSnapshotPayload* snapshot,
+    SmvmUiState& state) noexcept;
 void DrawFrame(const SmvmUiFrameParams& params, SmvmUiState& state) noexcept;
 
 } // namespace smvm_ui
@@ -141,7 +148,7 @@ void SmvmBeginBindingCapture(std::int32_t action, std::uint32_t original) noexce
 void SmvmClearBinding(std::int32_t action, std::uint32_t original) noexcept;
 void SmvmCloseMenu() noexcept;
 void SmvmOpenMenu() noexcept;
-[[nodiscard]] bool SmvmArmCinematicStart() noexcept;
+[[nodiscard]] bool SmvmArmCinematicStart(std::uint64_t replay_session_generation) noexcept;
 void SmvmSetReplayTickInputActive(bool active) noexcept;
 void SmvmReacquireFreeCameraInput() noexcept;
 

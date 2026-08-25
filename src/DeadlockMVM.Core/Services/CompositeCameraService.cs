@@ -69,6 +69,11 @@ public sealed class CompositeCameraService : ICameraService
     public Task<CameraState?> EnterFreeRoamAsync(CancellationToken cancellationToken = default)
         => _vconsole.EnterFreeRoamAsync(cancellationToken);
 
+    public Task<CameraState?> EnterFreeRoamIfCurrentAsync(
+        Func<Action, bool> runIfCurrent,
+        CancellationToken cancellationToken = default) =>
+        _vconsole.EnterFreeRoamIfCurrentAsync(runIfCurrent, cancellationToken);
+
     public void SelectPlayer(string playerOrSlot) => _vconsole.SelectPlayer(playerOrSlot);
 
     public void SelectNextPlayer() => _vconsole.SelectNextPlayer();

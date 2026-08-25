@@ -12,8 +12,19 @@ public sealed class NativeReplayCameraClient : IAsyncDisposable
     private ulong _sequence;
     private int _processId;
     private int _disposed;
+    private long _sessionConnectionEpoch;
 
     public bool Connected => _pipe?.IsConnected == true;
+    internal event EventHandler<SmvmActionDispatch>? SmvmActionReceived;
+    internal Func<long>? ExpectedReplaySessionGenerationProvider { get; set; }
+
+    internal void BindSessionConnectionEpoch(long connectionEpoch)
+    {
+        if (connectionEpoch <= 0)
+            throw new ArgumentOutOfRangeException(nameof(connectionEpoch));
+        if (Interlocked.CompareExchange(ref _sessionConnectionEpoch, connectionEpoch, 0) != 0)
+            throw new InvalidOperationException("The native client already has a session connection epoch.");
+    }
 
     public async Task<InProcessCameraStatus> ConnectAsync(
         int processId,
@@ -163,7 +174,12 @@ public sealed class NativeReplayCameraClient : IAsyncDisposable
                 if (!ReferenceEquals(Volatile.Read(ref _pipe), pipe))
                     throw new InvalidOperationException("The native replay camera connection was retired.");
                 var sequence = unchecked(++_sequence);
-                var message = InProcessProtocol.CreateMessage(type, sequence, payload.Span);
+                var replaySessionGeneration = ExpectedReplaySessionGenerationProvider?.Invoke() ?? 0;
+                var message = InProcessProtocol.CreateMessage(
+                    type,
+                    sequence,
+                    payload.Span,
+                    replaySessionGeneration);
                 await pipe.WriteAsync(message, cancellationToken).ConfigureAwait(false);
                 await pipe.FlushAsync(cancellationToken).ConfigureAwait(false);
 
@@ -171,7 +187,9 @@ public sealed class NativeReplayCameraClient : IAsyncDisposable
                 await ReadExactlyAsync(pipe, headerBytes, cancellationToken).ConfigureAwait(false);
                 var header = InProcessProtocol.ParseHeader(headerBytes);
                 if (header.Type != InProcessMessageType.Status ||
-                    header.PayloadSize != InProcessProtocol.StatusSize || header.Sequence != sequence)
+                    header.PayloadSize != InProcessProtocol.StatusSize ||
+                    header.Sequence != sequence ||
+                    header.ReplaySessionGeneration != 0)
                     throw new InvalidDataException("Native status response does not match the request.");
 
                 var statusBytes = new byte[header.PayloadSize];
@@ -179,9 +197,33 @@ public sealed class NativeReplayCameraClient : IAsyncDisposable
                 var status = InProcessProtocol.ParseStatus(statusBytes);
                 if (status.ProcessId != _processId)
                     throw new InvalidDataException("Native status came from an unexpected process.");
-                return status;
+                var completedReplaySessionGeneration =
+                    ExpectedReplaySessionGenerationProvider?.Invoke() ?? 0;
+                if (completedReplaySessionGeneration != replaySessionGeneration)
+                    throw new InvalidOperationException(
+                        "The replay session changed while a native camera request was in flight.");
+                var attributedStatus = status with
+                {
+                    SourceConnectionEpoch = Volatile.Read(ref _sessionConnectionEpoch),
+                };
+                // This callback deliberately runs before the request gate is
+                // released. Native actions are therefore handed to the session
+                // in the same FIFO order in which the pipe responses popped
+                // them, even when awaiting callers resume on different threads.
+                if (attributedStatus.Action.Type != SmvmActionType.None &&
+                    attributedStatus.SourceConnectionEpoch > 0)
+                {
+                    SmvmActionReceived?.Invoke(
+                        this,
+                        new SmvmActionDispatch(
+                            attributedStatus.Action,
+                            attributedStatus.SourceConnectionEpoch,
+                            attributedStatus.Action.ReplaySessionGeneration));
+                }
+                return attributedStatus;
             }
-            catch (Exception ex) when (ex is IOException or OperationCanceledException or ObjectDisposedException)
+            catch (Exception ex) when (ex is IOException or InvalidDataException or
+                                       OperationCanceledException or ObjectDisposedException)
             {
                 // A failed/cancelled in-flight request can leave a response queued
                 // and destroy framing. Retire this pipe; the monitor reconnects.

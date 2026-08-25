@@ -86,24 +86,30 @@ struct MouseAcquisitionReset final {
     const bool menu_open,
     const bool free_camera_requested,
     const bool free_camera_active,
-    const FreeCameraInputReadiness& readiness) noexcept {
-    return !menu_open && free_camera_requested && free_camera_active && readiness.AnyReady();
+    const FreeCameraInputReadiness& readiness,
+    const bool replay_seek_in_progress = false) noexcept {
+    return !menu_open && !replay_seek_in_progress && free_camera_requested &&
+           free_camera_active && readiness.AnyReady();
 }
 
 [[nodiscard]] constexpr bool CanConsumeFreeCameraKeyboardInput(
     const bool menu_open,
     const bool free_camera_requested,
     const bool free_camera_active,
-    const FreeCameraInputReadiness& readiness) noexcept {
-    return !menu_open && free_camera_requested && free_camera_active && readiness.KeyboardReady();
+    const FreeCameraInputReadiness& readiness,
+    const bool replay_seek_in_progress = false) noexcept {
+    return !menu_open && !replay_seek_in_progress && free_camera_requested &&
+           free_camera_active && readiness.KeyboardReady();
 }
 
 [[nodiscard]] constexpr bool CanConsumeFreeCameraMouseInput(
     const bool menu_open,
     const bool free_camera_requested,
     const bool free_camera_active,
-    const FreeCameraInputReadiness& readiness) noexcept {
-    return !menu_open && free_camera_requested && free_camera_active && readiness.MouseReady();
+    const FreeCameraInputReadiness& readiness,
+    const bool replay_seek_in_progress = false) noexcept {
+    return !menu_open && !replay_seek_in_progress && free_camera_requested &&
+           free_camera_active && readiness.MouseReady();
 }
 
 // Pure lifecycle mirror for transition tests. The Win32 implementation owns

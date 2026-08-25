@@ -19,6 +19,19 @@ struct ReplayTimelineGeometry {
     return internal_enabled && replay_active && smvm_replay_ui;
 }
 
+[[nodiscard]] constexpr bool ShouldHideEditorUiDuringCinematic(
+    const bool hide_ui_enabled,
+    const bool campath_playing) noexcept {
+    return hide_ui_enabled && campath_playing;
+}
+
+[[nodiscard]] constexpr bool ShouldShowEditorUi(
+    const bool timeline_available,
+    const bool hidden_for_cinematic,
+    const bool menu_open) noexcept {
+    return timeline_available && (!hidden_for_cinematic || menu_open);
+}
+
 [[nodiscard]] constexpr ReplayTimelineGeometry ComputeReplayTimelineGeometry(
     const float viewport_width,
     const float viewport_height,
@@ -62,6 +75,12 @@ struct ReplayTimelineGeometry {
     return currently_paused ? 0 : 1;
 }
 
+[[nodiscard]] constexpr bool ShouldLockReplayTimelineInput(
+    const bool menu_open,
+    const bool replay_seek_in_progress) noexcept {
+    return !menu_open || replay_seek_in_progress;
+}
+
 [[nodiscard]] constexpr bool ShouldOfferPlayCinematic(
     const std::uint32_t keyframe_count) noexcept {
     return keyframe_count >= 3;
@@ -74,11 +93,12 @@ struct ReplayTimelineGeometry {
 }
 
 [[nodiscard]] constexpr bool ShouldDrawCampathPlacementGuides(
+    const bool smvm_movie_ui,
     const bool clean_view,
     const bool has_path,
     const bool campath_playing,
     const bool camera_readable) noexcept {
-    return !clean_view && has_path && !campath_playing && camera_readable;
+    return smvm_movie_ui && !clean_view && has_path && !campath_playing && camera_readable;
 }
 
 [[nodiscard]] constexpr bool ReplayTimelineEditorOwnsKeyboard(
@@ -105,6 +125,14 @@ struct ReplayTimelineGeometry {
     return request_pending && replay_active && current_tick >= 0 && now_ms >= retry_at_ms;
 }
 
+[[nodiscard]] constexpr bool IsReplayUiActionSessionCurrent(
+    const bool replay_active,
+    const std::uint64_t current_replay_session_generation,
+    const std::uint64_t source_replay_session_generation) noexcept {
+    return replay_active && current_replay_session_generation > 0 &&
+           source_replay_session_generation == current_replay_session_generation;
+}
+
 [[nodiscard]] constexpr bool IsCinematicStartPromptReady(
     const bool armed,
     const bool has_path,
@@ -125,7 +153,7 @@ struct ReplayTimelineGeometry {
     return distance <= 2;
 }
 
-[[nodiscard]] constexpr double HostTimescaleFromPercent(const double requested_percent) noexcept {
+[[nodiscard]] constexpr double PlaybackSpeedFromPercent(const double requested_percent) noexcept {
     const auto finite_percent = requested_percent == requested_percent
         ? requested_percent
         : 100.0;

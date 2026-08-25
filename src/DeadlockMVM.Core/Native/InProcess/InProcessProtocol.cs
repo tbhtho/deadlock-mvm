@@ -128,6 +128,9 @@ public enum SmvmSnapshotFlags : uint
     RestoreWorkspace = 1 << 24,
     CaptureDiagnostics = 1 << 25,
     ShowStatusHud = 1 << 26,
+    ReplaySeekInProgress = 1 << 27,
+    RecordingProfileRestorePending = 1 << 28,
+    RecordingProfileTransactionInProgress = 1 << 29,
 }
 
 public enum SmvmCaptureStage : uint
@@ -383,10 +386,21 @@ public sealed record SmvmAction(
     long Tick,
     double Value,
     CameraSample Camera,
-    string Text)
+    string Text,
+    long ReplaySessionGeneration = 0)
 {
     public static SmvmAction None { get; } = new(SmvmActionType.None, -1, -1, 0, default, string.Empty);
 }
+
+/// <summary>
+/// Carries the immutable native-connection generation that produced an action.
+/// The host must never restamp a delayed response with the generation of a
+/// newer pipe.
+/// </summary>
+public sealed record SmvmActionDispatch(
+    SmvmAction Action,
+    long ConnectionEpoch,
+    long ReplaySessionGeneration);
 
 public sealed record SmvmSnapshot(
     SmvmSnapshotFlags Flags,
@@ -460,7 +474,9 @@ public sealed record SmvmSnapshot(
     uint StepForwardKey,
     SmvmNotificationAnchor StatusHudAnchor = SmvmNotificationAnchor.TopRight,
     double StatusHudScale = 1.0,
-    double StatusHudOpacity = 0.92);
+    double StatusHudOpacity = 0.92,
+    ulong RecordingProfileAcknowledgementGeneration = 0,
+    long ReplaySessionGeneration = 0);
 
 [Flags]
 public enum InProcessStatusFlags : uint
@@ -498,22 +514,29 @@ public sealed record InProcessCameraStatus(
     uint OverlayFrameMicroseconds,
     SmvmAction Action)
 {
+    /// <summary>
+    /// Managed-only provenance attached by <see cref="NativeReplayCameraClient"/>.
+    /// It is not part of the native wire payload.
+    /// </summary>
+    public long SourceConnectionEpoch { get; init; }
+
     public bool Ready => State == InProcessBackendState.Ready &&
                          Flags.HasFlag(InProcessStatusFlags.HookInstalled);
     public bool OverrideActive => Flags.HasFlag(InProcessStatusFlags.OverrideActive);
     public bool RollOverrideActive => Flags.HasFlag(InProcessStatusFlags.RollOverrideActive);
     public bool ManualCameraRequested => Flags.HasFlag(InProcessStatusFlags.ManualCameraRequested);
     public bool ManualCameraActive => Flags.HasFlag(InProcessStatusFlags.ManualCameraActive);
+    public bool CampathCompleted => Flags.HasFlag(InProcessStatusFlags.CampathCompleted);
     public bool CameraObserved => Flags.HasFlag(InProcessStatusFlags.CameraObserved) && Camera.IsValid && ReplayTick >= 0;
 }
 
 internal static class InProcessProtocol
 {
     public const uint Magic = 0x4D564D43;
-    public const ushort Version = 11;
-    public const int HeaderSize = 20;
-    public const int StatusSize = 264;
-    public const int SmvmSnapshotSize = 728;
+    public const ushort Version = 15;
+    public const int HeaderSize = 28;
+    public const int StatusSize = 272;
+    public const int SmvmSnapshotSize = 744;
     public const int CameraSampleSize = 56;
     public const int CampathKeyframeSize = 64;
     public const int CampathHeaderSize = 16;
@@ -521,10 +544,16 @@ internal static class InProcessProtocol
     public const int MaxCampathDocuments = 32;
     public const int MaxPayloadSize = CampathHeaderSize + (CampathKeyframeSize * CampathPath.MaxKeyframes);
 
-    public static byte[] CreateMessage(InProcessMessageType type, ulong sequence, ReadOnlySpan<byte> payload)
+    public static byte[] CreateMessage(
+        InProcessMessageType type,
+        ulong sequence,
+        ReadOnlySpan<byte> payload,
+        long expectedReplaySessionGeneration = 0)
     {
         if (payload.Length > MaxPayloadSize)
             throw new ArgumentOutOfRangeException(nameof(payload));
+        if (expectedReplaySessionGeneration < 0)
+            throw new ArgumentOutOfRangeException(nameof(expectedReplaySessionGeneration));
 
         var message = new byte[HeaderSize + payload.Length];
         var span = message.AsSpan();
@@ -533,11 +562,16 @@ internal static class InProcessProtocol
         BinaryPrimitives.WriteUInt16LittleEndian(span[6..], (ushort)type);
         BinaryPrimitives.WriteUInt32LittleEndian(span[8..], (uint)payload.Length);
         BinaryPrimitives.WriteUInt64LittleEndian(span[12..], sequence);
+        BinaryPrimitives.WriteInt64LittleEndian(span[20..], expectedReplaySessionGeneration);
         payload.CopyTo(span[HeaderSize..]);
         return message;
     }
 
-    public static (InProcessMessageType Type, int PayloadSize, ulong Sequence) ParseHeader(ReadOnlySpan<byte> header)
+    public static (
+        InProcessMessageType Type,
+        int PayloadSize,
+        ulong Sequence,
+        long ReplaySessionGeneration) ParseHeader(ReadOnlySpan<byte> header)
     {
         if (header.Length != HeaderSize)
             throw new InvalidDataException("Native response header has the wrong size.");
@@ -551,7 +585,14 @@ internal static class InProcessProtocol
         var payloadSize = checked((int)BinaryPrimitives.ReadUInt32LittleEndian(header[8..]));
         if (payloadSize is < 0 or > MaxPayloadSize)
             throw new InvalidDataException("Native response payload is too large.");
-        return (type, payloadSize, BinaryPrimitives.ReadUInt64LittleEndian(header[12..]));
+        var replaySessionGeneration = BinaryPrimitives.ReadInt64LittleEndian(header[20..]);
+        if (replaySessionGeneration < 0)
+            throw new InvalidDataException("Native response replay generation is invalid.");
+        return (
+            type,
+            payloadSize,
+            BinaryPrimitives.ReadUInt64LittleEndian(header[12..]),
+            replaySessionGeneration);
     }
 
     public static byte[] SerializeHello(int processId)
@@ -648,8 +689,11 @@ internal static class InProcessProtocol
     public static byte[] SerializeSmvmSnapshot(SmvmSnapshot snapshot)
     {
         ArgumentNullException.ThrowIfNull(snapshot);
+        if (snapshot.RecordingProfileAcknowledgementGeneration > long.MaxValue ||
+            snapshot.ReplaySessionGeneration < 0)
+            throw new ArgumentOutOfRangeException(nameof(snapshot));
         var payload = new byte[SmvmSnapshotSize];
-        BinaryPrimitives.WriteUInt32LittleEndian(payload, 6);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload, 9);
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(4), (uint)snapshot.Flags);
         BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(8), snapshot.CurrentTick);
         BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(16), snapshot.TotalTicks);
@@ -729,6 +773,10 @@ internal static class InProcessProtocol
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(708), (uint)snapshot.StatusHudAnchor);
         WriteDouble(payload, 712, snapshot.StatusHudScale);
         WriteDouble(payload, 720, snapshot.StatusHudOpacity);
+        BinaryPrimitives.WriteUInt64LittleEndian(
+            payload.AsSpan(728), snapshot.RecordingProfileAcknowledgementGeneration);
+        BinaryPrimitives.WriteInt64LittleEndian(
+            payload.AsSpan(736), snapshot.ReplaySessionGeneration);
         return payload;
     }
 
@@ -802,6 +850,9 @@ internal static class InProcessProtocol
         var actionType = (SmvmActionType)BinaryPrimitives.ReadUInt32LittleEndian(payload[120..]);
         if (!Enum.IsDefined(actionType) || payload[263] != 0)
             throw new InvalidDataException("Native status contains an invalid SMVM action.");
+        var actionReplaySessionGeneration = BinaryPrimitives.ReadInt64LittleEndian(payload[264..]);
+        if (actionReplaySessionGeneration < 0)
+            throw new InvalidDataException("Native status contains an invalid SMVM action replay generation.");
         var camera = new CameraSample(
             ReadDouble(payload, 48), ReadDouble(payload, 56), ReadDouble(payload, 64),
             ReadDouble(payload, 72), ReadDouble(payload, 80), ReadDouble(payload, 88),
@@ -819,6 +870,10 @@ internal static class InProcessProtocol
             throw new InvalidDataException("Native status contains a non-finite SMVM action value.");
         if (actionType == SmvmActionType.AddKeyframe && (actionTick < 0 || !actionCamera.IsValid))
             throw new InvalidDataException("Native status contains an invalid camera-capture action.");
+        if (actionType == SmvmActionType.RestoreDeadlockUi && actionTick <= 0)
+            throw new InvalidDataException("Native status contains an untagged emergency UI restore.");
+        if (actionType == SmvmActionType.SetDeadlockUiMode && actionTick == long.MinValue)
+            throw new InvalidDataException("Native status contains an invalid UI owner generation.");
         if (actionType == SmvmActionType.CaptureDiagnostic)
         {
             var stage = (SmvmCaptureStage)BinaryPrimitives.ReadInt32LittleEndian(payload[124..]);
@@ -847,7 +902,8 @@ internal static class InProcessProtocol
                 actionTick,
                 actionValue,
                 actionCamera,
-                ReadUtf8(payload.Slice(200, 64))));
+                ReadUtf8(payload.Slice(200, 64)),
+                actionReplaySessionGeneration));
     }
 
     private static void WriteDouble(Span<byte> payload, int offset, double value) =>

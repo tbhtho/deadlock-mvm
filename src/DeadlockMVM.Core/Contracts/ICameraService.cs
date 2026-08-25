@@ -36,6 +36,22 @@ public interface ICameraService : ICameraServicePollerSource
     /// </summary>
     Task<CameraState?> EnterFreeRoamAsync(CancellationToken cancellationToken = default);
 
+    /// <summary>
+    /// Enters Free Roam while letting a replay owner linearize each synchronous
+    /// VConsole mutation with its current replay lease. Implementations that
+    /// contain awaits should override this so a replacement replay cannot
+    /// receive the post-await camera command.
+    /// </summary>
+    Task<CameraState?> EnterFreeRoamIfCurrentAsync(
+        Func<Action, bool> runIfCurrent,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(runIfCurrent);
+        if (!runIfCurrent(static () => { }))
+            throw new InvalidOperationException("Replay changed before Free Roam could be entered.");
+        return EnterFreeRoamAsync(cancellationToken);
+    }
+
     void SelectPlayer(string playerOrSlot);
 
     void SelectNextPlayer();

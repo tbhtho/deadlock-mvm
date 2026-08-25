@@ -297,29 +297,39 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         OnEditorStateChanged();
     }
 
-    public async Task UpdateAsync()
+    public async Task UpdateAsync(
+        Func<bool>? stillCurrent = null,
+        Func<Action, bool>? runIfCurrent = null)
     {
         var selected = SelectedKeyframe;
-        if (selected is null || !CanCapture())
+        if (selected is null || !CanCapture() || stillCurrent?.Invoke() == false)
             return;
         var captured = await CaptureAsync().ConfigureAwait(true);
-        if (captured is null)
+        if (captured is null || stillCurrent?.Invoke() == false)
             return;
 
-        var index = Keyframes.IndexOf(selected);
-        if (index < 0 || PathCameraOwned)
+        void ApplyCapturedUpdate()
         {
-            Status = "That keyframe changed before it could be replaced. Try again.";
-            return;
+            var index = Keyframes.IndexOf(selected);
+            if (index < 0 || PathCameraOwned)
+            {
+                Status = "That keyframe changed before it could be replaced. Try again.";
+                return;
+            }
+
+            PushHistory();
+            var updated = new CampathKeyframe(selected.DemoTick, captured.Camera);
+            Keyframes[index] = updated;
+            SelectedKeyframe = updated;
+            Status = "Keyframe replaced with the current view.";
+            Autosave();
+            OnEditorStateChanged();
         }
 
-        PushHistory();
-        var updated = new CampathKeyframe(selected.DemoTick, captured.Camera);
-        Keyframes[index] = updated;
-        SelectedKeyframe = updated;
-        Status = "Keyframe replaced with the current view.";
-        Autosave();
-        OnEditorStateChanged();
+        if (runIfCurrent is not null)
+            _ = runIfCurrent(ApplyCapturedUpdate);
+        else
+            ApplyCapturedUpdate();
     }
 
     private async Task<CampathKeyframe?> CaptureAsync()

@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using System.Globalization;
 using DeadlockMVM.Core.Models;
 
 namespace DeadlockMVM.Core.Services;
@@ -23,6 +24,8 @@ public sealed partial class ReplayStateParser
 
     /// <summary>Engine game tick minus demo-timeline tick, learned from demo_info/output.</summary>
     public int? GameTickOffset => _gameTickOffset;
+
+    public void ResetGameTickOffset() => _gameTickOffset = null;
 
     public bool TryParseSeekCompletedTick(string line, out int tick)
     {
@@ -51,6 +54,25 @@ public sealed partial class ReplayStateParser
 
     [GeneratedRegex(@"playback_ticks: (\d+)")]
     private static partial Regex PlaybackTicksLine();
+
+    [GeneratedRegex(
+        @"(?:\[Demo\]\s+)?playing demo from\s+'([^'\r\n]+\.dem)'",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex DemoPlaybackStartedLine();
+
+    [GeneratedRegex(@"demo_timescale\s*=\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)")]
+    private static partial Regex DemoTimescaleLine();
+
+    /// <summary>
+    /// Source emits this only when a demo instance actually begins playback,
+    /// including a reload of the same file. It is not emitted by seeking.
+    /// </summary>
+    public bool TryParseReplaySessionStarted(string line, out string replayName)
+    {
+        var match = DemoPlaybackStartedLine().Match(line ?? string.Empty);
+        replayName = match.Success ? match.Groups[1].Value : string.Empty;
+        return match.Success;
+    }
 
     /// <summary>
     /// Parses one console output line and returns a partial state containing
@@ -129,6 +151,16 @@ public sealed partial class ReplayStateParser
             {
                 TotalTicks = int.Parse(playbackTicks.Groups[1].Value),
             };
+        }
+
+        var demoTimescale = DemoTimescaleLine().Match(line);
+        if (demoTimescale.Success && double.TryParse(
+                demoTimescale.Groups[1].Value,
+                NumberStyles.Float,
+                CultureInfo.InvariantCulture,
+                out var timescale) && double.IsFinite(timescale))
+        {
+            return new ReplayState { Timescale = timescale };
         }
 
         return null;

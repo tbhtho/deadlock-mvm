@@ -7,6 +7,8 @@
 #include "optimistic_edit.hpp"
 #include "pattern_scan.hpp"
 #include "protocol.hpp"
+#include "recording_visual_policy.hpp"
+#include "replay_session_transition.hpp"
 #include "replay_timeline_policy.hpp"
 #include "render_camera_policy.hpp"
 #include "smvm_action_queue.hpp"
@@ -56,19 +58,231 @@ void PatternTests() {
 }
 
 void ProtocolTests() {
+    using deadlock_mvm::DeadlockUiMode;
+    using deadlock_mvm::SmvmActionType;
     using deadlock_mvm::ClampReplayTimelineTick;
     using deadlock_mvm::ComputeReplayTimelineGeometry;
     using deadlock_mvm::DesiredReplayPauseActionIndex;
-    using deadlock_mvm::HostTimescaleFromPercent;
+    using deadlock_mvm::PlaybackSpeedFromPercent;
     using deadlock_mvm::IsCinematicStartPromptReady;
+    using deadlock_mvm::IsReplayUiActionSessionCurrent;
     using deadlock_mvm::ReplayTimelineEditorOwnsKeyboard;
     using deadlock_mvm::ReplayTimelineTextInputConsumesKey;
     using deadlock_mvm::ShouldDrawCampathPlacementGuides;
+    using deadlock_mvm::ShouldHideEditorUiDuringCinematic;
     using deadlock_mvm::ShouldOfferPlayCinematic;
     using deadlock_mvm::ShouldQueuePendingReplaySeek;
+    using deadlock_mvm::ShouldLockReplayTimelineInput;
     using deadlock_mvm::ShouldStartCinematicForSpaceEvent;
     using deadlock_mvm::ShouldShowCampathPlacementList;
+    using deadlock_mvm::ShouldShowEditorUi;
     using deadlock_mvm::ShouldShowReplayTimeline;
+
+    Check(!deadlock_mvm::HasReachedCampathEnd(1499.51, 1500) &&
+              deadlock_mvm::HasReachedCampathEnd(1500.0, 1500) &&
+              !deadlock_mvm::HasReachedCampathEnd(
+                  std::numeric_limits<double>::quiet_NaN(), 1500),
+          "Campath completion follows the same fractional clock as camera evaluation");
+
+    Check(deadlock_mvm::kReplayPresentationCommands ==
+              std::array<std::string_view, 4>{
+                  "citadel_player_glow_disabled true",
+                  "citadel_camera_fade_viewed_near_opacity 1",
+                  "citadel_camera_fade_other_near_opacity 1",
+                  "r_drawpanorama false"} &&
+              deadlock_mvm::kDeadlockPresentationRestoreCommands ==
+              std::array<std::string_view, 4>{
+                  "citadel_player_glow_disabled false",
+                  "citadel_camera_fade_viewed_near_opacity 0.4",
+                  "citadel_camera_fade_other_near_opacity 0.4",
+                  "r_drawpanorama true"},
+          "recording presentation has exact typed apply and emergency restore profiles");
+    Check(deadlock_mvm::ShouldAttemptRecordingVisualRestore(true, false, 500, 0) &&
+              !deadlock_mvm::ShouldAttemptRecordingVisualRestore(true, true, 2000, 500) &&
+              !deadlock_mvm::ShouldAttemptRecordingVisualRestore(true, false, 1499, 500) &&
+              deadlock_mvm::ShouldAttemptRecordingVisualRestore(true, false, 1500, 500) &&
+              !deadlock_mvm::ShouldAttemptRecordingVisualRestore(false, false, 1500, 500),
+          "recording presentation restore debt retries at a bounded one-second cadence");
+    Check(!deadlock_mvm::ShouldRequestManagedRecordingVisualRestore(true, true, true, false) &&
+              deadlock_mvm::ShouldRequestManagedRecordingVisualRestore(true, false, true, false) &&
+              !deadlock_mvm::ShouldRequestManagedRecordingVisualRestore(true, false, false, false) &&
+              !deadlock_mvm::ShouldRequestManagedRecordingVisualRestore(true, false, true, true),
+          "managed profile transactions cannot race the emergency inverse");
+    Check(!deadlock_mvm::ShouldQueueRecordingVisualRecoveryAction(
+                  true, true, true, false, 1000, 0) &&
+              deadlock_mvm::ShouldQueueRecordingVisualRecoveryAction(
+                  true, false, true, false, 1000, 0) &&
+              deadlock_mvm::ShouldQueueRecordingVisualRecoveryAction(
+                  false, true, true, false, 1000, 0) &&
+              deadlock_mvm::ShouldQueueRecordingVisualRecoveryAction(
+                  false, true, false, false, 1000, 0) &&
+              !deadlock_mvm::ShouldQueueRecordingVisualRecoveryAction(
+                  true, false, false, false, 1000, 0) &&
+              !deadlock_mvm::ShouldQueueRecordingVisualRecoveryAction(
+                  true, false, true, true, 1000, 0) &&
+              !deadlock_mvm::ShouldQueueRecordingVisualRecoveryAction(
+                  true, false, true, false, 1499, 500) &&
+              deadlock_mvm::ShouldQueueRecordingVisualRecoveryAction(
+                  true, false, true, false, 1500, 500),
+          "reconnect forward profile waits for the hard inverse and retry cadence");
+    Check(deadlock_mvm::ShouldQueueInitialOwnerPresentationAction(false, true) &&
+              deadlock_mvm::ShouldQueueInitialOwnerPresentationAction(true, false) &&
+              !deadlock_mvm::ShouldQueueInitialOwnerPresentationAction(true, true),
+          "owner forward intent waits behind hard native inverse debt");
+    Check(deadlock_mvm::ResolveLocalRecordingPresentationMode(
+              DeadlockUiMode::smvm_replay_ui,
+              true, false, false, false, DeadlockUiMode::smvm_replay_ui,
+              true, true, false) == DeadlockUiMode::deadlock_ui &&
+              deadlock_mvm::ResolveLocalRecordingPresentationMode(
+                  DeadlockUiMode::smvm_replay_ui,
+                  false, true, false, false, DeadlockUiMode::smvm_replay_ui,
+                  true, true, false) == DeadlockUiMode::deadlock_ui &&
+              deadlock_mvm::ResolveLocalRecordingPresentationMode(
+                  DeadlockUiMode::deadlock_ui,
+                  false, false, false, true, DeadlockUiMode::smvm_replay_ui,
+                  false, true, false) == DeadlockUiMode::deadlock_ui &&
+              deadlock_mvm::ResolveLocalRecordingPresentationMode(
+                  DeadlockUiMode::deadlock_ui,
+                  false, false, false, true, DeadlockUiMode::smvm_replay_ui,
+                  true, true, false) == DeadlockUiMode::smvm_replay_ui &&
+              deadlock_mvm::ResolveLocalRecordingPresentationMode(
+                  DeadlockUiMode::deadlock_ui,
+                  false, false, false, true, DeadlockUiMode::clean_footage,
+                  true, true, true) == DeadlockUiMode::deadlock_ui &&
+              deadlock_mvm::ResolveLocalRecordingPresentationMode(
+                  DeadlockUiMode::smvm_replay_ui,
+                  false, false, false, false, DeadlockUiMode::deadlock_ui,
+                  false, true, false) == DeadlockUiMode::smvm_replay_ui,
+          "hard inverse and undelivered owner intent keep local rendering fail-closed");
+    Check(deadlock_mvm::ResolveLocalRecordingPresentationMode(
+              DeadlockUiMode::smvm_replay_ui,
+              false, false, true, false, DeadlockUiMode::deadlock_ui,
+              false, true, false) == DeadlockUiMode::deadlock_ui,
+          "reconnect and replay-end recovery keep the local presentation fail-closed");
+    using deadlock_mvm::ReplayEndRecordingVisualDisposition;
+    Check(deadlock_mvm::ResolveReplayEndRecordingVisualDisposition(
+              false, true, false, true, false) ==
+                  ReplayEndRecordingVisualDisposition::wait_for_inverse &&
+              deadlock_mvm::ResolveReplayEndRecordingVisualDisposition(
+                  false, false, false, true, false) ==
+                  ReplayEndRecordingVisualDisposition::wait_for_managed_restore &&
+              deadlock_mvm::ResolveReplayEndRecordingVisualDisposition(
+                  true, false, true, false, false) ==
+                  ReplayEndRecordingVisualDisposition::retire_deadlock &&
+              deadlock_mvm::ResolveReplayEndRecordingVisualDisposition(
+                  true, false, false, true, false) ==
+                  ReplayEndRecordingVisualDisposition::reassert_active &&
+              deadlock_mvm::ResolveReplayEndRecordingVisualDisposition(
+                  true, false, false, true, true) ==
+                  ReplayEndRecordingVisualDisposition::wait_for_inverse,
+          "terminal replay cleanup cannot leak its inverse into a newly active replay");
+    Check(deadlock_mvm::MayQueueRecordingVisualActionWithoutActiveReplay(
+              SmvmActionType::restore_deadlock_ui, -1) &&
+              deadlock_mvm::MayQueueRecordingVisualActionWithoutActiveReplay(
+                  SmvmActionType::set_deadlock_ui_mode,
+                  static_cast<std::int32_t>(DeadlockUiMode::deadlock_ui)) &&
+              !deadlock_mvm::MayQueueRecordingVisualActionWithoutActiveReplay(
+                  SmvmActionType::set_deadlock_ui_mode,
+                  static_cast<std::int32_t>(DeadlockUiMode::smvm_replay_ui)) &&
+              !deadlock_mvm::MayQueueRecordingVisualActionWithoutActiveReplay(
+                  SmvmActionType::play_from_start, -1),
+          "inactive replay queue admits only typed presentation inverses");
+    const auto managed_restore_proven =
+        deadlock_mvm::ManagedSnapshotProvesRecordingVisualRestore(
+            true, false, false, false);
+    Check(managed_restore_proven &&
+              !deadlock_mvm::ManagedSnapshotProvesRecordingVisualRestore(
+                  true, false, false, true) &&
+              !deadlock_mvm::ManagedSnapshotProvesRecordingVisualRestore(
+                  true, true, false, false) &&
+              !deadlock_mvm::ManagedSnapshotProvesRecordingVisualRestore(
+                  false, false, false, false) &&
+              deadlock_mvm::ShouldCancelRecordingVisualReassert(
+                  true, managed_restore_proven) &&
+              !deadlock_mvm::ShouldCancelRecordingVisualReassert(
+                  true, false) &&
+              deadlock_mvm::ShouldCancelRecordingVisualReassert(
+                  false, false),
+          "failed reconnect forward rollback retries while intentional Deadlock UI cancels");
+    Check(deadlock_mvm::IsOwnerPresentationTransitionComplete(
+              42, 42, true, false, true, false, false) &&
+              deadlock_mvm::IsOwnerPresentationTransitionComplete(
+                  43, 43, true, true, false, false, false) &&
+              !deadlock_mvm::IsOwnerPresentationTransitionComplete(
+                  42, 41, true, false, true, false, false) &&
+              !deadlock_mvm::IsOwnerPresentationTransitionComplete(
+                  43, 42, true, false, true, false, false) &&
+              !deadlock_mvm::IsOwnerPresentationTransitionComplete(
+                  0, 0, true, false, true, false, false) &&
+              !deadlock_mvm::IsOwnerPresentationTransitionComplete(
+                  42, 42, false, false, true, false, false) &&
+              !deadlock_mvm::IsOwnerPresentationTransitionComplete(
+                  42, 42, true, true, true, false, false) &&
+              !deadlock_mvm::IsOwnerPresentationTransitionComplete(
+                  42, 42, true, false, true, true, false) &&
+              !deadlock_mvm::IsOwnerPresentationTransitionComplete(
+                  42, 42, true, false, true, false, true),
+          "owner presentation intent needs a post-boundary generation acknowledgement and a stable managed target");
+    Check(deadlock_mvm::RecordingVisualShutdownStep(false, 0) ==
+                  deadlock_mvm::RecordingVisualShutdownAction::complete &&
+              deadlock_mvm::RecordingVisualShutdownStep(true, 0) ==
+                  deadlock_mvm::RecordingVisualShutdownAction::attempt_restore &&
+              deadlock_mvm::RecordingVisualShutdownStep(true, 2) ==
+                  deadlock_mvm::RecordingVisualShutdownAction::attempt_restore &&
+              deadlock_mvm::RecordingVisualShutdownStep(true, 3) ==
+                  deadlock_mvm::RecordingVisualShutdownAction::keep_module_resident,
+          "shutdown retries restore debt three times and keeps the module resident on permanent failure");
+    Check(deadlock_mvm::RecordingVisualShutdownStep(true, 3) ==
+                  deadlock_mvm::RecordingVisualShutdownAction::keep_module_resident &&
+              !deadlock_mvm::ShouldAttemptRecordingVisualRestore(true, false, 3499, 3000) &&
+              deadlock_mvm::ShouldAttemptRecordingVisualRestore(true, false, 4000, 3000) &&
+              deadlock_mvm::RecordingVisualShutdownStep(false, 3) ==
+                  deadlock_mvm::RecordingVisualShutdownAction::complete,
+          "resident restore pump retries after the bounded shutdown batch and can later complete");
+    Check(!deadlock_mvm::ShouldClearObservedRecordingVisualRestoreDebt(
+                  true, true, false, false) &&
+              !deadlock_mvm::ShouldClearObservedRecordingVisualRestoreDebt(
+                  true, false, true, true) &&
+              !deadlock_mvm::ShouldClearObservedRecordingVisualRestoreDebt(
+                  true, false, false, true) &&
+              deadlock_mvm::ShouldClearObservedRecordingVisualRestoreDebt(
+                  false, true, true, true) &&
+              deadlock_mvm::ShouldClearObservedRecordingVisualRestoreDebt(
+                  false, true, false, false),
+          "hard F9 and host-loss debt survives stale managed snapshots while soft debt yields to managed ownership");
+    const auto zero_render_profile_observed =
+        deadlock_mvm::ManagedSnapshotMayHaveRecordingVisualProfile(
+            true, false, true, false);
+    Check(zero_render_profile_observed &&
+              deadlock_mvm::ShouldRestoreRecordingVisualProfileOnHostLoss(
+                  zero_render_profile_observed, false, false, false) &&
+              deadlock_mvm::ShouldRestoreRecordingVisualProfileOnHostLoss(
+                  false, true, true, false) &&
+              deadlock_mvm::ShouldRestoreRecordingVisualProfileOnHostLoss(
+                  false, false, false, true),
+          "pipe-observed recording profiles require host-loss restore even before the first render frame");
+    Check(deadlock_mvm::IsExplicitRecordingVisualRecoveryAcknowledged(
+              41, 41, true, false, false) &&
+              !deadlock_mvm::IsExplicitRecordingVisualRecoveryAcknowledged(
+                  41, 40, true, false, false) &&
+              !deadlock_mvm::IsExplicitRecordingVisualRecoveryAcknowledged(
+                  41, 41, true, true, false) &&
+              !deadlock_mvm::IsExplicitRecordingVisualRecoveryAcknowledged(
+                  41, 41, true, false, true) &&
+              deadlock_mvm::IsRecordingVisualReassertAcknowledged(
+                  42, 42, false, false) &&
+              !deadlock_mvm::IsRecordingVisualReassertAcknowledged(
+                  42, 42, true, false),
+          "recording recovery generations require an exact stable managed acknowledgement");
+    Check(deadlock_mvm::CanRetireRecordingVisualRestoreAttempt(
+                  9, 9, false, false) &&
+              deadlock_mvm::CanRetireRecordingVisualRestoreAttempt(
+                  9, 9, true, true) &&
+              !deadlock_mvm::CanRetireRecordingVisualRestoreAttempt(
+                  9, 9, true, false) &&
+              !deadlock_mvm::CanRetireRecordingVisualRestoreAttempt(
+                  9, 10, false, false),
+          "new requests and disconnected logical recovery survive an older inverse completion");
 
     Check(ClampReplayTimelineTick(-50, 1000) == 0 &&
               ClampReplayTimelineTick(500, 1000) == 500 &&
@@ -79,17 +293,18 @@ void ProtocolTests() {
           "timeline pause button requests an explicit destination state");
     Check(!ShouldOfferPlayCinematic(0) && !ShouldOfferPlayCinematic(2) &&
               ShouldOfferPlayCinematic(3) && ShouldOfferPlayCinematic(128),
-          "timeline replaces Add Keyframe with Play Cinematic at three cameras");
+          "Play Cinematic becomes available at three cameras");
     Check(ShouldShowCampathPlacementList(true, 1) &&
               !ShouldShowCampathPlacementList(false, 1) &&
               !ShouldShowCampathPlacementList(true, 0),
           "left Campath mini menu appears only after a camera is placed");
-    Check(ShouldDrawCampathPlacementGuides(false, true, false, true) &&
-              !ShouldDrawCampathPlacementGuides(true, true, false, true) &&
-              !ShouldDrawCampathPlacementGuides(false, false, false, true) &&
-              !ShouldDrawCampathPlacementGuides(false, true, true, true) &&
-              !ShouldDrawCampathPlacementGuides(false, true, false, false),
-          "world camera and path guides hide for Clean Footage and cinematic playback");
+    Check(ShouldDrawCampathPlacementGuides(true, false, true, false, true) &&
+              !ShouldDrawCampathPlacementGuides(false, false, true, false, true) &&
+              !ShouldDrawCampathPlacementGuides(true, true, true, false, true) &&
+              !ShouldDrawCampathPlacementGuides(true, false, false, false, true) &&
+              !ShouldDrawCampathPlacementGuides(true, false, true, true, true) &&
+              !ShouldDrawCampathPlacementGuides(true, false, true, false, false),
+          "world camera and path guides require Movie UI and hide for Clean Footage or playback");
     Check(ReplayTimelineEditorOwnsKeyboard(true, true, true) &&
               !ReplayTimelineEditorOwnsKeyboard(false, true, true) &&
               !ReplayTimelineEditorOwnsKeyboard(true, false, true) &&
@@ -104,6 +319,11 @@ void ProtocolTests() {
               !ShouldQueuePendingReplaySeek(true, true, 0, 99, 100) &&
               ShouldQueuePendingReplaySeek(true, true, 0, 100, 100),
           "the first typed seek waits for fresh replay readiness and retries without another click");
+    Check(IsReplayUiActionSessionCurrent(true, 18, 18) &&
+              !IsReplayUiActionSessionCurrent(true, 18, 17) &&
+              !IsReplayUiActionSessionCurrent(false, 18, 18) &&
+              !IsReplayUiActionSessionCurrent(true, 0, 0),
+          "typed seek retries and timeline scrubs are fenced to their source replay session");
     Check(IsCinematicStartPromptReady(true, true, 3, 1002, 1000, 1000, true, false) &&
               !IsCinematicStartPromptReady(true, true, 2, 1000, 1000, 1000, true, false) &&
               !IsCinematicStartPromptReady(true, true, 3, 1003, 1000, 1000, true, false) &&
@@ -111,12 +331,12 @@ void ProtocolTests() {
               !IsCinematicStartPromptReady(true, true, 3, 1000, 1000, 1000, false, false) &&
               !IsCinematicStartPromptReady(true, true, 3, 1000, 1000, 1000, true, true),
           "cinematic Space prompt appears only at the first camera after protected preparation");
-    Check(HostTimescaleFromPercent(25.0) == 0.25 &&
-              HostTimescaleFromPercent(100.0) == 1.0 &&
-              HostTimescaleFromPercent(400.0) == 4.0 &&
-              HostTimescaleFromPercent(-20.0) == 0.01 &&
-              HostTimescaleFromPercent(5000.0) == 10.0,
-          "custom host timescale converts percentages and clamps to the supported engine range");
+    Check(PlaybackSpeedFromPercent(25.0) == 0.25 &&
+              PlaybackSpeedFromPercent(100.0) == 1.0 &&
+              PlaybackSpeedFromPercent(400.0) == 4.0 &&
+              PlaybackSpeedFromPercent(-20.0) == 0.01 &&
+              PlaybackSpeedFromPercent(5000.0) == 10.0,
+          "custom replay speed converts percentages and clamps to the supported engine range");
     Check(ShouldStartCinematicForSpaceEvent(true, true, true, false, false) &&
               !ShouldStartCinematicForSpaceEvent(true, false, true, false, false) &&
               !ShouldStartCinematicForSpaceEvent(true, true, true, true, false) &&
@@ -128,6 +348,19 @@ void ProtocolTests() {
               !ShouldShowReplayTimeline(true, false, true) &&
               !ShouldShowReplayTimeline(true, true, false),
           "mini timeline renders only for the active internal replay UI");
+    Check(ShouldHideEditorUiDuringCinematic(true, true) &&
+              !ShouldHideEditorUiDuringCinematic(false, true) &&
+              !ShouldHideEditorUiDuringCinematic(true, false),
+          "Hide UI removes editor surfaces only while the cinematic is rolling");
+    Check(!ShouldShowEditorUi(true, true, false) &&
+              ShouldShowEditorUi(true, true, true) &&
+              ShouldShowEditorUi(true, false, false) &&
+              !ShouldShowEditorUi(false, false, true),
+          "opening the interaction menu visibly overrides cinematic UI hiding");
+    Check(ShouldLockReplayTimelineInput(false, false) &&
+              ShouldLockReplayTimelineInput(true, true) &&
+              !ShouldLockReplayTimelineInput(true, false),
+          "timeline input locks while ticks update without closing the visible overlay");
     constexpr auto bottom_timeline = ComputeReplayTimelineGeometry(1920.0F, 1080.0F, 1.0F, false);
     Check(bottom_timeline.x == 600.0F && bottom_timeline.y == 968.0F &&
               bottom_timeline.width == 720.0F && bottom_timeline.height == 96.0F,
@@ -161,6 +394,7 @@ void ProtocolTests() {
     deadlock_mvm::SmvmActionQueue action_queue;
     deadlock_mvm::SmvmActionPayload queued_action{};
     queued_action.type = deadlock_mvm::SmvmActionType::toggle_replay_pause;
+    queued_action.replay_session_generation = 17;
     const auto first_generation = action_queue.Generation();
     Check(action_queue.TryPush(queued_action, first_generation), "editor action queues in its connection epoch");
     action_queue.Invalidate();
@@ -168,8 +402,10 @@ void ProtocolTests() {
     Check(!action_queue.TryPop(popped_action), "editor action does not survive connection invalidation");
     Check(!action_queue.TryPush(queued_action, first_generation), "stale producer epoch is rejected");
     const auto second_generation = action_queue.Generation();
+    queued_action.replay_session_generation = 18;
     Check(action_queue.TryPush(queued_action, second_generation) && action_queue.TryPop(popped_action) &&
-              popped_action.type == deadlock_mvm::SmvmActionType::toggle_replay_pause,
+              popped_action.type == deadlock_mvm::SmvmActionType::toggle_replay_pause &&
+              popped_action.replay_session_generation == 18,
           "current connection epoch still transfers editor actions");
 
     const auto ready_capture = deadlock_mvm::SmvmCaptureAvailability{
@@ -269,7 +505,50 @@ void ProtocolTests() {
           "slider fails back to the authoritative value after an unacknowledged edit");
 
     using namespace deadlock_mvm;
-    const MessageHeader valid{kProtocolMagic, kProtocolVersion, MessageType::get_status, 0, 7};
+
+    const auto rounded_tick_behind = InterpolatedReplayTick(
+        1000, 100, 999.51 * kSource2ReplayTickInterval, kSource2ReplayTickInterval);
+    const auto rounded_tick_ahead = InterpolatedReplayTick(
+        1000, 100, 1000.49 * kSource2ReplayTickInterval, kSource2ReplayTickInterval);
+    const auto next_rounded_tick = InterpolatedReplayTick(
+        1001, 100, 1000.51 * kSource2ReplayTickInterval, kSource2ReplayTickInterval);
+    Check(std::abs(rounded_tick_behind - 899.51) < 1e-9 &&
+              std::abs(rounded_tick_ahead - 900.49) < 1e-9 &&
+              std::abs(next_rounded_tick - 900.51) < 1e-9 &&
+              rounded_tick_behind < rounded_tick_ahead &&
+              rounded_tick_ahead < next_rounded_tick,
+          "render-time replay clock stays continuous across Deadlock's nearest-tick rounding");
+    Check(InterpolatedReplayTick(
+              1000, 100, std::numeric_limits<double>::quiet_NaN(),
+              kSource2ReplayTickInterval) == 900.0 &&
+              InterpolatedReplayTick(
+                  1000, 100, 1100.0 * kSource2ReplayTickInterval,
+                  kSource2ReplayTickInterval) == 900.0 &&
+              InterpolatedReplayTick(1000, 100, 1000.0 * kSource2ReplayTickInterval, 0.0) == 900.0 &&
+              InterpolatedReplayTick(
+                  1000, -1, 1000.5 * kSource2ReplayTickInterval,
+                  kSource2ReplayTickInterval) == -1.0,
+          "render-time replay clock fails closed for unavailable or incoherent clocks");
+    constexpr auto acceptance_replay_tick = 146926;
+    constexpr auto acceptance_offset = 7997;
+    constexpr auto acceptance_engine_tick = acceptance_replay_tick + acceptance_offset;
+    const auto acceptance_interval = static_cast<float>(kSource2ReplayTickInterval);
+    const auto quarter_curtime = static_cast<float>(
+        (acceptance_engine_tick + 0.25) * acceptance_interval);
+    const auto three_quarter_curtime = static_cast<float>(
+        (acceptance_engine_tick + 0.75) * acceptance_interval);
+    const auto acceptance_quarter = InterpolatedReplayTick(
+        acceptance_engine_tick, acceptance_offset, quarter_curtime, acceptance_interval);
+    const auto acceptance_three_quarter = InterpolatedReplayTick(
+        acceptance_engine_tick + 1, acceptance_offset, three_quarter_curtime,
+        acceptance_interval);
+    Check(acceptance_quarter >= acceptance_replay_tick + 0.20 &&
+              acceptance_quarter <= acceptance_replay_tick + 0.30 &&
+              acceptance_three_quarter > acceptance_quarter &&
+              acceptance_three_quarter >= acceptance_replay_tick + 0.70 &&
+              acceptance_three_quarter <= acceptance_replay_tick + 0.80,
+          "fractional replay clock stays monotonic with float globals at the acceptance replay length");
+    const MessageHeader valid{kProtocolMagic, kProtocolVersion, MessageType::get_status, 0, 7, 0};
     Check(ValidateHeader(valid), "valid header is accepted");
     auto bad = valid;
     bad.magic = 0;
@@ -280,13 +559,86 @@ void ProtocolTests() {
     bad = valid;
     bad.payload_size = static_cast<std::uint32_t>(kMaxMessageBytes + 1);
     Check(!ValidateHeader(bad), "oversized payload is rejected");
+    bad = valid;
+    bad.replay_session_generation = 0x8000000000000000ULL;
+    Check(!ValidateHeader(bad), "request replay generation must fit the signed managed domain");
+
+    Check(sizeof(MessageHeader) == 28 &&
+              offsetof(MessageHeader, replay_session_generation) == 20,
+          "SMVM v15 request headers append replay-session provenance");
+    Check(IsReplaySessionRequestCurrent(MessageType::set_camera_sample, 17, true, 17) &&
+              !IsReplaySessionRequestCurrent(MessageType::set_camera_sample, 17, true, 18) &&
+              !IsReplaySessionRequestCurrent(MessageType::set_camera_sample, 17, false, 0) &&
+              IsReplaySessionRequestCurrent(MessageType::set_camera_sample, 0, false, 0) &&
+              IsReplaySessionRequestCurrent(MessageType::get_status, 17, true, 18),
+          "replay-scoped camera requests require exact snapshot provenance while generation zero stays unscoped");
+    Check(IsReplayScopedCameraRequest(MessageType::enable_manual_camera) &&
+              IsReplayScopedCameraRequest(MessageType::disable_manual_camera) &&
+              IsReplayScopedCameraRequest(MessageType::set_campath_documents) &&
+              IsReplayScopedCameraRequest(MessageType::set_roll_override) &&
+              IsReplayScopedCameraRequest(MessageType::set_camera_sample) &&
+              IsReplayScopedCameraRequest(MessageType::set_campath) &&
+              IsReplayScopedCameraRequest(MessageType::clear_campath) &&
+              IsReplayScopedCameraRequest(MessageType::set_editor_campath) &&
+              IsReplayScopedCameraRequest(MessageType::clear_editor_campath) &&
+              IsReplayScopedCameraRequest(MessageType::enable_override) &&
+              IsReplayScopedCameraRequest(MessageType::disable_override) &&
+              IsReplayScopedCameraRequest(MessageType::prepare_camera_observation) &&
+              !IsReplayScopedCameraRequest(MessageType::update_smvm_snapshot) &&
+              !IsReplayScopedCameraRequest(MessageType::shutdown),
+          "camera-mutating and replay-document requests are replay-session scoped");
+
+    auto manual_camera_owned = true;
+    auto override_owned = true;
+    auto active_campath = true;
+    auto editor_campath = true;
+    auto campath_documents = true;
+    auto cinematic_armed = true;
+    const auto invalidated = InvalidateReplaySessionStateIfChanged(
+        true,
+        17,
+        18,
+        [&]() {
+            manual_camera_owned = false;
+            override_owned = false;
+            active_campath = false;
+        },
+        [&]() { editor_campath = false; },
+        [&]() { campath_documents = false; },
+        [&]() { cinematic_armed = false; });
+    Check(invalidated && !manual_camera_owned && !override_owned && !active_campath &&
+              !editor_campath && !campath_documents && !cinematic_armed,
+          "same-pipe replay replacement synchronously invalidates all replay-A resident state");
+
+    auto unchanged_callbacks = 0;
+    const auto unchanged = InvalidateReplaySessionStateIfChanged(
+        true,
+        18,
+        18,
+        [&]() { ++unchanged_callbacks; },
+        [&]() { ++unchanged_callbacks; },
+        [&]() { ++unchanged_callbacks; },
+        [&]() { ++unchanged_callbacks; });
+    const auto first_snapshot = InvalidateReplaySessionStateIfChanged(
+        false,
+        0,
+        18,
+        [&]() { ++unchanged_callbacks; },
+        [&]() { ++unchanged_callbacks; },
+        [&]() { ++unchanged_callbacks; },
+        [&]() { ++unchanged_callbacks; });
+    Check(!unchanged && !first_snapshot && unchanged_callbacks == 0,
+          "same generation and first snapshot publication preserve current resident state");
 
     Check(ExpectedPayloadSize(MessageType::set_camera_sample) == sizeof(CameraSample),
           "sample payload size is fixed");
     Check(ExpectedPayloadSize(MessageType::get_status) == 0, "status request has no payload");
     Check(sizeof(HeartbeatPayload) == 24, "heartbeat carries the replay clock calibration");
-    Check(sizeof(SmvmSnapshotPayload) == 728 && sizeof(StatusPayload) == 264,
-          "SMVM v10 snapshot and status layouts are fixed");
+    Check(sizeof(SmvmSnapshotPayload) == 744 &&
+              offsetof(SmvmSnapshotPayload, recording_profile_ack_generation) == 728 &&
+              offsetof(SmvmSnapshotPayload, replay_session_generation) == 736 &&
+              sizeof(StatusPayload) == 272,
+          "SMVM v15 snapshot v9 and status layouts are fixed");
     Check(ExpectedPayloadSize(MessageType::set_roll_override) == sizeof(RollPayload),
           "roll override payload is one narrowly typed value");
     Check(ValidatePayloadSize(MessageType::prepare_camera_observation, 0),
@@ -304,7 +656,9 @@ void ProtocolTests() {
           "fixed SMVM snapshot payload is accepted");
 
     SmvmSnapshotPayload snapshot{};
-    snapshot.snapshot_version = 6;
+    snapshot.snapshot_version = 9;
+    snapshot.recording_profile_ack_generation = 0x1020304050607080ULL;
+    snapshot.replay_session_generation = 17;
     snapshot.current_tick = -1;
     snapshot.total_ticks = -1;
     snapshot.timescale = 1.0;
@@ -335,9 +689,22 @@ void ProtocolTests() {
     Check(snapshot.roll_left_key == 'Z' && snapshot.roll_right_key == 'C' &&
               snapshot.roll_reset_key == 'R',
           "owner Z/C/R roll bindings survive native snapshot validation exactly");
+    snapshot.flags = smvm_snapshot_replay_seek_in_progress;
+    Check(ValidateSmvmSnapshotPayload(snapshot),
+          "typed replay-seek transition flag is accepted without changing snapshot layout");
+    snapshot.flags = smvm_snapshot_recording_profile_restore_pending;
+    Check(ValidateSmvmSnapshotPayload(snapshot),
+          "typed recording-profile restore debt is accepted without changing snapshot layout");
+    snapshot.flags = smvm_snapshot_recording_profile_transaction_in_progress;
+    Check(ValidateSmvmSnapshotPayload(snapshot),
+          "typed recording-profile apply transaction is accepted without changing snapshot layout");
     snapshot.flags = 1u << 31;
     Check(!ValidateSmvmSnapshotPayload(snapshot), "unknown SMVM snapshot flags fail closed");
     snapshot.flags = 0;
+    snapshot.recording_profile_ack_generation = 0x8000000000000000ULL;
+    Check(!ValidateSmvmSnapshotPayload(snapshot),
+          "recording recovery acknowledgement must fit the signed action generation");
+    snapshot.recording_profile_ack_generation = 0x1020304050607080ULL;
     snapshot.add_key = 0xDEADBEEFu;
     Check(!ValidateSmvmSnapshotPayload(snapshot), "invalid SMVM input encoding is rejected");
     snapshot.add_key = 1u << 16;
@@ -525,6 +892,10 @@ void ProtocolTests() {
               CanConsumeFreeCameraInput(false, true, true, mouse_missing) &&
               !CanConsumeFreeCameraMouseInput(false, true, true, mouse_missing),
           "paused Free Camera consumes keyboard motion while unavailable mouse input stays gated");
+    Check(!CanConsumeFreeCameraInput(false, true, true, all_ready, true) &&
+              !CanConsumeFreeCameraKeyboardInput(false, true, true, all_ready, true) &&
+              !CanConsumeFreeCameraMouseInput(false, true, true, all_ready, true),
+          "Free Camera motion is frozen across replay seek and camera rebase work");
     Check(ResolveManualCameraShortcut(true, false, false, true, false, false, false) ==
               ManualCameraShortcutAction::enter_or_reacquire &&
               ResolveManualCameraShortcut(true, false, false, true, false, true, false) ==
@@ -681,14 +1052,14 @@ void ProtocolTests() {
         {260, {180, 140, 50, -10, 45, 20, 50}},
         {500, {260, 160, 100, 0, 90, 0, 70}},
     }};
-    const auto evaluate_tick = [&cinematic_path](const std::int64_t tick) {
+    const auto evaluate_tick = [&cinematic_path](const double tick) {
         auto segment = 0u;
         while (segment + 2 < cinematic_path.size() &&
                tick > cinematic_path[segment + 1].demo_tick)
             ++segment;
         const auto span = cinematic_path[segment + 1].demo_tick -
                           cinematic_path[segment].demo_tick;
-        const auto amount = static_cast<double>(tick - cinematic_path[segment].demo_tick) /
+        const auto amount = (tick - static_cast<double>(cinematic_path[segment].demo_tick)) /
                             static_cast<double>(span);
         return EvaluateCampathCamera(
             cinematic_path.data(),
@@ -701,6 +1072,16 @@ void ProtocolTests() {
     const auto before_key = evaluate_tick(259);
     const auto at_key = evaluate_tick(260);
     const auto after_key = evaluate_tick(261);
+    const auto at_whole_render_tick = evaluate_tick(100.0);
+    const auto at_half_render_tick = evaluate_tick(100.5);
+    const auto at_next_render_tick = evaluate_tick(101.0);
+    Check(std::hypot(
+              at_half_render_tick.x - at_whole_render_tick.x,
+              at_half_render_tick.y - at_whole_render_tick.y) > 0.01 &&
+              std::hypot(
+                  at_next_render_tick.x - at_half_render_tick.x,
+                  at_next_render_tick.y - at_half_render_tick.y) > 0.01,
+          "Campath evaluation advances between integer demo ticks");
     const auto incoming_x = at_key.x - before_key.x;
     const auto outgoing_x = after_key.x - at_key.x;
     const auto incoming_y = at_key.y - before_key.y;

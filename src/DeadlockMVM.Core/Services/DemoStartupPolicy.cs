@@ -1,13 +1,15 @@
 namespace DeadlockMVM.Core.Services;
 
 public readonly record struct DemoStartupObservation(
+    bool Connected,
     bool ReplayActive,
     string ReplayIdentity,
     bool Paused,
     bool HudHidden,
     bool NativeConnected,
     bool ReplayClockReady,
-    bool FreeCameraEstablished);
+    bool FreeCameraEstablished,
+    bool ReplayTelemetryAuthoritative = true);
 
 public readonly record struct DemoStartupDirectives(
     int Generation,
@@ -41,18 +43,26 @@ public sealed class DemoStartupPolicy
     private bool _cameraCompleted;
     private bool _cameraAttemptInFlight;
     private bool _ownerOverrodeStartup;
+    private string? _pendingOwnerOverrideIdentity;
+    private bool _ownerOverridePendingForNextSession;
     private DateTimeOffset _pauseRetryAfter = DateTimeOffset.MinValue;
     private DateTimeOffset _hudRetryAfter = DateTimeOffset.MinValue;
     private DateTimeOffset _cameraRetryAfter = DateTimeOffset.MinValue;
 
-    public static string CreateReplayIdentity(string replayName, long? totalTicks)
+    public static string CreateReplayIdentity(
+        string replayName,
+        long? totalTicks,
+        long replaySessionGeneration = 0)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(replayName);
         _ = totalTicks;
         // Total ticks are normally learned after the name. Including that
         // late-arriving value would falsely create a second startup session
         // and could pause again after the owner has already pressed Resume.
-        return replayName.Trim();
+        var normalizedName = replayName.Trim();
+        return replaySessionGeneration > 0
+            ? $"{replaySessionGeneration}:{normalizedName}"
+            : normalizedName;
     }
 
     public DemoStartupDirectives Observe(
@@ -61,6 +71,13 @@ public sealed class DemoStartupPolicy
     {
         lock (_gate)
         {
+            // A transient command-channel outage or the connected-but-empty
+            // post-marker discovery window does not prove that the demo ended.
+            // Preserve the same-demo session and every owner override until
+            // live replay telemetry is authoritative again.
+            if (!observation.Connected || !observation.ReplayTelemetryAuthoritative)
+                return new DemoStartupDirectives(_generation, false, false, false);
+
             if (!observation.ReplayActive || string.IsNullOrWhiteSpace(observation.ReplayIdentity))
             {
                 ResetSession();
@@ -69,6 +86,15 @@ public sealed class DemoStartupPolicy
 
             if (!string.Equals(_replayIdentity, observation.ReplayIdentity, StringComparison.Ordinal))
                 BeginSession(observation.ReplayIdentity);
+            else if (_ownerOverridePendingForNextSession)
+            {
+                // Provisional telemetry resolved back to the current replay.
+                // Consume the wildcard here so it cannot suppress a later,
+                // genuinely new demo after already protecting this session.
+                _ownerOverrodeStartup = true;
+                _ownerOverridePendingForNextSession = false;
+                _pendingOwnerOverrideIdentity = null;
+            }
 
             if (_ownerOverrodeStartup)
                 return new DemoStartupDirectives(_generation, false, false, false);
@@ -89,7 +115,7 @@ public sealed class DemoStartupPolicy
             }
 
             var hideHud = false;
-            if (!_hudCompleted && !_hudAttemptInFlight &&
+            if (observation.NativeConnected && !_hudCompleted && !_hudAttemptInFlight &&
                 _hudAttempts < MaxHudAttempts && now >= _hudRetryAfter)
             {
                 hideHud = true;
@@ -164,20 +190,81 @@ public sealed class DemoStartupPolicy
                 !_ownerOverrodeStartup;
     }
 
-    public void MarkOwnerOverride()
+    /// <summary>
+    /// Binds an explicit owner choice to the replay visible at input ingress.
+    /// The coordinator can observe a new replay/process before this policy's
+    /// dispatcher pass begins that session, so a mismatched identity is retained
+    /// for the next BeginSession instead of being applied to the old session.
+    /// A null identity during provisional telemetry targets the current session,
+    /// or the next session when a process reset has already cleared it.
+    /// </summary>
+    public void MarkOwnerOverride(
+        string? replayIdentity = null,
+        bool scopeToNextObservedSession = false)
     {
         lock (_gate)
         {
-            if (_replayIdentity is null)
+            var targetIdentity = string.IsNullOrWhiteSpace(replayIdentity)
+                ? null
+                : replayIdentity.Trim();
+            if (scopeToNextObservedSession)
+            {
+                _ownerOverridePendingForNextSession = true;
+                if (_replayIdentity is not null)
+                {
+                    _ownerOverrodeStartup = true;
+                    _hudAttemptInFlight = false;
+                    _cameraAttemptInFlight = false;
+                }
                 return;
-            _ownerOverrodeStartup = true;
-            _hudAttemptInFlight = false;
-            _cameraAttemptInFlight = false;
+            }
+
+            if (_replayIdentity is not null &&
+                (targetIdentity is null || string.Equals(
+                    _replayIdentity,
+                    targetIdentity,
+                    StringComparison.Ordinal)))
+            {
+                _ownerOverrodeStartup = true;
+                _hudAttemptInFlight = false;
+                _cameraAttemptInFlight = false;
+                return;
+            }
+
+            if (_replayIdentity is null)
+                _ownerOverridePendingForNextSession = true;
+            else if (targetIdentity is not null)
+            {
+                _pendingOwnerOverrideIdentity = targetIdentity;
+                // The owner acted on an authoritative replacement before its
+                // dispatcher pass began that session. Retain the target for the
+                // replacement and immediately retire every directive from the
+                // old session so it cannot cross the boundary behind the input.
+                _ownerOverrodeStartup = true;
+                _hudAttemptInFlight = false;
+                _cameraAttemptInFlight = false;
+            }
         }
+    }
+
+    /// <summary>
+    /// A new Deadlock process is a new physical demo session even when it loads
+    /// the same replay file. Retire prior owner overrides and startup completion;
+    /// transient same-process transport reconnects must not call this.
+    /// </summary>
+    public void ResetForNewProcess()
+    {
+        lock (_gate)
+            ResetSession();
     }
 
     private void BeginSession(string replayIdentity)
     {
+        var ownerOverridePending = _ownerOverridePendingForNextSession ||
+            string.Equals(
+                _pendingOwnerOverrideIdentity,
+                replayIdentity,
+                StringComparison.Ordinal);
         _generation++;
         _replayIdentity = replayIdentity;
         _pauseAttempts = 0;
@@ -188,7 +275,9 @@ public sealed class DemoStartupPolicy
         _hudAttemptInFlight = false;
         _cameraCompleted = false;
         _cameraAttemptInFlight = false;
-        _ownerOverrodeStartup = false;
+        _ownerOverrodeStartup = ownerOverridePending;
+        _pendingOwnerOverrideIdentity = null;
+        _ownerOverridePendingForNextSession = false;
         _pauseRetryAfter = DateTimeOffset.MinValue;
         _hudRetryAfter = DateTimeOffset.MinValue;
         _cameraRetryAfter = DateTimeOffset.MinValue;
@@ -208,6 +297,8 @@ public sealed class DemoStartupPolicy
         _cameraCompleted = false;
         _cameraAttemptInFlight = false;
         _ownerOverrodeStartup = false;
+        _pendingOwnerOverrideIdentity = null;
+        _ownerOverridePendingForNextSession = false;
         _pauseRetryAfter = DateTimeOffset.MinValue;
         _hudRetryAfter = DateTimeOffset.MinValue;
         _cameraRetryAfter = DateTimeOffset.MinValue;

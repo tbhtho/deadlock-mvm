@@ -25,7 +25,9 @@ struct SmvmOverlayCallbacks final {
     // when none was received or the last copy is stale.
     bool (*read_campath_documents)(void* context, CampathDocumentsPayload& documents) noexcept{};
     bool (*queue_action)(void* context, const SmvmActionPayload& action) noexcept{};
-    void (*request_camera_capture)(void* context) noexcept{};
+    void (*request_camera_capture)(
+        void* context,
+        std::uint64_t replay_session_generation) noexcept{};
     void (*publish_status)(
         void* context,
         SmvmRendererBackend backend,
@@ -60,6 +62,20 @@ bool StopSmvmOverlay() noexcept;
     const SmvmSnapshotPayload& snapshot,
     SmvmManualInputFrame& frame) noexcept;
 void ResetSmvmManualInput() noexcept;
+// Mirrors presentation state as soon as the pipe receives a validated managed
+// snapshot, even when no renderer frame has been observed yet.
+void ObserveSmvmRecordingVisualSnapshot(const SmvmSnapshotPayload& snapshot) noexcept;
+// Fail-closed host-loss route. Physical restore retries without Present, while
+// generation-tagged F9/reconnect intent survives until the managed owner
+// acknowledges the complete inverse or forward profile transaction.
+void NotifySmvmHostDisconnected() noexcept;
+// If shutdown cannot restore the presentation while VConsole is unavailable,
+// the resident backend calls this renderer-independent pump until a later
+// retry succeeds. The DLL remains loaded throughout that fail-closed state.
+void PumpSmvmOverlayResidentRecovery() noexcept;
+// Invalidates replay-owned prompt/input state before a replacement replay
+// snapshot becomes visible on the same native pipe.
+void InvalidateSmvmReplaySessionState() noexcept;
 // Re-runs only the Free Camera pointer acquisition path. Camera transform,
 // FOV, Roll, and camera ownership remain untouched.
 void SmvmReacquireFreeCameraInput() noexcept;

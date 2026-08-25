@@ -8,6 +8,45 @@
 
 namespace deadlock_mvm {
 
+constexpr double kSource2ReplayTickInterval = 1.0 / 64.0;
+
+// Source 2 publishes camera time as a fractional render-time value while the
+// replay position used for document keys is an integer tick. Derive only the
+// bounded sub-tick fraction here; if the two clocks do not agree, fail closed
+// to the authoritative integer tick instead of inventing camera time.
+[[nodiscard]] inline double InterpolatedReplayTick(
+    const std::int64_t engine_tick,
+    const std::int64_t game_tick_offset,
+    const double engine_curtime,
+    const double interval_per_tick) noexcept {
+    if (game_tick_offset < 0)
+        return -1.0;
+    const auto integer_replay_tick = static_cast<double>(engine_tick - game_tick_offset);
+    if (!std::isfinite(engine_curtime) || !std::isfinite(interval_per_tick) ||
+        interval_per_tick <= 0.0)
+        return integer_replay_tick;
+    const auto continuous_engine_tick = engine_curtime / interval_per_tick;
+    const auto rounded_tick_residual =
+        continuous_engine_tick - static_cast<double>(engine_tick);
+    // Deadlock's camera path rounds curtime/interval to the nearest integer
+    // tick, so a coherent continuous clock legitimately spans roughly
+    // [-0.5, +0.5) around engine_tick. Keep a small float-precision margin.
+    if (!std::isfinite(continuous_engine_tick) ||
+        rounded_tick_residual < -0.75 || rounded_tick_residual > 0.75)
+        return integer_replay_tick;
+    return continuous_engine_tick - static_cast<double>(game_tick_offset);
+}
+
+// Campath evaluation and completion must share the same continuous Source 2
+// clock. The integer replay tick is nearest-rounded and can reach the final
+// document tick almost half a render tick before the final camera sample.
+[[nodiscard]] inline bool HasReachedCampathEnd(
+    const double evaluated_tick,
+    const std::int64_t end_tick) noexcept {
+    return std::isfinite(evaluated_tick) &&
+           evaluated_tick >= static_cast<double>(end_tick);
+}
+
 [[nodiscard]] inline double LerpValue(const double from, const double to, const double amount) noexcept {
     return from + ((to - from) * amount);
 }

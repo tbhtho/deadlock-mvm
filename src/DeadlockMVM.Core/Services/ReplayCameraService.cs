@@ -84,24 +84,52 @@ public sealed class ReplayCameraService : ICameraService
     /// entering roam does not visibly move the camera. If the transform cannot
     /// be read, a bare spec_mode 6 is sent as a best-effort fallback.
     /// </summary>
-    public async Task<CameraState?> EnterFreeRoamAsync(CancellationToken cancellationToken = default)
+    public Task<CameraState?> EnterFreeRoamAsync(CancellationToken cancellationToken = default) =>
+        EnterFreeRoamCoreAsync(
+            static effect =>
+            {
+                effect();
+                return true;
+            },
+            cancellationToken);
+
+    public Task<CameraState?> EnterFreeRoamIfCurrentAsync(
+        Func<Action, bool> runIfCurrent,
+        CancellationToken cancellationToken = default)
     {
-        EnsureConnected();
-        Send(CameraCommands.DisableAutoDirector);
+        ArgumentNullException.ThrowIfNull(runIfCurrent);
+        return EnterFreeRoamCoreAsync(runIfCurrent, cancellationToken);
+    }
+
+    private async Task<CameraState?> EnterFreeRoamCoreAsync(
+        Func<Action, bool> runIfCurrent,
+        CancellationToken cancellationToken)
+    {
+        if (!runIfCurrent(() =>
+            {
+                EnsureConnected();
+                Send(CameraCommands.DisableAutoDirector);
+            }))
+            throw new InvalidOperationException("Replay changed before Free Roam could be entered.");
 
         var state = await ReadTransformAsync(cancellationToken).ConfigureAwait(false);
-        if (state?.ActiveTransform is { } transform)
-        {
-            var height = state.CameraHeight ?? 63;
-            Send(CameraCommands.MoveRoamTarget(transform.X, transform.Y, transform.Z - height));
-        }
-        else
-        {
-            Send(CameraCommands.FreeRoam);
-        }
+        if (!runIfCurrent(() =>
+            {
+                EnsureConnected();
+                if (state?.ActiveTransform is { } transform)
+                {
+                    var height = state.CameraHeight ?? 63;
+                    Send(CameraCommands.MoveRoamTarget(transform.X, transform.Y, transform.Z - height));
+                }
+                else
+                {
+                    Send(CameraCommands.FreeRoam);
+                }
 
-        // Roaming has no follow target; the engine drops it on roam entry.
-        TrackSelection(new SpectatorSelection { Mode = SpecCameraMode.FreeRoam });
+                // Roaming has no follow target; the engine drops it on roam entry.
+                TrackSelection(new SpectatorSelection { Mode = SpecCameraMode.FreeRoam });
+            }))
+            throw new InvalidOperationException("Replay changed while Free Roam was being entered.");
         return state;
     }
 

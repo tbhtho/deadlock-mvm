@@ -22,11 +22,18 @@ public sealed record ReplayState
     public int? TotalTicks { get; init; }
 
     /// <summary>
-    /// Last host_timescale commanded through MVM. This is surfaced immediately
-    /// as commanded state rather than waiting for a console query round trip.
+    /// Last known demo_timescale. The canonical requested value is surfaced
+    /// immediately and replaced by engine readback when the console reports it.
     /// </summary>
     public double? Timescale { get; init; }
 
     /// <summary>Demo file name as reported by the engine (e.g. "replays/75438101-6448.dem").</summary>
     public string? ReplayName { get; init; }
+
+    /// <summary>
+    /// Monotonic controller-local demo-load generation. Unlike file name and
+    /// total ticks, this advances when Source reports a real same-file reload.
+    /// It survives transient VConsole reconnects within that replay session.
+    /// </summary>
+    public long ReplaySessionGeneration { get; init; }
 }
