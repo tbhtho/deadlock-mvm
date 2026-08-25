@@ -10,7 +10,7 @@ public readonly record struct DemoStartupObservation(
     bool ReplayClockReady,
     bool FreeCameraEstablished,
     bool ReplayTelemetryAuthoritative = true,
-    bool PlaybackHostActive = true);
+    bool PlaybackSceneReady = true);
 
 public readonly record struct DemoStartupDirectives(
     int Generation,
@@ -44,6 +44,8 @@ public sealed class DemoStartupPolicy
     private bool _cameraCompleted;
     private bool _cameraAttemptInFlight;
     private bool _ownerOverrodeStartup;
+    private bool _sceneReadyObserved;
+    private bool _sceneWasObservedUnready;
     private string? _pendingOwnerOverrideIdentity;
     private bool _ownerOverridePendingForNextSession;
     private DateTimeOffset _pauseRetryAfter = DateTimeOffset.MinValue;
@@ -100,12 +102,28 @@ public sealed class DemoStartupPolicy
             if (_ownerOverrodeStartup)
                 return new DemoStartupDirectives(_generation, false, false, false);
 
-            if (observation.Paused)
-                _pauseCompleted = true;
-            if (observation.HudHidden)
-                _hudCompleted = true;
-            if (observation.FreeCameraEstablished)
-                _cameraCompleted = true;
+            // Position/pause telemetry can become authoritative while Deadlock
+            // is still loading the map. Do not consume attempts or accept those
+            // provisional completion values until the live render camera exists.
+            if (!observation.PlaybackSceneReady)
+            {
+                if (!_sceneReadyObserved)
+                    _sceneWasObservedUnready = true;
+                return new DemoStartupDirectives(_generation, false, false, false);
+            }
+
+            var sceneBecameReadyAfterLoading =
+                !_sceneReadyObserved && _sceneWasObservedUnready;
+            _sceneReadyObserved = true;
+            if (!sceneBecameReadyAfterLoading)
+            {
+                if (observation.Paused)
+                    _pauseCompleted = true;
+                if (observation.HudHidden)
+                    _hudCompleted = true;
+                if (observation.FreeCameraEstablished)
+                    _cameraCompleted = true;
+            }
 
             var pause = false;
             if (!_pauseCompleted && _pauseAttempts < MaxPauseAttempts && now >= _pauseRetryAfter)
@@ -125,8 +143,7 @@ public sealed class DemoStartupPolicy
             }
 
             var enterFreeCamera = false;
-            if (_pauseCompleted && observation.PlaybackHostActive &&
-                observation.NativeConnected && observation.ReplayClockReady &&
+            if (_pauseCompleted && observation.NativeConnected && observation.ReplayClockReady &&
                 !_cameraCompleted && !_cameraAttemptInFlight &&
                 _cameraAttempts < MaxCameraAttempts && now >= _cameraRetryAfter)
             {
@@ -278,6 +295,8 @@ public sealed class DemoStartupPolicy
         _cameraCompleted = false;
         _cameraAttemptInFlight = false;
         _ownerOverrodeStartup = ownerOverridePending;
+        _sceneReadyObserved = false;
+        _sceneWasObservedUnready = false;
         _pendingOwnerOverrideIdentity = null;
         _ownerOverridePendingForNextSession = false;
         _pauseRetryAfter = DateTimeOffset.MinValue;
@@ -299,6 +318,8 @@ public sealed class DemoStartupPolicy
         _cameraCompleted = false;
         _cameraAttemptInFlight = false;
         _ownerOverrodeStartup = false;
+        _sceneReadyObserved = false;
+        _sceneWasObservedUnready = false;
         _pendingOwnerOverrideIdentity = null;
         _ownerOverridePendingForNextSession = false;
         _pauseRetryAfter = DateTimeOffset.MinValue;

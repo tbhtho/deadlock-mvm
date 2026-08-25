@@ -60,11 +60,6 @@ public sealed partial class ReplayStateParser
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex DemoPlaybackStartedLine();
 
-    [GeneratedRegex(
-        @"\[HostStateManager\]\s+Host activate:\s+Playing Demo(?:\s+\([^\r\n)]*\))?",
-        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
-    private static partial Regex DemoHostActivatedLine();
-
     [GeneratedRegex(@"demo_timescale\s*=\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)")]
     private static partial Regex DemoTimescaleLine();
 
@@ -88,9 +83,6 @@ public sealed partial class ReplayStateParser
     {
         if (string.IsNullOrEmpty(line))
             return null;
-
-        if (DemoHostActivatedLine().IsMatch(line))
-            return new ReplayState { PlaybackHostActive = true };
 
         var position = PositionLine().Match(line);
         if (position.Success)

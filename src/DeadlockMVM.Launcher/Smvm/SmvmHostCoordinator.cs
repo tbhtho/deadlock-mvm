@@ -92,6 +92,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         _native.SmvmSnapshotProvider = CreateSnapshot;
         _native.SmvmActionReceived += OnActionReceived;
         _native.StatusChanged += OnNativeStatusChanged;
+        _camera.CapabilitiesChanged += OnCameraCapabilitiesChanged;
         _campath.EditorStateChanged += OnEditorStateChanged;
         _native.CampathStateChanged += OnCampathStateChanged;
         _controller.StateChanged += OnReplayStateChanged;
@@ -282,10 +283,17 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
             () => _ = CoordinateAfterNativeStatusAsync(connectionBecameLive));
     }
 
+    private void OnCameraCapabilitiesChanged(object? sender, EventArgs e)
+    {
+        if (Volatile.Read(ref _stopping) != 0)
+            return;
+        BeginInvokeIsolated(() => _ = CoordinateDemoStartupAsync(_controller.State));
+    }
+
     private async Task CoordinateAfterNativeStatusAsync(bool connectionBecameLive)
     {
         var processBoundaryEpoch = Volatile.Read(ref _processBoundaryEpoch);
-        if (connectionBecameLive &&
+        if (connectionBecameLive && IsPlaybackSceneReady() &&
             Volatile.Read(ref _processProfileReassertPending) == 0)
         {
             // TryConnect publishes only after native acknowledged the first
@@ -345,7 +353,8 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         lock (_processBoundaryGate)
         {
             if (!IsProcessBoundaryCurrent(processBoundaryEpoch) ||
-                !HasAuthoritativeReplayTelemetry(replay))
+                !HasAuthoritativeReplayTelemetry(replay) ||
+                !IsPlaybackSceneReady())
             {
                 return;
             }
@@ -420,7 +429,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         // A replacement Deadlock process starts with fresh HUD/cvar state.
         // Reassert only after both its marker-fenced telemetry and native pipe
         // are authoritative; retain the debt if either side arrives first.
-        if (_native.Connected &&
+        if (_native.Connected && IsPlaybackSceneReady() &&
             Interlocked.CompareExchange(ref _processProfileReassertPending, 0, 1) == 1)
         {
             var reasserted = await ReassertMovieUiWithConnectionLeaseAsync(
@@ -435,6 +444,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         }
 
         var replayActive = IsReplayActive(replay);
+        var playbackSceneReady = replayActive && IsPlaybackSceneReady();
         if (!replay.Connected)
         {
             // ReplayState.Empty is also the transient VConsole-disconnect
@@ -471,7 +481,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                 replay.ReplaySessionGeneration)
             : string.Empty;
         var presentation = _deadlockUi.ProfileStatus;
-        if (replayTelemetryAuthoritative && replayActive &&
+        if (replayTelemetryAuthoritative && replayActive && playbackSceneReady &&
             presentation.ShouldRetryForwardProfile)
         {
             var forwardLease = CaptureForwardPresentationLease();
@@ -505,7 +515,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                     _controller.GameTickOffset is not null,
                     _native.ManualCameraEstablished,
                     replayTelemetryAuthoritative,
-                    replay.PlaybackHostActive),
+                    playbackSceneReady),
                 DateTimeOffset.UtcNow);
         }
 
@@ -529,6 +539,9 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
             }
             return;
         }
+
+        if (!playbackSceneReady)
+            return;
 
         // Establish the owner's 100% demo-playback baseline once for every
         // newly observed replay, then leave later custom choices alone for
@@ -733,6 +746,9 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
     private static bool HasAuthoritativeReplayTelemetry(ReplayState replay) =>
         replay.Connected && !string.IsNullOrWhiteSpace(replay.ReplayName) &&
         replay.CurrentTick is not null;
+
+    private bool IsPlaybackSceneReady() =>
+        _camera is CompositeCameraService { NativeStatus.Attached: true };
 
     private EditorSnapshot ReadEditorSnapshot()
     {
@@ -2378,6 +2394,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
             return;
         _native.SmvmActionReceived -= OnActionReceived;
         _native.StatusChanged -= OnNativeStatusChanged;
+        _camera.CapabilitiesChanged -= OnCameraCapabilitiesChanged;
         _native.SmvmSnapshotProvider = null;
         _campath.EditorStateChanged -= OnEditorStateChanged;
         _native.CampathStateChanged -= OnCampathStateChanged;
