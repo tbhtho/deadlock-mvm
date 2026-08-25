@@ -1007,6 +1007,10 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                     {
                         ThrowIfQueuedActionLeaseExpired();
                         await EnterFreeRoamForCurrentOperationAsync(cancellationToken).ConfigureAwait(false);
+                        await SynchronizeObserverOriginAfterSeekAsync(
+                            path.Keyframes[0].Camera,
+                            cancellationToken,
+                            ownershipEpoch).ConfigureAwait(false);
                     }
                     catch (Exception ex) when (ex is not OperationCanceledException)
                     {
@@ -1196,6 +1200,10 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
             ThrowIfQueuedActionLeaseExpired();
             await EnterFreeRoamForCurrentOperationAsync(cancellationToken).ConfigureAwait(false);
+            await SynchronizeObserverOriginAfterSeekAsync(
+                keyframe.Camera,
+                cancellationToken,
+                ownershipEpoch).ConfigureAwait(false);
             // EnterFreeRoamAsync completes from authoritative spectator state, but
             // the renderer camera can still be between observer instances for a
             // few frames after demo_gototick. Prove that the post-seek instance is
@@ -1329,6 +1337,10 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                         "Replay seek landed after an explicit SMVM Free Camera exit; camera ownership will remain released.");
                 ThrowIfQueuedActionLeaseExpired();
                 await EnterFreeRoamForCurrentOperationAsync(cancellationToken).ConfigureAwait(false);
+                await SynchronizeObserverOriginAfterSeekAsync(
+                    baseline,
+                    cancellationToken,
+                    ownershipEpoch).ConfigureAwait(false);
                 var manualGateStatus = await SendHeartbeatAsync(manualClient, cancellationToken).ConfigureAwait(false);
                 manualGateStatus = await WaitForNativeAsync(
                     manualClient,
@@ -1408,6 +1420,10 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             {
                 ThrowIfQueuedActionLeaseExpired();
                 await EnterFreeRoamForCurrentOperationAsync(cancellationToken).ConfigureAwait(false);
+                await SynchronizeObserverOriginAfterSeekAsync(
+                    path.Evaluate(landed),
+                    cancellationToken,
+                    ownershipEpoch).ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -1623,6 +1639,70 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         status = await client.ClearCampathAsync(cancellationToken).ConfigureAwait(false);
         UpdateStatus(status);
         return status;
+    }
+
+    /// <summary>
+    /// A demo seek rebuilds Deadlock's observer instance at an engine-owned
+    /// position. Re-applying only SMVM's rendered sample would leave that hidden
+    /// observer origin behind, so Source 2 could stream/cull from one location
+    /// while the owner sees another. Drive the authoritative roaming target to
+    /// the shot before native rendering resumes; the existing seek transfer flag
+    /// keeps input held and the UPDATING TICKS prompt visible for the full settle.
+    /// </summary>
+    private async Task SynchronizeObserverOriginAfterSeekAsync(
+        CameraSample renderedSample,
+        CancellationToken cancellationToken,
+        long ownershipEpoch)
+    {
+        ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
+        CameraState? settled;
+        try
+        {
+            settled = await _camera.GoToPositionAsync(
+                renderedSample.X,
+                renderedSample.Y,
+                renderedSample.Z,
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // A collision or transient getpos failure must not destroy a valid
+            // replay landing. Preserve the existing exact rendered-camera
+            // restore and surface the degraded visibility synchronization.
+            _log.Warn(
+                $"Native camera: post-seek observer-origin synchronization was unavailable: {ex.Message}");
+            return;
+        }
+
+        // Do not let an explicit Free Camera exit that happened during the
+        // engine glide fall through into a stale native re-arm.
+        ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
+        if (settled?.ActiveTransform is not { } observer)
+        {
+            _log.Warn(
+                "Native camera: Deadlock did not report an observer-origin landing after seek; " +
+                "the rendered shot will still be restored.");
+            return;
+        }
+
+        var dx = observer.X - renderedSample.X;
+        var dy = observer.Y - renderedSample.Y;
+        var dz = observer.Z - renderedSample.Z;
+        var distance = Math.Sqrt(dx * dx + dy * dy + dz * dz);
+        if (distance > 1.0)
+        {
+            _log.Warn(
+                $"Native camera: post-seek observer origin settled {distance:0.##} units from " +
+                "the rendered shot because of world collision; Source 2 visibility origin was still refreshed.");
+        }
+        else
+        {
+            _log.Info("Native camera: post-seek observer and rendered visibility origins synchronized.");
+        }
     }
 
     private async Task<InProcessCameraStatus> EnsureManualCameraArmedUnderOverrideAsync(

@@ -14,6 +14,10 @@ public sealed class DeadlockUiController
     new[]
     {
         "citadel_player_glow_disabled true",
+        "citadel_trooper_glow_disabled true",
+        "citadel_trooper_friendly_glow_disabled true",
+        "citadel_trooper_outline_enabled false",
+        "citadel_boss_glow_disabled true",
         "citadel_camera_fade_viewed_near_opacity 1",
         "citadel_camera_fade_other_near_opacity 1",
         "r_drawpanorama false",
@@ -23,6 +27,10 @@ public sealed class DeadlockUiController
     new[]
     {
         "citadel_player_glow_disabled false",
+        "citadel_trooper_glow_disabled false",
+        "citadel_trooper_friendly_glow_disabled false",
+        "citadel_trooper_outline_enabled true",
+        "citadel_boss_glow_disabled false",
         "citadel_camera_fade_viewed_near_opacity 0.4",
         "citadel_camera_fade_other_near_opacity 0.4",
         "r_drawpanorama true",

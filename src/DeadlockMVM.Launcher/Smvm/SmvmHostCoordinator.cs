@@ -140,6 +140,8 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
             };
             if (rejectSource)
             {
+                if (action.Type == SmvmActionType.SetTimescale)
+                    _log.Info("Ignored replay-speed input from a superseded replay snapshot.");
                 return;
             }
             if (action.Type == SmvmActionType.SetTimescale)
@@ -1784,15 +1786,28 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
             if (currentReplayIdentity is null ||
                 !TryCaptureReplayCommandLease(currentReplayIdentity, out var commandLease))
             {
+                _log.Info("Ignored replay-speed input because authoritative replay telemetry is not ready.");
                 return false;
             }
             if (lease.ReplayIdentity is null &&
                 queuedActionLease.SourceReplaySessionGeneration > 0 &&
                 commandLease.ReplaySessionGeneration != queuedActionLease.SourceReplaySessionGeneration)
             {
+                _log.Info("Ignored replay-speed input because the replay changed before it could be applied.");
                 return false;
             }
-            return _controller.SetSpeedIfCurrent(speed, commandLease);
+            var applied = _controller.SetSpeedIfCurrent(speed, commandLease);
+            if (applied)
+            {
+                _log.Info(
+                    $"Replay speed applied: {speed * 100.0:0.##}% through demo_timescale " +
+                    "(host_timescale remains neutral at 100%).");
+            }
+            else
+            {
+                _log.Info("Ignored replay-speed input because its VConsole replay lease expired.");
+            }
+            return applied;
         }
     }
 

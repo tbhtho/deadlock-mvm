@@ -85,14 +85,22 @@ void ProtocolTests() {
           "Campath completion follows the same fractional clock as camera evaluation");
 
     Check(deadlock_mvm::kReplayPresentationCommands ==
-              std::array<std::string_view, 4>{
+              std::array<std::string_view, 8>{
                   "citadel_player_glow_disabled true",
+                  "citadel_trooper_glow_disabled true",
+                  "citadel_trooper_friendly_glow_disabled true",
+                  "citadel_trooper_outline_enabled false",
+                  "citadel_boss_glow_disabled true",
                   "citadel_camera_fade_viewed_near_opacity 1",
                   "citadel_camera_fade_other_near_opacity 1",
                   "r_drawpanorama false"} &&
               deadlock_mvm::kDeadlockPresentationRestoreCommands ==
-              std::array<std::string_view, 4>{
+              std::array<std::string_view, 8>{
                   "citadel_player_glow_disabled false",
+                  "citadel_trooper_glow_disabled false",
+                  "citadel_trooper_friendly_glow_disabled false",
+                  "citadel_trooper_outline_enabled true",
+                  "citadel_boss_glow_disabled false",
                   "citadel_camera_fade_viewed_near_opacity 0.4",
                   "citadel_camera_fade_other_near_opacity 0.4",
                   "r_drawpanorama true"},

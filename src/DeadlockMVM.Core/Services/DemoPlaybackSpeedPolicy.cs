@@ -4,7 +4,8 @@ namespace DeadlockMVM.Core.Services;
 /// Arbitrates the once-per-replay 100% speed baseline against later explicit
 /// owner choices. Captured startup leases become stale at owner input and at a
 /// Deadlock process boundary, so an awaited startup pass cannot overwrite a
-/// newer custom speed.
+/// newer custom speed. Playback speed is a VConsole replay operation and is
+/// deliberately independent of the optional native camera connection.
 /// </summary>
 public sealed class DemoPlaybackSpeedPolicy
 {
@@ -115,12 +116,16 @@ public sealed class DemoPlaybackSpeedPolicy
         string? currentReplayIdentity,
         bool nativeConnected)
     {
+        // Retain the native parameters in this compatibility-facing policy
+        // signature, but do not lease a VConsole-only command to the camera
+        // pipe. A renderer/native reconnect must not discard a valid owner
+        // speed choice for the same replay and process.
+        _ = currentNativeConnectionEpoch;
+        _ = nativeConnected;
         lock (_gate)
         {
             if (lease.OwnerIntentEpoch != _ownerIntentEpoch ||
-                !nativeConnected ||
-                lease.ProcessBoundaryEpoch != currentProcessBoundaryEpoch ||
-                lease.NativeConnectionEpoch != currentNativeConnectionEpoch)
+                lease.ProcessBoundaryEpoch != currentProcessBoundaryEpoch)
             {
                 return false;
             }

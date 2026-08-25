@@ -20,19 +20,25 @@ public static class SmvmQueuedActionLeasePolicy
         bool nativeConnected,
         bool replayTelemetryAuthoritative)
     {
-        if (!nativeConnected ||
-            lease.NativeConnectionEpoch <= 0 ||
-            lease.NativeConnectionEpoch != currentNativeConnectionEpoch ||
-            lease.ProcessBoundaryEpoch != currentProcessBoundaryEpoch)
+        var scope = GetScope(action);
+        if (lease.ProcessBoundaryEpoch != currentProcessBoundaryEpoch)
+        {
+            return false;
+        }
+        if (scope != SmvmQueuedActionScope.PlaybackSpeed &&
+            (!nativeConnected ||
+             lease.NativeConnectionEpoch <= 0 ||
+             lease.NativeConnectionEpoch != currentNativeConnectionEpoch))
         {
             return false;
         }
 
-        return GetScope(action) switch
+        return scope switch
         {
             SmvmQueuedActionScope.ProcessAndNative => true,
             // DemoPlaybackSpeedPolicy owns the current-or-immediate-next replay
-            // rule; this generic policy still fences process and native pipe.
+            // rule. Speed is VConsole-only, so this layer fences the Deadlock
+            // process but deliberately ignores the optional camera pipe.
             SmvmQueuedActionScope.PlaybackSpeed => true,
             // Escape/F9 are valid while replay telemetry is provisional, but
             // their delayed cleanup must never tear down the next replay.
