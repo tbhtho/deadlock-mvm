@@ -13,6 +13,7 @@ public sealed class DeadlockUiController
     public static IReadOnlyList<string> ReplayPresentationCommands { get; } = Array.AsReadOnly(
     new[]
     {
+        ReplayCommands.EnableReplayDevelopmentConVars,
         "citadel_player_glow_disabled true",
         "citadel_trooper_glow_disabled true",
         "citadel_trooper_friendly_glow_disabled true",
@@ -52,6 +53,7 @@ public sealed class DeadlockUiController
         "citadel_camera_fade_viewed_near_opacity 0.4",
         "citadel_camera_fade_other_near_opacity 0.4",
         "r_drawpanorama true",
+        "sv_cheats 0",
     });
 
     /// <summary>
@@ -113,7 +115,7 @@ public sealed class DeadlockUiController
 
     /// <summary>
     /// Atomically validates owner intent under the same transaction gate that
-    /// serializes the four VConsole commands. An emergency F9 either runs after
+    /// serializes the fixed VConsole profile. An emergency F9 either runs after
     /// this whole forward batch, or invalidates it before the first command.
     /// </summary>
     public bool ApplyIfCurrent(

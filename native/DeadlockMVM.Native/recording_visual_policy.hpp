@@ -74,7 +74,8 @@ enum class RecordingVisualShutdownAction : std::uint32_t {
 
 // Fixed, current-build replay presentation profiles. Keep these typed and
 // narrow: they are also used by the native F9 / host-loss recovery path.
-inline constexpr std::array<std::string_view, 17> kReplayPresentationCommands{
+inline constexpr std::array<std::string_view, 18> kReplayPresentationCommands{
+    "sv_cheats 1",
     "citadel_player_glow_disabled true",
     "citadel_trooper_glow_disabled true",
     "citadel_trooper_friendly_glow_disabled true",
@@ -94,7 +95,7 @@ inline constexpr std::array<std::string_view, 17> kReplayPresentationCommands{
     "r_drawpanorama false",
 };
 
-inline constexpr std::array<std::string_view, 17> kDeadlockPresentationRestoreCommands{
+inline constexpr std::array<std::string_view, 18> kDeadlockPresentationRestoreCommands{
     "citadel_player_glow_disabled false",
     "citadel_trooper_glow_disabled false",
     "citadel_trooper_friendly_glow_disabled false",
@@ -112,6 +113,7 @@ inline constexpr std::array<std::string_view, 17> kDeadlockPresentationRestoreCo
     "citadel_camera_fade_viewed_near_opacity 0.4",
     "citadel_camera_fade_other_near_opacity 0.4",
     "r_drawpanorama true",
+    "sv_cheats 0",
 };
 
 [[nodiscard]] constexpr bool ShouldAttemptRecordingVisualRestore(

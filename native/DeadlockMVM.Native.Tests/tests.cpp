@@ -85,7 +85,8 @@ void ProtocolTests() {
           "Campath completion follows the same fractional clock as camera evaluation");
 
     Check(deadlock_mvm::kReplayPresentationCommands ==
-              std::array<std::string_view, 17>{
+              std::array<std::string_view, 18>{
+                  "sv_cheats 1",
                   "citadel_player_glow_disabled true",
                   "citadel_trooper_glow_disabled true",
                   "citadel_trooper_friendly_glow_disabled true",
@@ -104,7 +105,7 @@ void ProtocolTests() {
                   "citadel_camera_fade_other_near_opacity 1",
                   "r_drawpanorama false"} &&
               deadlock_mvm::kDeadlockPresentationRestoreCommands ==
-              std::array<std::string_view, 17>{
+              std::array<std::string_view, 18>{
                   "citadel_player_glow_disabled false",
                   "citadel_trooper_glow_disabled false",
                   "citadel_trooper_friendly_glow_disabled false",
@@ -121,7 +122,8 @@ void ProtocolTests() {
                   "citadel_unit_status_old_hide_names false",
                   "citadel_camera_fade_viewed_near_opacity 0.4",
                   "citadel_camera_fade_other_near_opacity 0.4",
-                  "r_drawpanorama true"},
+                  "r_drawpanorama true",
+                  "sv_cheats 0"},
           "recording presentation has exact typed apply and emergency restore profiles");
     Check(deadlock_mvm::ShouldAttemptRecordingVisualRestore(true, false, 500, 0) &&
               !deadlock_mvm::ShouldAttemptRecordingVisualRestore(true, true, 2000, 500) &&

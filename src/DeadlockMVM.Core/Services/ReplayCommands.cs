@@ -17,6 +17,7 @@ public static class ReplayCommands
     public const string QueryTimescale = "host_timescale";
     public const string ResetLegacyDemoTimescale = "demo_timescale 1";
     public const string DisableFrameSpikeReports = "engine_frametime_warnings_enable 0";
+    public const string EnableReplayDevelopmentConVars = "sv_cheats 1";
 
     /// <summary>Steps one tick and pauses (engine default).</summary>
     public const string StepTick = "demo_step_tick";
@@ -44,6 +45,8 @@ public static class ReplayCommands
         return [
             "+engine_frametime_warnings_enable",
             "0",
+            "+sv_cheats",
+            "1",
             "+playdemo",
             gamePath,
             $"+{Pause}",
