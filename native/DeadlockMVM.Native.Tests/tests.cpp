@@ -85,22 +85,32 @@ void ProtocolTests() {
           "Campath completion follows the same fractional clock as camera evaluation");
 
     Check(deadlock_mvm::kReplayPresentationCommands ==
-              std::array<std::string_view, 8>{
+              std::array<std::string_view, 13>{
                   "citadel_player_glow_disabled true",
                   "citadel_trooper_glow_disabled true",
                   "citadel_trooper_friendly_glow_disabled true",
                   "citadel_trooper_outline_enabled false",
                   "citadel_boss_glow_disabled true",
+                  "citadel_unit_status_allies_see_thru_walls false",
+                  "citadel_unit_status_enabled false",
+                  "citadel_healthbars_enabled false",
+                  "citadel_unit_status_hide_names true",
+                  "citadel_unit_status_old_hide_names true",
                   "citadel_camera_fade_viewed_near_opacity 1",
                   "citadel_camera_fade_other_near_opacity 1",
                   "r_drawpanorama false"} &&
               deadlock_mvm::kDeadlockPresentationRestoreCommands ==
-              std::array<std::string_view, 8>{
+              std::array<std::string_view, 13>{
                   "citadel_player_glow_disabled false",
                   "citadel_trooper_glow_disabled false",
                   "citadel_trooper_friendly_glow_disabled false",
                   "citadel_trooper_outline_enabled true",
                   "citadel_boss_glow_disabled false",
+                  "citadel_unit_status_allies_see_thru_walls true",
+                  "citadel_unit_status_enabled true",
+                  "citadel_healthbars_enabled true",
+                  "citadel_unit_status_hide_names false",
+                  "citadel_unit_status_old_hide_names false",
                   "citadel_camera_fade_viewed_near_opacity 0.4",
                   "citadel_camera_fade_other_near_opacity 0.4",
                   "r_drawpanorama true"},
