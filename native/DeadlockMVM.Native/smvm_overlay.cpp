@@ -303,6 +303,8 @@ struct OverlayState final {
     std::atomic<std::int64_t> manual_look_right_delta{0};
     std::atomic<std::int64_t> manual_look_up_delta{0};
     std::atomic<std::int32_t> manual_wheel_delta{0};
+    std::atomic<double> manual_fov_target{90.0};
+    std::atomic<bool> manual_fov_target_pending{false};
     std::atomic<bool> manual_pointer_requested{false};
     std::atomic<bool> manual_pointer_active{false};
     std::atomic<std::uint64_t> manual_pointer_next_health_check_ms{0};
@@ -5964,6 +5966,26 @@ void SmvmReacquireFreeCameraInput() noexcept {
     }
 }
 
+bool SmvmSetManualFovTarget(const double fov) noexcept {
+    if (!std::isfinite(fov) || fov < kMinFov || fov > kMaxFov)
+        return false;
+    auto& state = g_overlay;
+    state.manual_fov_target.store(fov, std::memory_order_release);
+    state.manual_fov_target_pending.store(true, std::memory_order_release);
+    return true;
+}
+
+bool ConsumeSmvmManualFovTarget(double& fov) noexcept {
+    auto& state = g_overlay;
+    if (!state.manual_fov_target_pending.exchange(false, std::memory_order_acq_rel))
+        return false;
+    const auto target = state.manual_fov_target.load(std::memory_order_acquire);
+    if (!std::isfinite(target) || target < kMinFov || target > kMaxFov)
+        return false;
+    fov = target;
+    return true;
+}
+
 bool ConsumeSmvmManualInput(
     const SmvmSnapshotPayload& snapshot,
     SmvmManualInputFrame& frame) noexcept {
@@ -6064,6 +6086,7 @@ void InvalidateSmvmReplaySessionState() noexcept {
     // the armed generation ensures replay B always requires a fresh prompt and
     // key press even when it replaces replay A on the same pipe.
     ResetCinematicStartGate(true);
+    g_overlay.manual_fov_target_pending.store(false, std::memory_order_release);
 }
 
 bool StartSmvmOverlay(const HMODULE self_module, const SmvmOverlayCallbacks& callbacks) noexcept {
@@ -6087,6 +6110,7 @@ bool StartSmvmOverlay(const HMODULE self_module, const SmvmOverlayCallbacks& cal
     state.ready.store(false, std::memory_order_release);
     state.menu_open.store(false, std::memory_order_release);
     state.replay_tick_input_active.store(false, std::memory_order_release);
+    state.manual_fov_target_pending.store(false, std::memory_order_release);
     ResetCinematicStartGate(true);
     state.clean_view.store(false, std::memory_order_release);
     state.manual_pointer_requested.store(false, std::memory_order_release);
@@ -6320,6 +6344,7 @@ bool StopSmvmOverlay() noexcept {
     state.self = nullptr;
     state.started.store(false, std::memory_order_release);
     state.replay_tick_input_active.store(false, std::memory_order_release);
+    state.manual_fov_target_pending.store(false, std::memory_order_release);
     ResetCinematicStartGate(true);
     ResetSmvmManualInput();
     ResetConsumedReleaseRoutes();

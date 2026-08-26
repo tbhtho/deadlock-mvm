@@ -61,6 +61,10 @@ bool StopSmvmOverlay() noexcept;
 [[nodiscard]] bool ConsumeSmvmManualInput(
     const SmvmSnapshotPayload& snapshot,
     SmvmManualInputFrame& frame) noexcept;
+// Typed FOV edits are submitted while Tab interaction has suspended the
+// relative-pointer route. Keep them separate from mouse input so the next
+// rendered manual-camera frame can apply the exact value while paused.
+[[nodiscard]] bool ConsumeSmvmManualFovTarget(double& fov) noexcept;
 void ResetSmvmManualInput() noexcept;
 // Mirrors presentation state as soon as the pipe receives a validated managed
 // snapshot, even when no renderer frame has been observed yet.
@@ -79,5 +83,6 @@ void InvalidateSmvmReplaySessionState() noexcept;
 // Re-runs only the Free Camera pointer acquisition path. Camera transform,
 // FOV, Roll, and camera ownership remain untouched.
 void SmvmReacquireFreeCameraInput() noexcept;
+[[nodiscard]] bool SmvmSetManualFovTarget(double fov) noexcept;
 
 } // namespace deadlock_mvm

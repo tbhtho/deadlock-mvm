@@ -85,7 +85,7 @@ void ProtocolTests() {
           "Campath completion follows the same fractional clock as camera evaluation");
 
     Check(deadlock_mvm::kReplayPresentationCommands ==
-              std::array<std::string_view, 13>{
+              std::array<std::string_view, 17>{
                   "citadel_player_glow_disabled true",
                   "citadel_trooper_glow_disabled true",
                   "citadel_trooper_friendly_glow_disabled true",
@@ -94,13 +94,17 @@ void ProtocolTests() {
                   "citadel_unit_status_allies_see_thru_walls false",
                   "citadel_unit_status_enabled false",
                   "citadel_healthbars_enabled false",
+                  "citadel_unit_status_max_total_bars 0",
+                  "r_citadel_glow_health_bars false",
+                  "citadel_hud_objective_health_enabled 0",
+                  "r_citadel_see_thru_walls_opacity 0",
                   "citadel_unit_status_hide_names true",
                   "citadel_unit_status_old_hide_names true",
                   "citadel_camera_fade_viewed_near_opacity 1",
                   "citadel_camera_fade_other_near_opacity 1",
                   "r_drawpanorama false"} &&
               deadlock_mvm::kDeadlockPresentationRestoreCommands ==
-              std::array<std::string_view, 13>{
+              std::array<std::string_view, 17>{
                   "citadel_player_glow_disabled false",
                   "citadel_trooper_glow_disabled false",
                   "citadel_trooper_friendly_glow_disabled false",
@@ -109,6 +113,10 @@ void ProtocolTests() {
                   "citadel_unit_status_allies_see_thru_walls true",
                   "citadel_unit_status_enabled true",
                   "citadel_healthbars_enabled true",
+                  "citadel_unit_status_max_total_bars 2",
+                  "r_citadel_glow_health_bars true",
+                  "citadel_hud_objective_health_enabled 2",
+                  "r_citadel_see_thru_walls_opacity 0.3",
                   "citadel_unit_status_hide_names false",
                   "citadel_unit_status_old_hide_names false",
                   "citadel_camera_fade_viewed_near_opacity 0.4",
@@ -380,8 +388,8 @@ void ProtocolTests() {
               !ShouldLockReplayTimelineInput(true, false),
           "timeline input locks while ticks update without closing the visible overlay");
     constexpr auto bottom_timeline = ComputeReplayTimelineGeometry(1920.0F, 1080.0F, 1.0F, false);
-    Check(bottom_timeline.x == 600.0F && bottom_timeline.y == 968.0F &&
-              bottom_timeline.width == 720.0F && bottom_timeline.height == 96.0F,
+    Check(bottom_timeline.x == 530.0F && bottom_timeline.y == 968.0F &&
+              bottom_timeline.width == 860.0F && bottom_timeline.height == 96.0F,
           "mini timeline has a compact two-row centered bottom layout");
     constexpr auto narrow_timeline = ComputeReplayTimelineGeometry(320.0F, 200.0F, 1.0F, true);
     Check(narrow_timeline.x == 16.0F && narrow_timeline.y == 16.0F &&
@@ -867,6 +875,13 @@ void ProtocolTests() {
         CameraSample{0, 0, 0, 0, 0, 0, 70}, motion, inverted_tuning, 1.0 / 60.0);
     Check(inverted.pitch > 0.0 && inverted.fov > 70.0,
           "manual camera honors invert-Y and inverted FOV wheel direction");
+    const auto typed_fov = ApplyTypedManualFov(
+        CameraSample{0, 0, 0, 0, 0, 0, 70}, 37.5);
+    const auto rejected_typed_fov = ApplyTypedManualFov(
+        CameraSample{0, 0, 0, 0, 0, 0, 70}, 200.0);
+    Check(std::abs(typed_fov.fov - 37.5) < 0.0001 &&
+              std::abs(rejected_typed_fov.fov - 70.0) < 0.0001,
+          "typed FOV applies an exact validated value to the rendered manual camera");
 
     ManualCameraMotion right_look{};
     right_look.look_right = 10.0;

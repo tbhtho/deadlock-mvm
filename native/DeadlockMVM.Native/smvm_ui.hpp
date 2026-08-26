@@ -71,6 +71,12 @@ struct SmvmUiState final {
     bool playback_speed_initialized{};
     bool playback_speed_input_active{};
     double playback_speed_snapshot{1.0};
+    float manual_fov{90.0F};
+    bool manual_fov_initialized{};
+    bool manual_fov_input_active{};
+    double manual_fov_snapshot{90.0};
+    std::uint64_t manual_fov_pending_until_ms{};
+    bool replay_tick_input_active{};
     bool hide_ui_during_cinematic{};
     std::array<char, 64> save_as_name{};
     bool open_save_as_modal{};
@@ -151,5 +157,6 @@ void SmvmOpenMenu() noexcept;
 [[nodiscard]] bool SmvmArmCinematicStart(std::uint64_t replay_session_generation) noexcept;
 void SmvmSetReplayTickInputActive(bool active) noexcept;
 void SmvmReacquireFreeCameraInput() noexcept;
+[[nodiscard]] bool SmvmSetManualFovTarget(double fov) noexcept;
 
 } // namespace deadlock_mvm

@@ -1248,6 +1248,9 @@ void* __fastcall CameraUpdateHook(void* camera) noexcept {
                     (snapshot.flags & smvm_snapshot_fov_inverted) != 0,
                 };
                 sample = ApplyManualCameraMotion(sample, motion, tuning, delta_seconds);
+                double typed_fov = 0.0;
+                if (ConsumeSmvmManualFovTarget(typed_fov))
+                    sample = ApplyTypedManualFov(sample, typed_fov);
                 if (backend->roll_override_requested.load(std::memory_order_acquire))
                     sample.roll = std::bit_cast<double>(
                         backend->roll_override_bits.load(std::memory_order_acquire));

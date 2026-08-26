@@ -415,14 +415,14 @@ void SeekToTickField(
         ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_EnterReturnsTrue);
     ImGui::PopFont();
     if (timeline_field)
-        SmvmSetReplayTickInputActive(ImGui::IsItemActive());
+        state.replay_tick_input_active = ImGui::IsItemActive();
     smvm_theme::Tooltip("Type an absolute replay tick and press Enter.");
     if (entered && submit()) {
         // Move keyboard focus to the following Go button. Enter must finish
         // text editing so Free Camera input can be reacquired immediately.
         ImGui::SetKeyboardFocusHere();
         if (timeline_field)
-            SmvmSetReplayTickInputActive(false);
+            state.replay_tick_input_active = false;
     }
     ImGui::SameLine();
     if (smvm_theme::Button("Go", replay_active && state.go_to_tick[0] != '\0'))
@@ -1882,6 +1882,108 @@ void DrawPlaybackSpeedControls(const FrameContext& context) noexcept {
     }
 }
 
+void DrawManualFovControl(const FrameContext& context) noexcept {
+    auto& state = *context.state;
+    const auto& snapshot = *context.snapshot;
+    const auto scale = smvm_theme::GetScale();
+    const auto& camera = context.params->rendered_camera != nullptr &&
+            ValidateSample(*context.params->rendered_camera)
+        ? *context.params->rendered_camera
+        : snapshot.camera;
+    const auto now = GetTickCount64();
+    const auto camera_ready = ValidateSample(camera) &&
+        (snapshot.flags & smvm_snapshot_manual_camera_requested) != 0 &&
+        (snapshot.flags & smvm_snapshot_manual_camera_active) != 0 &&
+        (snapshot.flags & smvm_snapshot_campath_playing) == 0 &&
+        (snapshot.flags & smvm_snapshot_replay_seek_in_progress) == 0;
+
+    if (!state.manual_fov_initialized) {
+        state.manual_fov = static_cast<float>(camera.fov);
+        state.manual_fov_snapshot = camera.fov;
+        state.manual_fov_initialized = true;
+    } else if (state.manual_fov_pending_until_ms != 0 &&
+               std::abs(camera.fov - state.manual_fov) <= 0.05) {
+        state.manual_fov_pending_until_ms = 0;
+        state.manual_fov_snapshot = camera.fov;
+    } else if (!state.manual_fov_input_active &&
+               (state.manual_fov_pending_until_ms == 0 ||
+                now >= state.manual_fov_pending_until_ms) &&
+               std::abs(state.manual_fov_snapshot - camera.fov) > 0.001) {
+        state.manual_fov = static_cast<float>(camera.fov);
+        state.manual_fov_snapshot = camera.fov;
+        state.manual_fov_pending_until_ms = 0;
+    }
+
+    ImGui::SameLine();
+    ImGui::PushFont(smvm_theme::GetFonts().hint);
+    ImGui::TextColored(smvm_theme::Vec4(smvm_theme::colors::kMuted), "FOV");
+    ImGui::PopFont();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!camera_ready);
+    ImGui::SetNextItemWidth(64.0F * scale);
+    ImGui::PushFont(smvm_theme::GetFonts().mono);
+    const auto entered = ImGui::InputFloat(
+        "##manual_fov",
+        &state.manual_fov,
+        0.0F,
+        0.0F,
+        "%.1f",
+        ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_EnterReturnsTrue);
+    state.manual_fov_input_active = ImGui::IsItemActive();
+    ImGui::PopFont();
+    smvm_theme::Tooltip("Type the rendered SMVM Free Camera FOV (5 to 170 degrees). Press Enter or Set.");
+    ImGui::SameLine();
+    const auto apply = smvm_theme::Button("Set", camera_ready, ImVec2(40.0F * scale, 0.0F));
+    if (entered || apply) {
+        const auto target = std::clamp(
+            static_cast<double>(state.manual_fov), kMinFov, kMaxFov);
+        state.manual_fov = static_cast<float>(target);
+        if (SmvmSetManualFovTarget(target)) {
+            state.manual_fov_snapshot = target;
+            state.manual_fov_pending_until_ms = now + 1000;
+        }
+        if (entered) {
+            ImGui::SetKeyboardFocusHere();
+            state.manual_fov_input_active = false;
+        }
+    }
+    ImGui::EndDisabled();
+}
+
+void DrawReplayPauseIndicator(const FrameContext& context) noexcept {
+    const auto& snapshot = *context.snapshot;
+    const auto scale = smvm_theme::GetScale();
+    const auto pause_known = (snapshot.flags & smvm_snapshot_pause_known) != 0;
+    const auto paused = (snapshot.flags & smvm_snapshot_paused) != 0;
+    const auto* label = !pause_known
+        ? "REPLAY STATUS..."
+        : (paused ? "REPLAY PAUSED" : "REPLAY PLAYING");
+    const auto color = !pause_known
+        ? smvm_theme::colors::kMuted
+        : (paused ? smvm_theme::colors::kWarning : smvm_theme::colors::kSuccess);
+
+    ImGui::SetNextWindowPos(ImVec2(16.0F * scale, 16.0F * scale), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(154.0F * scale, 38.0F * scale), ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.96F);
+    ImGui::PushStyleVar(
+        ImGuiStyleVar_WindowPadding,
+        ImVec2(12.0F * scale, 10.0F * scale));
+    const auto open = ImGui::Begin(
+        "##smvm_replay_pause_indicator",
+        nullptr,
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoInputs);
+    if (open) {
+        ImGui::PushFont(smvm_theme::GetFonts().section);
+        ImGui::TextColored(smvm_theme::Vec4(color), "%s", label);
+        ImGui::PopFont();
+    }
+    ImGui::End();
+    ImGui::PopStyleVar(2);
+}
+
 void DrawCenteredProgressPrompt(const FrameContext& context, const char* text) noexcept {
     const auto scale = smvm_theme::GetScale();
     const auto& fonts = smvm_theme::GetFonts();
@@ -2064,6 +2166,11 @@ void DrawReplayTimeline(const FrameContext& context) noexcept {
             "Hide the Campath list and timeline only while the cinematic is playing.");
         ImGui::SameLine();
         DrawPlaybackSpeedControls(context);
+        DrawManualFovControl(context);
+        SmvmSetReplayTickInputActive(
+            state.replay_tick_input_active ||
+            state.playback_speed_input_active ||
+            state.manual_fov_input_active);
     }
     ImGui::End();
     ImGui::PopStyleVar();
@@ -2177,6 +2284,10 @@ void ObserveReplaySession(
     state.replay_scrub_tick = 0;
     state.replay_scrub_session_generation = 0;
     state.go_to_tick.fill('\0');
+    state.manual_fov_initialized = false;
+    state.manual_fov_input_active = false;
+    state.manual_fov_pending_until_ms = 0;
+    state.replay_tick_input_active = false;
     SmvmSetReplayTickInputActive(false);
 }
 
@@ -2218,6 +2329,7 @@ void DrawFrame(const SmvmUiFrameParams& params, SmvmUiState& state) noexcept {
     state.free_camera_activation_started_ms = 0;
     state.free_camera_activation_error_until_ms = 0;
     if (show_editor_ui) {
+        DrawReplayPauseIndicator(context);
         DrawCampathMiniMenu(context);
         DrawReplayTimeline(context);
         if ((params.snapshot->flags & smvm_snapshot_replay_seek_in_progress) != 0)

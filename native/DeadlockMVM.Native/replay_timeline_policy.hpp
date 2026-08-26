@@ -42,7 +42,7 @@ struct ReplayTimelineGeometry {
     const auto available_width = viewport_width > margin * 2.0F
         ? viewport_width - margin * 2.0F
         : 1.0F;
-    const auto desired_width = 720.0F * scale;
+    const auto desired_width = 860.0F * scale;
     const auto width = desired_width < available_width ? desired_width : available_width;
     const auto available_height = viewport_height > margin * 2.0F
         ? viewport_height - margin * 2.0F

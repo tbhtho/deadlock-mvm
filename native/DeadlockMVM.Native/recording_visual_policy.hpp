@@ -74,7 +74,7 @@ enum class RecordingVisualShutdownAction : std::uint32_t {
 
 // Fixed, current-build replay presentation profiles. Keep these typed and
 // narrow: they are also used by the native F9 / host-loss recovery path.
-inline constexpr std::array<std::string_view, 13> kReplayPresentationCommands{
+inline constexpr std::array<std::string_view, 17> kReplayPresentationCommands{
     "citadel_player_glow_disabled true",
     "citadel_trooper_glow_disabled true",
     "citadel_trooper_friendly_glow_disabled true",
@@ -83,6 +83,10 @@ inline constexpr std::array<std::string_view, 13> kReplayPresentationCommands{
     "citadel_unit_status_allies_see_thru_walls false",
     "citadel_unit_status_enabled false",
     "citadel_healthbars_enabled false",
+    "citadel_unit_status_max_total_bars 0",
+    "r_citadel_glow_health_bars false",
+    "citadel_hud_objective_health_enabled 0",
+    "r_citadel_see_thru_walls_opacity 0",
     "citadel_unit_status_hide_names true",
     "citadel_unit_status_old_hide_names true",
     "citadel_camera_fade_viewed_near_opacity 1",
@@ -90,7 +94,7 @@ inline constexpr std::array<std::string_view, 13> kReplayPresentationCommands{
     "r_drawpanorama false",
 };
 
-inline constexpr std::array<std::string_view, 13> kDeadlockPresentationRestoreCommands{
+inline constexpr std::array<std::string_view, 17> kDeadlockPresentationRestoreCommands{
     "citadel_player_glow_disabled false",
     "citadel_trooper_glow_disabled false",
     "citadel_trooper_friendly_glow_disabled false",
@@ -99,6 +103,10 @@ inline constexpr std::array<std::string_view, 13> kDeadlockPresentationRestoreCo
     "citadel_unit_status_allies_see_thru_walls true",
     "citadel_unit_status_enabled true",
     "citadel_healthbars_enabled true",
+    "citadel_unit_status_max_total_bars 2",
+    "r_citadel_glow_health_bars true",
+    "citadel_hud_objective_health_enabled 2",
+    "r_citadel_see_thru_walls_opacity 0.3",
     "citadel_unit_status_hide_names false",
     "citadel_unit_status_old_hide_names false",
     "citadel_camera_fade_viewed_near_opacity 0.4",

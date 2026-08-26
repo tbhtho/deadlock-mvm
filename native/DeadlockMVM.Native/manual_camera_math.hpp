@@ -28,6 +28,17 @@ struct ManualCameraTuning final {
     bool invert_fov{};
 };
 
+[[nodiscard]] inline CameraSample ApplyTypedManualFov(
+    const CameraSample& current,
+    const double requested_fov) noexcept {
+    if (!ValidateSample(current) || !std::isfinite(requested_fov) ||
+        requested_fov < kMinFov || requested_fov > kMaxFov)
+        return current;
+    auto result = current;
+    result.fov = requested_fov;
+    return result;
+}
+
 [[nodiscard]] inline CameraSample ApplyManualCameraMotion(
     const CameraSample& current,
     ManualCameraMotion motion,
