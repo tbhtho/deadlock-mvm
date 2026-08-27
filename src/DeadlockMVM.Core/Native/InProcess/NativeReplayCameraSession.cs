@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
+using System.ComponentModel;
 using DeadlockMVM.Core.Contracts;
 using DeadlockMVM.Core.Models;
 using DeadlockMVM.Core.Services;
@@ -17,6 +18,7 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
     private static readonly TimeSpan SelfTestRestorationTimeout = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan SelfTestEmergencyCleanupTimeout = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan AutomaticRecoveryTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan ReplayPauseConfirmationTimeout = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan PausedManualCameraBootstrapDelay = TimeSpan.FromMilliseconds(125);
     private static readonly TimeSpan VisibilityOriginSyncInterval = TimeSpan.FromMilliseconds(250);
     private static readonly TimeSpan VisibilityOriginWarningInterval = TimeSpan.FromSeconds(5);
@@ -30,6 +32,7 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
     private readonly ICameraService _camera;
     private readonly ILogService _log;
     private readonly string _dllPath;
+    private readonly Func<string?> _expectedExecutablePathProvider;
     private readonly CancellationTokenSource _stop = new();
     private readonly SemaphoreSlim _operationGate = new(1, 1);
     private readonly AsyncLocal<QueuedActionContext?> _queuedActionContext = new();
@@ -65,12 +68,14 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         ReplayController controller,
         ICameraService camera,
         ILogService log,
-        string dllPath)
+        string dllPath,
+        Func<string?>? expectedExecutablePathProvider = null)
     {
         _controller = controller;
         _camera = camera;
         _log = log;
         _dllPath = Path.GetFullPath(dllPath);
+        _expectedExecutablePathProvider = expectedExecutablePathProvider ?? (static () => null);
         _camera.SelectionChanged += OnSelectionChanged;
         _monitorTask = MonitorAsync(_stop.Token);
     }
@@ -988,8 +993,6 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                 {
                     Transition(CampathPlaybackState.SeekingToStart,
                         "SKIPPING TO CAMPATH START", startTick, currentTick);
-                    if (originalState.IsPaused != true && !PauseReplayForCurrentOperation())
-                        throw new InvalidOperationException("Replay changed before Campath start could pause it.");
                     Transition(CampathPlaybackState.WaitingForLandedTick,
                         "Waiting for Deadlock to report the landed replay tick.", startTick, currentTick);
                     int landed;
@@ -1010,8 +1013,10 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                         throw;
                     }
                     observationExpectedTick = landed;
-                    if (!PauseReplayForCurrentOperation())
-                        throw new InvalidOperationException("Replay changed while Campath was landing at its start tick.");
+                    if (!await PauseReplayAndWaitForCurrentOperationAsync(cancellationToken)
+                            .ConfigureAwait(false))
+                        throw new InvalidOperationException(
+                            "Replay changed or did not confirm pause after landing at the Campath start tick.");
                     Transition(CampathPlaybackState.ReacquiringFreeRoam,
                         "Reacquiring Free Roam after the landed seek.", startTick, landed);
                     try
@@ -1201,13 +1206,13 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             if (CampathCameraOwned)
                 await StopCampathCoreAsync(cancellationToken).ConfigureAwait(false);
 
-            if (!PauseReplayForCurrentOperation())
-                throw new InvalidOperationException("Replay changed before Go To could pause it.");
             var landed = await SeekToPathStartAsync(
                 checked((int)keyframe.DemoTick),
                 cancellationToken).ConfigureAwait(false);
-            if (!PauseReplayForCurrentOperation())
-                throw new InvalidOperationException("Replay changed before the active Campath seek could pause it.");
+            if (!await PauseReplayAndWaitForCurrentOperationAsync(cancellationToken)
+                    .ConfigureAwait(false))
+                throw new InvalidOperationException(
+                    "Replay changed or did not confirm pause after Go To landed.");
             ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
             ThrowIfQueuedActionLeaseExpired();
             await EnterFreeRoamForCurrentOperationAsync(cancellationToken).ConfigureAwait(false);
@@ -1288,8 +1293,7 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         var preservingManualCamera = false;
         var protectedManualSeek = false;
         var activeCampathSeek = false;
-        var restoreProtectedTransport = false;
-        bool? protectedTransportWasPaused = null;
+        var replayPauseConfirmed = false;
         try
         {
             ThrowIfQueuedActionLeaseExpired();
@@ -1325,11 +1329,6 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                         "A validated SMVM Free Camera frame is required before seeking. " +
                         "Free Camera intent remains requested; reacquire it and retry.");
 
-                var manualWasPaused = _controller.State.IsPaused;
-                protectedTransportWasPaused = manualWasPaused;
-                restoreProtectedTransport = true;
-                if (!PauseReplayForCurrentOperation())
-                    throw new InvalidOperationException("Replay changed before the Free Camera seek could pause it.");
                 int manualLanded;
                 try
                 {
@@ -1341,8 +1340,11 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                         $"Deadlock did not land at requested tick {tick} within 15 seconds.", ex);
                 }
 
-                if (!PauseReplayForCurrentOperation())
-                    throw new InvalidOperationException("Replay changed while the Free Camera seek was landing.");
+                if (!await PauseReplayAndWaitForCurrentOperationAsync(cancellationToken)
+                        .ConfigureAwait(false))
+                    throw new InvalidOperationException(
+                        "Replay changed or did not confirm pause after the Free Camera seek landed.");
+                replayPauseConfirmed = true;
                 if (!ManualCameraDesired)
                     throw new InvalidOperationException(
                         "Replay seek landed after an explicit SMVM Free Camera exit; camera ownership will remain released.");
@@ -1388,11 +1390,6 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             if (client?.Connected != true)
                 throw new CampathStartException(CampathStartFailure.NativeBackendDisconnected, _message);
 
-            var wasPaused = _controller.State.IsPaused;
-            protectedTransportWasPaused = wasPaused;
-            restoreProtectedTransport = true;
-            if (!PauseReplayForCurrentOperation())
-                throw new InvalidOperationException("Replay changed while the active Campath seek was landing.");
             var beforeTick = _controller.State.CurrentTick;
             Transition(
                 CampathPlaybackState.WaitingForLandedTick,
@@ -1425,8 +1422,11 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                 $"Landed at tick {landed}; reacquiring Free Roam before camera writes resume.",
                 tick,
                 landed);
-            if (!PauseReplayForCurrentOperation())
-                throw new InvalidOperationException("Replay changed while the active Campath seek was landing.");
+            if (!await PauseReplayAndWaitForCurrentOperationAsync(cancellationToken)
+                    .ConfigureAwait(false))
+                throw new InvalidOperationException(
+                    "Replay changed or did not confirm pause after the active Campath seek landed.");
+            replayPauseConfirmed = true;
             try
             {
                 ThrowIfQueuedActionLeaseExpired();
@@ -1570,8 +1570,14 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         }
         finally
         {
-            if (restoreProtectedTransport)
-                RestoreReplayTransportState(protectedTransportWasPaused);
+            // A timeline jump is a shot-composition action. It must always
+            // finish on a frozen frame, even when the replay was playing when
+            // the owner entered the tick. Play Cinematic is the only action
+            // that should resume transport after a seek.
+            if (!replayPauseConfirmed &&
+                !await PauseReplayAndWaitForCurrentOperationAsync(CancellationToken.None)
+                    .ConfigureAwait(false))
+                _log.Warn("Native camera: replay changed before the completed seek could be left paused.");
             if (preservingManualCamera)
                 ExitCameraTransfer();
             _operationGate.Release();
@@ -2436,7 +2442,10 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             return;
         }
 
-        using var process = FindDeadlockProcess();
+        var expectedExecutablePath = _expectedExecutablePathProvider();
+        if (string.IsNullOrWhiteSpace(expectedExecutablePath))
+            return;
+        using var process = FindDeadlockProcess(expectedExecutablePath);
         if (process is null)
             return;
 
@@ -2447,7 +2456,8 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             SmvmRendererBackend.None, SmvmRendererError.None, SmvmOverlayFlags.None, 0, SmvmAction.None);
         OnStatusChanged();
 
-        var load = NativeReplayModuleLoader.LoadForReplay(process.Id, _dllPath);
+        var load = NativeReplayModuleLoader.LoadForReplay(
+            process.Id, _dllPath, expectedExecutablePath);
         if (!load.Success)
         {
             _status = _status with { State = InProcessBackendState.Failed };
@@ -2826,6 +2836,59 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             return true;
         }
         return _controller.PauseIfCurrent(lease.Value);
+    }
+
+    private async Task<bool> PauseReplayAndWaitForCurrentOperationAsync(
+        CancellationToken cancellationToken)
+    {
+        var lease = _queuedActionContext.Value?.ReplayLease;
+        bool IsCurrentReplay() =>
+            lease is null || _controller.IsReplayCommandLeaseCurrent(lease.Value);
+
+        if (!IsCurrentReplay())
+            return false;
+
+        var pauseConfirmed = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        void OnStateChanged(object? _, ReplayState state)
+        {
+            if (!IsCurrentReplay())
+                pauseConfirmed.TrySetResult(false);
+            else if (state.IsPaused == true)
+                pauseConfirmed.TrySetResult(true);
+        }
+
+        _controller.StateChanged += OnStateChanged;
+        try
+        {
+            // Always send a post-landing pause. IsPaused can still contain the
+            // pre-seek value until Deadlock publishes its next transport line,
+            // so using it to skip this command could leave the landed replay
+            // running behind Free Camera recovery.
+            if (!PauseReplayForCurrentOperation())
+                return false;
+
+            using var confirmation = CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken);
+            confirmation.CancelAfter(ReplayPauseConfirmationTimeout);
+            try
+            {
+                return await pauseConfirmed.Task
+                    .WaitAsync(confirmation.Token)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                // A redundant demo_pause is not guaranteed to print another
+                // state line. The command was still issued under the exact
+                // replay lease; accept the already-paused authoritative state.
+                return IsCurrentReplay() && _controller.State.IsPaused == true;
+            }
+        }
+        finally
+        {
+            _controller.StateChanged -= OnStateChanged;
+        }
     }
 
     private bool PlayReplayForCurrentOperation()
@@ -3859,7 +3922,16 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
              SmvmOverlayFlags.RelativeMouseReady | SmvmOverlayFlags.RawInputReady |
              SmvmOverlayFlags.CursorReady | SmvmOverlayFlags.ForegroundReady |
              SmvmOverlayFlags.WindowProcedureReady | SmvmOverlayFlags.EngineInputReady |
-             SmvmOverlayFlags.FallbackMouseObserved);
+             SmvmOverlayFlags.FallbackMouseObserved |
+             SmvmOverlayFlags.CreepHealthbarHookInstalled |
+             SmvmOverlayFlags.CreepHealthbarSuppressionObserved |
+             SmvmOverlayFlags.TowerOutlineHooksInstalled |
+             SmvmOverlayFlags.TowerOutlineSuppressionObserved |
+             SmvmOverlayFlags.TowerFadeOverrideInstalled |
+             SmvmOverlayFlags.TowerFadeOverrideEnforced |
+             SmvmOverlayFlags.CreepHealthbarHookRetrying |
+             SmvmOverlayFlags.TowerOutlineHooksRetrying |
+             SmvmOverlayFlags.TowerFadeOverrideRetrying);
         if (status.RendererBackend != _loggedRendererBackend ||
             status.RendererError != _loggedRendererError || lifecycle != _loggedRendererLifecycle)
         {
@@ -4044,9 +4116,27 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         replay.Connected && !string.IsNullOrWhiteSpace(replay.ReplayName) && replay.CurrentTick is not null &&
         (replay.TotalTicks is null || replay.CurrentTick < replay.TotalTicks);
 
-    private static Process? FindDeadlockProcess() =>
-        Process.GetProcessesByName("deadlock").FirstOrDefault() ??
-        Process.GetProcessesByName("project8").FirstOrDefault();
+    private static Process? FindDeadlockProcess(string expectedExecutablePath)
+    {
+        foreach (var processName in new[] { "deadlock", "project8" })
+        {
+            foreach (var process in Process.GetProcessesByName(processName))
+            {
+                try
+                {
+                    if (NativeReplayModuleLoader.IsEligibleReplayProcess(
+                            process, expectedExecutablePath, out _))
+                        return process;
+                }
+                catch (Exception ex) when (ex is InvalidOperationException or Win32Exception)
+                {
+                    // Process exited or was inaccessible between enumeration and validation.
+                }
+                process.Dispose();
+            }
+        }
+        return null;
+    }
 
     private sealed class StaleConnectionLeaseException(string message) : IOException(message);
 

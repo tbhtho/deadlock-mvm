@@ -4,13 +4,16 @@
 #include "hook_lifecycle.hpp"
 #include "manual_camera_math.hpp"
 #include "pattern_scan.hpp"
+#include "pipe_accept_policy.hpp"
 #include "protocol.hpp"
 #include "recording_visual_policy.hpp"
+#include "replay_launch_policy.hpp"
 #include "replay_session_transition.hpp"
 #include "smvm_action_queue.hpp"
 #include "smvm_overlay.hpp"
 
 #include <Windows.h>
+#include <shellapi.h>
 
 #include <algorithm>
 #include <array>
@@ -702,7 +705,14 @@ void OverlayPublishStatus(
     }
 
     const auto command_line = GetCommandLineW();
-    const auto replay_launch = command_line != nullptr && Lower(command_line).find(L"+playdemo") != std::wstring::npos;
+    auto argument_count = 0;
+    auto** const arguments = command_line == nullptr
+        ? nullptr
+        : CommandLineToArgvW(command_line, &argument_count);
+    const auto replay_launch = arguments != nullptr &&
+        HasRequiredReplayLaunchArguments(argument_count, arguments);
+    if (arguments != nullptr)
+        LocalFree(arguments);
     backend.command_line_replay.store(replay_launch, std::memory_order_release);
     if (!replay_launch) {
         backend.error.store(ErrorCode::replay_launch_required, std::memory_order_release);
@@ -1520,24 +1530,48 @@ void* __fastcall CameraUpdateHook(void* camera) noexcept {
     return detached;
 }
 
-[[nodiscard]] bool ReadExact(const HANDLE pipe, void* buffer, const DWORD size) noexcept {
+[[nodiscard]] bool ReadExact(
+    const HANDLE pipe,
+    const HANDLE io_event,
+    void* buffer,
+    const DWORD size) noexcept {
     auto* output = static_cast<std::uint8_t*>(buffer);
     DWORD total = 0;
     while (total < size) {
+        ResetEvent(io_event);
+        OVERLAPPED operation{};
+        operation.hEvent = io_event;
         DWORD read = 0;
-        if (!ReadFile(pipe, output + total, size - total, &read, nullptr) || read == 0)
+        if (!ReadFile(pipe, output + total, size - total, &read, &operation)) {
+            if (GetLastError() != ERROR_IO_PENDING ||
+                !GetOverlappedResult(pipe, &operation, &read, TRUE))
+                return false;
+        }
+        if (read == 0)
             return false;
         total += read;
     }
     return true;
 }
 
-[[nodiscard]] bool WriteExact(const HANDLE pipe, const void* buffer, const DWORD size) noexcept {
+[[nodiscard]] bool WriteExact(
+    const HANDLE pipe,
+    const HANDLE io_event,
+    const void* buffer,
+    const DWORD size) noexcept {
     const auto* input = static_cast<const std::uint8_t*>(buffer);
     DWORD total = 0;
     while (total < size) {
+        ResetEvent(io_event);
+        OVERLAPPED operation{};
+        operation.hEvent = io_event;
         DWORD written = 0;
-        if (!WriteFile(pipe, input + total, size - total, &written, nullptr) || written == 0)
+        if (!WriteFile(pipe, input + total, size - total, &written, &operation)) {
+            if (GetLastError() != ERROR_IO_PENDING ||
+                !GetOverlappedResult(pipe, &operation, &written, TRUE))
+                return false;
+        }
+        if (written == 0)
             return false;
         total += written;
     }
@@ -1586,12 +1620,16 @@ void* __fastcall CameraUpdateHook(void* camera) noexcept {
     return status;
 }
 
-[[nodiscard]] bool SendStatus(const HANDLE pipe, Backend& backend, const std::uint64_t sequence) noexcept {
+[[nodiscard]] bool SendStatus(
+    const HANDLE pipe,
+    const HANDLE io_event,
+    Backend& backend,
+    const std::uint64_t sequence) noexcept {
     const auto status = BuildStatus(backend);
     const MessageHeader header{kProtocolMagic, kProtocolVersion, MessageType::status,
                                static_cast<std::uint32_t>(sizeof(status)), sequence, 0};
-    return WriteExact(pipe, &header, static_cast<DWORD>(sizeof(header))) &&
-           WriteExact(pipe, &status, static_cast<DWORD>(sizeof(status)));
+    return WriteExact(pipe, io_event, &header, static_cast<DWORD>(sizeof(header))) &&
+           WriteExact(pipe, io_event, &status, static_cast<DWORD>(sizeof(status)));
 }
 
 void ResetConnectionGate(Backend& backend) noexcept {
@@ -1636,11 +1674,95 @@ void ResetConnectionGate(Backend& backend) noexcept {
     return ValidateSmvmSnapshotPayload(snapshot);
 }
 
-[[nodiscard]] bool ServePipeConnection(Backend& backend) noexcept {
+enum class PipeConnectionResult : std::uint8_t {
+    connected,
+    retry,
+    shutdown,
+};
+
+[[nodiscard]] bool DrainCanceledPipeConnect(
+    const HANDLE pipe,
+    OVERLAPPED& operation) noexcept {
+    static_cast<void>(CancelIoEx(pipe, &operation));
+    DWORD transferred = 0;
+    return GetOverlappedResult(pipe, &operation, &transferred, TRUE) != FALSE;
+}
+
+[[nodiscard]] PipeConnectionResult ConnectPipe(
+    const HANDLE pipe,
+    const HANDLE io_event,
+    Backend& backend,
+    const bool initial_connection,
+    const std::uint64_t initial_accept_started_at) noexcept {
+    OVERLAPPED operation{};
+    operation.hEvent = io_event;
+    const auto connect_succeeded = ConnectNamedPipe(pipe, &operation) != FALSE;
+    const auto connect_error = connect_succeeded ? ERROR_SUCCESS : GetLastError();
+    auto progress = connect_succeeded || connect_error == ERROR_PIPE_CONNECTED
+        ? PipeAcceptProgress::connected
+        : connect_error == ERROR_IO_PENDING
+            ? PipeAcceptProgress::pending
+            : PipeAcceptProgress::failed;
+
+    if (progress == PipeAcceptProgress::connected)
+        return PipeConnectionResult::connected;
+    if (progress == PipeAcceptProgress::failed)
+        return PipeConnectionResult::retry;
+
+    if (!initial_connection) {
+        if (WaitForSingleObject(io_event, INFINITE) == WAIT_OBJECT_0) {
+            DWORD transferred = 0;
+            if (GetOverlappedResult(pipe, &operation, &transferred, FALSE))
+                return PipeConnectionResult::connected;
+        }
+        static_cast<void>(DrainCanceledPipeConnect(pipe, operation));
+        return PipeConnectionResult::retry;
+    }
+
+    for (;;) {
+        const auto elapsed = GetTickCount64() - initial_accept_started_at;
+        const auto action = ResolveInitialPipeAcceptAction(
+            progress,
+            backend.shutdown.load(std::memory_order_acquire),
+            elapsed);
+        if (action == InitialPipeAcceptAction::accept)
+            return PipeConnectionResult::connected;
+        if (action == InitialPipeAcceptAction::fail)
+            return PipeConnectionResult::retry;
+        if (action == InitialPipeAcceptAction::cancel_for_shutdown ||
+            action == InitialPipeAcceptAction::cancel_for_timeout) {
+            if (DrainCanceledPipeConnect(pipe, operation))
+                return PipeConnectionResult::connected;
+            if (action == InitialPipeAcceptAction::cancel_for_timeout)
+                backend.shutdown.store(true, std::memory_order_release);
+            return PipeConnectionResult::shutdown;
+        }
+
+        const auto wait_result = WaitForSingleObject(
+            io_event,
+            InitialPipeAcceptWaitMilliseconds(elapsed));
+        if (wait_result == WAIT_TIMEOUT)
+            continue;
+        if (wait_result == WAIT_OBJECT_0) {
+            DWORD transferred = 0;
+            progress = GetOverlappedResult(pipe, &operation, &transferred, FALSE)
+                ? PipeAcceptProgress::connected
+                : PipeAcceptProgress::failed;
+            continue;
+        }
+        static_cast<void>(DrainCanceledPipeConnect(pipe, operation));
+        return PipeConnectionResult::retry;
+    }
+}
+
+[[nodiscard]] bool ServePipeConnection(
+    Backend& backend,
+    const bool initial_connection,
+    const std::uint64_t initial_accept_started_at) noexcept {
     const auto name = L"\\\\.\\pipe\\DeadlockMVM.Native." + std::to_wstring(GetCurrentProcessId());
     const auto pipe = CreateNamedPipeW(
         name.c_str(),
-        PIPE_ACCESS_DUPLEX,
+        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
         1,
         4096,
@@ -1654,8 +1776,23 @@ void ResetConnectionGate(Backend& backend) noexcept {
         return false;
     }
 
-    const auto connected = ConnectNamedPipe(pipe, nullptr) != FALSE || GetLastError() == ERROR_PIPE_CONNECTED;
-    if (!connected) {
+    const auto io_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (io_event == nullptr) {
+        CloseHandle(pipe);
+        backend.state.store(BackendState::failed, std::memory_order_release);
+        backend.error.store(ErrorCode::protocol_error, std::memory_order_release);
+        backend.shutdown.store(true, std::memory_order_release);
+        return false;
+    }
+
+    const auto connection = ConnectPipe(
+        pipe,
+        io_event,
+        backend,
+        initial_connection,
+        initial_accept_started_at);
+    if (connection != PipeConnectionResult::connected) {
+        CloseHandle(io_event);
         CloseHandle(pipe);
         return false;
     }
@@ -1664,7 +1801,7 @@ void ResetConnectionGate(Backend& backend) noexcept {
     backend.pipe_connected.store(true, std::memory_order_release);
     while (!backend.shutdown.load(std::memory_order_acquire)) {
         MessageHeader header{};
-        if (!ReadExact(pipe, &header, static_cast<DWORD>(sizeof(header))))
+        if (!ReadExact(pipe, io_event, &header, static_cast<DWORD>(sizeof(header))))
             break;
         if (!ValidateHeader(header) || !ValidatePayloadSize(header.type, header.payload_size)) {
             backend.error.store(ErrorCode::protocol_error, std::memory_order_release);
@@ -1672,7 +1809,7 @@ void ResetConnectionGate(Backend& backend) noexcept {
         }
 
         std::array<std::uint8_t, kMaxMessageBytes> payload{};
-        if (header.payload_size != 0 && !ReadExact(pipe, payload.data(), header.payload_size))
+        if (header.payload_size != 0 && !ReadExact(pipe, io_event, payload.data(), header.payload_size))
             break;
 
         SmvmSnapshotPayload current_snapshot{};
@@ -1687,7 +1824,7 @@ void ResetConnectionGate(Backend& backend) noexcept {
             // A command queued for an older replay must be observational only:
             // acknowledge its sequence without changing camera ownership, path,
             // samples, or diagnostics in the newly loaded replay.
-            if (!SendStatus(pipe, backend, header.sequence))
+            if (!SendStatus(pipe, io_event, backend, header.sequence))
                 break;
             continue;
         }
@@ -1941,22 +2078,51 @@ void ResetConnectionGate(Backend& backend) noexcept {
                 break;
         }
 
-        if (!SendStatus(pipe, backend, header.sequence))
+        if (!SendStatus(pipe, io_event, backend, header.sequence))
             break;
     }
 
     FlushFileBuffers(pipe);
     DisconnectNamedPipe(pipe);
+    CloseHandle(io_event);
     CloseHandle(pipe);
     ResetConnectionGate(backend);
     return true;
 }
 
 void ServePipe(Backend& backend) noexcept {
+    bool initial_connection = true;
+    const auto initial_accept_started_at = GetTickCount64();
     while (!backend.shutdown.load(std::memory_order_acquire)) {
-        const auto served = ServePipeConnection(backend);
-        if (!served && !backend.shutdown.load(std::memory_order_acquire))
-            Sleep(100);
+        if (initial_connection) {
+            const auto initial_action = ResolveInitialPipeAcceptAction(
+                PipeAcceptProgress::pending,
+                false,
+                GetTickCount64() - initial_accept_started_at);
+            if (initial_action == InitialPipeAcceptAction::cancel_for_timeout) {
+                backend.shutdown.store(true, std::memory_order_release);
+                break;
+            }
+        }
+        const auto served = ServePipeConnection(
+            backend,
+            initial_connection,
+            initial_accept_started_at);
+        if (served)
+            initial_connection = false;
+        if (!served && !backend.shutdown.load(std::memory_order_acquire)) {
+            if (!initial_connection) {
+                Sleep(100);
+                continue;
+            }
+            const auto elapsed = GetTickCount64() - initial_accept_started_at;
+            const auto wait_milliseconds = InitialPipeAcceptWaitMilliseconds(elapsed);
+            if (wait_milliseconds == 0) {
+                backend.shutdown.store(true, std::memory_order_release);
+                break;
+            }
+            Sleep(wait_milliseconds);
+        }
     }
 }
 
@@ -1972,6 +2138,8 @@ void ServePipe(Backend& backend) noexcept {
 
     if (!ValidateHostProcess(backend)) {
         backend.state.store(BackendState::failed, std::memory_order_release);
+        g_backend = nullptr;
+        FreeLibraryAndExitThread(self_module, 0);
     } else {
         // The launcher loads this component immediately after process creation
         // so the renderer hook can be installed before Deadlock publishes its

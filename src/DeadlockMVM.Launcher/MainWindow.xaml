@@ -1,6 +1,7 @@
 <Window x:Class="DeadlockMVM.Launcher.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:core="clr-namespace:DeadlockMVM.Core;assembly=DeadlockMVM.Core"
         xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
         Title="Deadlock MVM Launcher"
         Width="560"
@@ -143,11 +144,12 @@
                             Margin="0,8,0,0" />
 
                     <!-- Launch arguments -->
-                    <TextBlock Text="Launch arguments"
+                    <TextBlock Text="Additional launch arguments"
                                Style="{StaticResource SectionLabel}"
                                Margin="0,17,0,0" />
                     <TextBox Style="{StaticResource DarkTextBox}"
-                             Text="{Binding ExtraArguments, UpdateSourceTrigger=PropertyChanged}"
+                              Text="{Binding ExtraArguments, UpdateSourceTrigger=PropertyChanged}"
+                              ToolTip="Movie Mode always supplies -insecure -dev -console -condebug. Add optional arguments here."
                              Margin="0,7,0,0" />
 
                     <CheckBox Content="Hide launcher while Deadlock is running"
@@ -226,7 +228,7 @@
 
                     <!-- Version footer -->
                     <Grid Margin="0,12,0,0" MinHeight="20">
-                        <TextBlock Text="v0.1.0"
+                        <TextBlock Text="{x:Static core:ProductInfo.DisplayVersion}"
                                    Style="{StaticResource MutedText}"
                                    HorizontalAlignment="Right" />
                     </Grid>
@@ -362,7 +364,7 @@
                             VerticalAlignment="Center"
                             Command="{Binding UseSelectedReplayCommand}" />
                     <Button Grid.Column="2"
-                            Content="PLAY REPLAY"
+                            Content="{Binding PlayButtonText}"
                             Style="{StaticResource SmallButton}"
                             VerticalAlignment="Center"
                             Margin="8,0,0,0"

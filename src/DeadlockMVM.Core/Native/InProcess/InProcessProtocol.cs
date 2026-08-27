@@ -95,6 +95,15 @@ public enum SmvmOverlayFlags : uint
     WindowProcedureReady = 1 << 13,
     EngineInputReady = 1 << 14,
     FallbackMouseObserved = 1 << 15,
+    CreepHealthbarHookInstalled = 1 << 16,
+    CreepHealthbarSuppressionObserved = 1 << 17,
+    TowerOutlineHooksInstalled = 1 << 18,
+    TowerOutlineSuppressionObserved = 1 << 19,
+    TowerFadeOverrideInstalled = 1 << 20,
+    TowerFadeOverrideEnforced = 1 << 21,
+    CreepHealthbarHookRetrying = 1 << 22,
+    TowerOutlineHooksRetrying = 1 << 23,
+    TowerFadeOverrideRetrying = 1 << 24,
 }
 
 [Flags]
@@ -533,7 +542,7 @@ public sealed record InProcessCameraStatus(
 internal static class InProcessProtocol
 {
     public const uint Magic = 0x4D564D43;
-    public const ushort Version = 15;
+    public const ushort Version = 16;
     public const int HeaderSize = 28;
     public const int StatusSize = 272;
     public const int SmvmSnapshotSize = 744;
@@ -841,7 +850,16 @@ internal static class InProcessProtocol
             SmvmOverlayFlags.RelativeMouseReady | SmvmOverlayFlags.RawInputReady |
             SmvmOverlayFlags.CursorReady | SmvmOverlayFlags.ForegroundReady |
             SmvmOverlayFlags.WindowProcedureReady | SmvmOverlayFlags.EngineInputReady |
-            SmvmOverlayFlags.FallbackMouseObserved;
+            SmvmOverlayFlags.FallbackMouseObserved |
+            SmvmOverlayFlags.CreepHealthbarHookInstalled |
+            SmvmOverlayFlags.CreepHealthbarSuppressionObserved |
+            SmvmOverlayFlags.TowerOutlineHooksInstalled |
+            SmvmOverlayFlags.TowerOutlineSuppressionObserved |
+            SmvmOverlayFlags.TowerFadeOverrideInstalled |
+            SmvmOverlayFlags.TowerFadeOverrideEnforced |
+            SmvmOverlayFlags.CreepHealthbarHookRetrying |
+            SmvmOverlayFlags.TowerOutlineHooksRetrying |
+            SmvmOverlayFlags.TowerFadeOverrideRetrying;
         if (!Enum.IsDefined(state) || !Enum.IsDefined(error) || (flags & ~knownStatusFlags) != 0 ||
             !Enum.IsDefined(rendererBackend) || !Enum.IsDefined(rendererError) ||
             (overlayFlags & ~knownOverlayFlags) != 0)

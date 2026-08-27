@@ -8,6 +8,7 @@ native/build/
 
 ## Published launcher output
 /release/
+/release-visual-fix/
 
 ## Visual Studio
 .vs/
@@ -43,3 +44,18 @@ tools/out/
 ## Reverse-engineering research work area (IDA databases, binary copies, temp)
 tools/research/ida/
 /tests/DeadlockMVM.Core.Tests/
+
+# Local development records
+/docs/
+/.history/
+/.github/
+/KeyboardVerify/
+/LiveVerify/
+/ReshadeVerify/
+/native/DeadlockMVM.Native.Tests/
+/BUILDING.md
+/CHANGELOG.md
+/FINAL_STATUS.md
+/KNOWN-ISSUES.md
+/PROJECT_MEMORY.md
+/RESHade-IMPLEMENTATION.md

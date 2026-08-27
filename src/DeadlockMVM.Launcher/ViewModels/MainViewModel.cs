@@ -14,6 +14,8 @@ namespace DeadlockMVM.Launcher.ViewModels;
 
 public sealed class MainViewModel : ViewModelBase
 {
+    private static readonly TimeSpan ReplayLaunchDetectionTimeout = TimeSpan.FromMinutes(2);
+
     private readonly ISteamService _steam;
     private readonly IProcessMonitor _process;
     private readonly IGameLauncher _launcher;
@@ -42,6 +44,8 @@ public sealed class MainViewModel : ViewModelBase
     private ReplayInfo? _selectedReplay;
     private string _replayDirectoryPath = string.Empty;
     private string _replayStatusText = "Deadlock installation not found.";
+    private int _launchAttemptGeneration;
+    private int _launchOperationGeneration;
 
     public event EventHandler<bool>? LaunchCompleted;
     public event EventHandler<bool>? DeadlockRunningChanged;
@@ -61,9 +65,8 @@ public sealed class MainViewModel : ViewModelBase
         _replayService = replayService;
         _log = log;
         _settings = settings;
-        _extraArguments = string.IsNullOrWhiteSpace(settings.ExtraLaunchArguments)
-            ? DefaultLaunchArguments
-            : settings.ExtraLaunchArguments;
+        _extraArguments = MovieModeLaunchPolicy.NormalizeAdditionalArguments(
+            settings.ExtraLaunchArguments);
 
         LaunchCommand = new RelayCommand(Launch, () => CanLaunch);
         RefreshCommand = new RelayCommand(Refresh);
@@ -78,8 +81,6 @@ public sealed class MainViewModel : ViewModelBase
         _timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(3) };
         _timer.Tick += (_, _) => RefreshProcesses();
     }
-
-    private static string DefaultLaunchArguments => string.Join(' ', DeadlockConstants.MovieModeArguments);
 
     public ICommand LaunchCommand { get; }
 
@@ -250,7 +251,19 @@ public sealed class MainViewModel : ViewModelBase
         private set
         {
             if (SetProperty(ref _deadlockRunning, value))
+            {
+                if (value && IsLaunching)
+                {
+                    CompleteLaunchOpening();
+                    StatusMessage = SelectedReplay is { } replay
+                        ? $"Playing {replay.FileName}..."
+                        : "Replay is running.";
+                    _log.Info("Deadlock process detected; replay launch lock released.");
+                }
                 DeadlockRunningChanged?.Invoke(this, value);
+                OnPropertyChanged(nameof(PlayButtonText));
+                NotifyLaunchStateChanged();
+            }
         }
     }
 
@@ -342,11 +355,14 @@ public sealed class MainViewModel : ViewModelBase
         private set
         {
             if (SetProperty(ref _isLaunching, value))
+            {
+                OnPropertyChanged(nameof(PlayButtonText));
                 NotifyLaunchStateChanged();
+            }
         }
     }
 
-    public bool CanLaunch => DeadlockInstalled && !IsLaunching;
+    public bool CanLaunch => DeadlockInstalled && !DeadlockRunning && !IsLaunching;
 
     public bool IsReplaysPage
     {
@@ -354,8 +370,13 @@ public sealed class MainViewModel : ViewModelBase
         private set => SetProperty(ref _isReplaysPage, value);
     }
 
-    public string PlayButtonText =>
-        SelectedReplay is null ? "SELECT A REPLAY" : "PLAY SELECTED REPLAY";
+    public string PlayButtonText => IsLaunching
+        ? "LAUNCHING REPLAY..."
+        : DeadlockRunning
+            ? "REPLAY RUNNING"
+            : SelectedReplay is null
+                ? "SELECT A REPLAY"
+                : "PLAY SELECTED REPLAY";
 
     public ReplayInfo? SelectedReplay
     {
@@ -477,6 +498,12 @@ public sealed class MainViewModel : ViewModelBase
 
     private void Launch()
     {
+        if (IsLaunching || DeadlockRunning)
+        {
+            _log.Info("Ignored replay launch because Deadlock is already opening or running.");
+            return;
+        }
+
         if (!DeadlockInstalled)
         {
             StatusMessage = "Deadlock installation not found.";
@@ -492,13 +519,14 @@ public sealed class MainViewModel : ViewModelBase
         }
 
         var replay = SelectedReplay;
-        _settings.ExtraLaunchArguments = ExtraArguments;
+        var additionalArguments = MovieModeLaunchPolicy.NormalizeAdditionalArguments(ExtraArguments);
+        if (!string.Equals(additionalArguments, ExtraArguments, StringComparison.Ordinal))
+            ExtraArguments = additionalArguments;
+        _settings.ExtraLaunchArguments = additionalArguments;
         _settings.Save();
 
-        var gameArguments = CommandLine
-            .Tokenize(ExtraArguments)
-            .Concat(ReplayCommands.StartDemoPaused(replay.GamePath))
-            .ToArray();
+        var gameArguments = MovieModeLaunchPolicy.BuildReplayArguments(
+            additionalArguments, replay.GamePath);
         var steamExecutable = ResolveSteamExecutable();
         var launchThroughSteam = steamExecutable is not null;
         var request = new LaunchRequest
@@ -520,7 +548,9 @@ public sealed class MainViewModel : ViewModelBase
         _log.Info($"Replay playback requested: {replay.FileName} as '{replay.GamePath}'");
 
         IsLaunching = true;
-        StatusMessage = $"Launching {replay.FileName}...";
+        var launchOperation = Interlocked.Increment(ref _launchOperationGeneration);
+        var launchAttempt = Interlocked.Increment(ref _launchAttemptGeneration);
+        StatusMessage = "Launching replay...";
 
         var result = _launcher.Launch(request);
 
@@ -529,7 +559,7 @@ public sealed class MainViewModel : ViewModelBase
             _log.Info($"Launch OK — PID {result.ProcessId}, command: {result.FullCommandLine}");
             if (launchThroughSteam)
             {
-                BeginEarlyNativeLoadForSteamLaunch();
+                BeginEarlyNativeLoadForSteamLaunch(launchOperation);
             }
             else if (result.ProcessId is int processId)
             {
@@ -537,24 +567,54 @@ public sealed class MainViewModel : ViewModelBase
                 // Deadlock creates its real DXGI swapchain. The session monitor
                 // remains the retry/reconnect path if this earliest attempt
                 // loses a startup race or the process rejects the load.
-                var nativePath = Path.Combine(AppContext.BaseDirectory, "DeadlockMVM.Native.dll");
-                var nativeLoad = NativeReplayModuleLoader.LoadForReplay(processId, nativePath);
-                if (nativeLoad.Success)
-                    _log.Info($"Early native load: {nativeLoad.Message}");
-                else
-                    _log.Warn($"Early native load unavailable; monitor will retry: {nativeLoad.Message}");
+                BeginEarlyNativeLoadForDirectLaunch(launchOperation, processId);
             }
-            StatusMessage = $"Playing {replay.FileName}...";
-            BeginVerifyPlayback(replay.GamePath);
+            StatusMessage = "Launching replay...";
+            BeginLaunchDetectionTimeout(launchAttempt, replay.FileName);
+            BeginVerifyPlayback(launchOperation, replay.GamePath);
         }
         else
         {
             _log.Error(result.Message);
             StatusMessage = result.Message;
+            CompleteLaunchOpening();
         }
 
-        IsLaunching = false;
         LaunchCompleted?.Invoke(this, result.Success);
+    }
+
+    private void BeginLaunchDetectionTimeout(int launchAttempt, string replayFileName)
+    {
+        var uiScheduler = SynchronizationContext.Current is { }
+            ? TaskScheduler.FromCurrentSynchronizationContext()
+            : TaskScheduler.Default;
+
+        _ = Task.Run(async () =>
+            {
+                await Task.Delay(ReplayLaunchDetectionTimeout).ConfigureAwait(false);
+            })
+            .ContinueWith(
+                _ =>
+                {
+                    if (!IsLaunching || launchAttempt != Volatile.Read(ref _launchAttemptGeneration))
+                        return;
+
+                    CompleteLaunchOpening();
+                    StatusMessage = $"Deadlock did not open for {replayFileName}. You can try again.";
+                    _log.Warn(
+                        $"Replay launch lock timed out after {ReplayLaunchDetectionTimeout.TotalSeconds:0} seconds; " +
+                        "no Deadlock process was detected.");
+                    LaunchCompleted?.Invoke(this, false);
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                uiScheduler);
+    }
+
+    private void CompleteLaunchOpening()
+    {
+        Interlocked.Increment(ref _launchAttemptGeneration);
+        IsLaunching = false;
     }
 
     public void NotifyLauncherHidden() =>
@@ -562,6 +622,7 @@ public sealed class MainViewModel : ViewModelBase
 
     public void RestoreAfterDeadlockExit()
     {
+        Interlocked.Increment(ref _launchOperationGeneration);
         Refresh();
         StatusMessage = "Deadlock closed. Launcher restored.";
         _log.Info("Deadlock exited; launcher window restored and replay state refreshed.");
@@ -575,7 +636,24 @@ public sealed class MainViewModel : ViewModelBase
         return File.Exists(executable) ? executable : null;
     }
 
-    private void BeginEarlyNativeLoadForSteamLaunch()
+    private void BeginEarlyNativeLoadForDirectLaunch(int launchOperation, int processId)
+    {
+        var nativePath = Path.Combine(AppContext.BaseDirectory, "DeadlockMVM.Native.dll");
+        var expectedGamePath = Path.GetFullPath(_gameExecutablePath);
+        _ = Task.Run(() =>
+        {
+            if (launchOperation != Volatile.Read(ref _launchOperationGeneration))
+                return;
+            var nativeLoad = NativeReplayModuleLoader.LoadForReplay(
+                processId, nativePath, expectedGamePath);
+            if (nativeLoad.Success)
+                _log.Info($"Early native load: {nativeLoad.Message}");
+            else
+                _log.Warn($"Early native load unavailable; monitor will retry: {nativeLoad.Message}");
+        });
+    }
+
+    private void BeginEarlyNativeLoadForSteamLaunch(int launchOperation)
     {
         var nativePath = Path.Combine(AppContext.BaseDirectory, "DeadlockMVM.Native.dll");
         var expectedGamePath = Path.GetFullPath(_gameExecutablePath);
@@ -585,6 +663,8 @@ public sealed class MainViewModel : ViewModelBase
             string? lastFailure = null;
             while (DateTime.UtcNow < deadline)
             {
+                if (launchOperation != Volatile.Read(ref _launchOperationGeneration))
+                    return;
                 foreach (var processName in new[]
                          {
                              DeadlockConstants.GameProcessName,
@@ -602,7 +682,10 @@ public sealed class MainViewModel : ViewModelBase
                                         StringComparison.OrdinalIgnoreCase))
                                     continue;
 
-                                var nativeLoad = NativeReplayModuleLoader.LoadForReplay(process.Id, nativePath);
+                                if (launchOperation != Volatile.Read(ref _launchOperationGeneration))
+                                    return;
+                                var nativeLoad = NativeReplayModuleLoader.LoadForReplay(
+                                    process.Id, nativePath, expectedGamePath);
                                 if (nativeLoad.Success)
                                 {
                                     _log.Info($"Early Steam native load: {nativeLoad.Message}");
@@ -634,7 +717,7 @@ public sealed class MainViewModel : ViewModelBase
     /// actually started. The game truncates the log on every launch, so the
     /// whole file is scanned; readiness comes from file writes, not sleeps.
     /// </summary>
-    private void BeginVerifyPlayback(string gamePath)
+    private void BeginVerifyPlayback(int launchOperation, string gamePath)
     {
         var consoleLogPath = DeadlockConsoleLog.GetConsoleLogPath(_gameExecutablePath);
         var startedAfterLocal = DateTime.Now.AddMinutes(-1);
@@ -653,6 +736,9 @@ public sealed class MainViewModel : ViewModelBase
             {
                 await Task.Delay(2000).ConfigureAwait(false);
 
+                if (launchOperation != Volatile.Read(ref _launchOperationGeneration))
+                    return;
+
                 if (DeadlockConsoleLog.ContainsPlaybackConfirmation(
                         consoleLogPath, gamePath, startedAfterLocal))
                 {
@@ -664,6 +750,8 @@ public sealed class MainViewModel : ViewModelBase
             await Task.Factory.StartNew(
                 () =>
                 {
+                    if (launchOperation != Volatile.Read(ref _launchOperationGeneration))
+                        return;
                     StatusMessage = confirmed
                         ? "Replay playback confirmed."
                         : "Could not confirm playback in Deadlock's console log.";
@@ -837,7 +925,7 @@ public sealed class MainViewModel : ViewModelBase
             return;
         }
 
-        var arguments = CommandLine.Tokenize(ExtraArguments);
+        var arguments = MovieModeLaunchPolicy.BuildPreviewArguments(ExtraArguments);
         var steamExecutable = ResolveSteamExecutable();
         if (steamExecutable is not null)
         {

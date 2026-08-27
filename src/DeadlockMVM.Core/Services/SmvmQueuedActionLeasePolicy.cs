@@ -94,6 +94,13 @@ public static class SmvmQueuedActionLeasePolicy
     public static bool RequiresReplayLease(SmvmAction action) =>
         GetScope(action) == SmvmQueuedActionScope.ReplayIdentity;
 
+    /// <summary>
+    /// Playback speed owns only the engine clock and has its own process/replay
+    /// fencing. It must not wait behind serialized seek or camera operations.
+    /// </summary>
+    public static bool BypassesSerializedCameraActionGate(SmvmAction action) =>
+        GetScope(action) == SmvmQueuedActionScope.PlaybackSpeed;
+
     private static bool RequiresReplayIdentity(SmvmActionType action) => action is
         SmvmActionType.ToggleReplayPause or
         SmvmActionType.SetTimescale or

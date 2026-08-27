@@ -8,6 +8,33 @@
 
 namespace deadlock_mvm {
 
+struct RecordingVisualHostDisconnectState final {
+    bool bootstrap_suppression_armed{};
+    bool managed_snapshot_observed{};
+    DeadlockUiMode local_mode{DeadlockUiMode::deadlock_ui};
+};
+
+[[nodiscard]] constexpr bool ShouldNotifyRecordingVisualHostDisconnectOnSnapshotAbsence(
+    const bool managed_snapshot_observed) noexcept {
+    // A missing render-time snapshot is ordinary startup state until the first
+    // validated managed lease arrives. An actual pipe close is routed through
+    // ResetConnectionGate even when it happens before that first snapshot.
+    return managed_snapshot_observed;
+}
+
+[[nodiscard]] constexpr RecordingVisualHostDisconnectState
+ResolveRecordingVisualHostDisconnectState(
+    RecordingVisualHostDisconnectState state) noexcept {
+    // The command-line bootstrap is a temporary bridge to the first validated
+    // managed snapshot. A closed pipe always retires that lease. If no snapshot
+    // ever arrived, no managed presentation owner exists to recover, so remain
+    // in the native fail-open Deadlock presentation.
+    state.bootstrap_suppression_armed = false;
+    if (!state.managed_snapshot_observed)
+        state.local_mode = DeadlockUiMode::deadlock_ui;
+    return state;
+}
+
 [[nodiscard]] constexpr DeadlockUiMode ResolveLocalRecordingPresentationMode(
     const DeadlockUiMode managed_mode,
     const bool explicit_restore_pending,
@@ -74,8 +101,9 @@ enum class RecordingVisualShutdownAction : std::uint32_t {
 
 // Fixed, current-build replay presentation profiles. Keep these typed and
 // narrow: they are also used by the native F9 / host-loss recovery path.
-inline constexpr std::array<std::string_view, 18> kReplayPresentationCommands{
+inline constexpr std::array<std::string_view, 20> kReplayPresentationCommands{
     "sv_cheats 1",
+    "engine_frametime_warnings_enable 0",
     "citadel_player_glow_disabled true",
     "citadel_trooper_glow_disabled true",
     "citadel_trooper_friendly_glow_disabled true",
@@ -91,27 +119,30 @@ inline constexpr std::array<std::string_view, 18> kReplayPresentationCommands{
     "citadel_unit_status_hide_names true",
     "citadel_unit_status_old_hide_names true",
     "citadel_camera_fade_viewed_near_opacity 1",
-    "citadel_camera_fade_other_near_opacity 1",
+    "r_citadel_clip_sphere_min_opacity 1",
+    "r_citadel_clip_sphere_distance_max 75",
     "r_drawpanorama false",
 };
 
-inline constexpr std::array<std::string_view, 18> kDeadlockPresentationRestoreCommands{
+inline constexpr std::array<std::string_view, 20> kDeadlockPresentationRestoreCommands{
     "citadel_player_glow_disabled false",
     "citadel_trooper_glow_disabled false",
-    "citadel_trooper_friendly_glow_disabled false",
-    "citadel_trooper_outline_enabled true",
+    "citadel_trooper_friendly_glow_disabled true",
+    "citadel_trooper_outline_enabled false",
     "citadel_boss_glow_disabled false",
     "citadel_unit_status_allies_see_thru_walls true",
     "citadel_unit_status_enabled true",
     "citadel_healthbars_enabled true",
-    "citadel_unit_status_max_total_bars 2",
+    "citadel_unit_status_max_total_bars 6",
     "r_citadel_glow_health_bars true",
     "citadel_hud_objective_health_enabled 2",
     "r_citadel_see_thru_walls_opacity 0.3",
     "citadel_unit_status_hide_names false",
     "citadel_unit_status_old_hide_names false",
     "citadel_camera_fade_viewed_near_opacity 0.4",
-    "citadel_camera_fade_other_near_opacity 0.4",
+    "r_citadel_clip_sphere_min_opacity 0.4",
+    "r_citadel_clip_sphere_distance_max 75",
+    "engine_frametime_warnings_enable 1",
     "r_drawpanorama true",
     "sv_cheats 0",
 };

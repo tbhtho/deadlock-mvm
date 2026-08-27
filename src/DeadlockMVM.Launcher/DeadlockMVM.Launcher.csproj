@@ -11,6 +11,14 @@
 
   <ItemGroup>
     <ProjectReference Include="..\DeadlockMVM.Core\DeadlockMVM.Core.csproj" />
+    <Content Include="..\..\THIRD_PARTY_NOTICES.md"
+             Link="THIRD_PARTY_NOTICES.md"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="..\..\native\third_party\imgui\LICENSE.txt"
+             Link="THIRD_PARTY_LICENSES\DearImGui-LICENSE.txt"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
   <PropertyGroup>

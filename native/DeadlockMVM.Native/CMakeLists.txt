@@ -1,10 +1,14 @@
 add_library(DeadlockMVM.Native SHARED
     dllmain.cpp
+    npc_healthbar_hook.cpp
     pattern_scan.cpp
     replay_camera.cpp
     smvm_overlay.cpp
     smvm_theme.cpp
     smvm_ui.cpp
+    tower_fade_override.cpp
+    tower_outline_hook.cpp
+    version.rc
 )
 
 target_include_directories(DeadlockMVM.Native PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -16,7 +20,7 @@ target_compile_definitions(DeadlockMVM.Native PRIVATE
 )
 target_compile_options(DeadlockMVM.Native PRIVATE /W4 /WX /permissive- /EHsc /guard:cf)
 target_link_options(DeadlockMVM.Native PRIVATE /DYNAMICBASE /NXCOMPAT /GUARD:CF)
-target_link_libraries(DeadlockMVM.Native PRIVATE imgui Advapi32 D3D11 D3DCompiler DXGI Gdi32 User32 Ws2_32)
+target_link_libraries(DeadlockMVM.Native PRIVATE imgui Advapi32 D3D11 D3DCompiler DXGI Gdi32 Shell32 User32 Ws2_32)
 
 set_target_properties(DeadlockMVM.Native PROPERTIES
     OUTPUT_NAME "DeadlockMVM.Native"

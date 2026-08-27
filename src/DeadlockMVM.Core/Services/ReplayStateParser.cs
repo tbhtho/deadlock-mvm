@@ -134,7 +134,12 @@ public sealed partial class ReplayStateParser
             if (gameTick > demoTick)
                 _gameTickOffset = gameTick - demoTick;
 
-            return new ReplayState { CurrentTick = demoTick };
+            // This is only Deadlock acknowledging the requested destination.
+            // On a freshly paused replay it can remain at the original tick for
+            // several seconds. Publishing the target here falsely completes
+            // the protected seek before the engine has moved. Only a skip-
+            // finished line or an authoritative position poll can prove arrival.
+            return null;
         }
 
         var serverStart = ServerStartTickLine().Match(line);

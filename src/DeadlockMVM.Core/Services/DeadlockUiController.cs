@@ -14,6 +14,7 @@ public sealed class DeadlockUiController
     new[]
     {
         ReplayCommands.EnableReplayDevelopmentConVars,
+        ReplayCommands.DisableFrameSpikeReports,
         "citadel_player_glow_disabled true",
         "citadel_trooper_glow_disabled true",
         "citadel_trooper_friendly_glow_disabled true",
@@ -29,7 +30,8 @@ public sealed class DeadlockUiController
         "citadel_unit_status_hide_names true",
         "citadel_unit_status_old_hide_names true",
         "citadel_camera_fade_viewed_near_opacity 1",
-        "citadel_camera_fade_other_near_opacity 1",
+        "r_citadel_clip_sphere_min_opacity 1",
+        "r_citadel_clip_sphere_distance_max 75",
         "r_drawpanorama false",
     });
 
@@ -38,20 +40,22 @@ public sealed class DeadlockUiController
     {
         "citadel_player_glow_disabled false",
         "citadel_trooper_glow_disabled false",
-        "citadel_trooper_friendly_glow_disabled false",
-        "citadel_trooper_outline_enabled true",
+        "citadel_trooper_friendly_glow_disabled true",
+        "citadel_trooper_outline_enabled false",
         "citadel_boss_glow_disabled false",
         "citadel_unit_status_allies_see_thru_walls true",
         "citadel_unit_status_enabled true",
         "citadel_healthbars_enabled true",
-        "citadel_unit_status_max_total_bars 2",
+        "citadel_unit_status_max_total_bars 6",
         "r_citadel_glow_health_bars true",
         "citadel_hud_objective_health_enabled 2",
         "r_citadel_see_thru_walls_opacity 0.3",
         "citadel_unit_status_hide_names false",
         "citadel_unit_status_old_hide_names false",
         "citadel_camera_fade_viewed_near_opacity 0.4",
-        "citadel_camera_fade_other_near_opacity 0.4",
+        "r_citadel_clip_sphere_min_opacity 0.4",
+        "r_citadel_clip_sphere_distance_max 75",
+        ReplayCommands.EnableFrameSpikeReports,
         "r_drawpanorama true",
         "sv_cheats 0",
     });
@@ -59,11 +63,15 @@ public sealed class DeadlockUiController
     /// <summary>
     /// Pause/resume and Tab can recreate Panorama without resetting the other
     /// movie-presentation cvars. Those frequent transitions only need this
-    /// single idempotent command; replaying the full profile on every state
-    /// callback creates avoidable VConsole and render-thread pressure.
+    /// tiny idempotent batch; replaying the full profile on every state callback
+    /// creates avoidable VConsole and render-thread pressure.
     /// </summary>
     public static IReadOnlyList<string> ReplayHudSuppressionCommands { get; } =
-        Array.AsReadOnly(new[] { "r_drawpanorama false" });
+        Array.AsReadOnly(new[]
+        {
+            ReplayCommands.DisableFrameSpikeReports,
+            "r_drawpanorama false",
+        });
 
     private readonly ReplayController _replay;
     private readonly ILogService _log;
@@ -144,7 +152,10 @@ public sealed class DeadlockUiController
             {
                 SendProfile(ReplayPresentationCommands);
                 CompleteProfileApply(mode, recoveryGeneration);
-                _log.Info($"Deadlock UI mode applied: {mode}.");
+                _log.Info(
+                    $"Deadlock UI mode applied: {mode} " +
+                    $"(full profile, {ReplayPresentationCommands.Count} commands, " +
+                    $"ack={recoveryGeneration}).");
                 return true;
             }
             catch (Exception ex)
@@ -160,8 +171,17 @@ public sealed class DeadlockUiController
     /// mode. Replay transport and editor-menu transitions can make the engine
     /// recreate Panorama even though SMVM still owns the movie interface.
     /// </summary>
-    public bool ReassertSuppression(bool replayActive)
+    public bool ReassertSuppression(bool replayActive) =>
+        ReassertSuppressionIfCurrent(replayActive, static () => true);
+
+    /// <summary>
+    /// Reasserts only the inexpensive runtime suppression commands while the
+    /// caller's process/replay lease remains current. Pause, resume, Tab, and
+    /// seek landing must never reinstall the complete render profile.
+    /// </summary>
+    public bool ReassertSuppressionIfCurrent(bool replayActive, Func<bool> stillCurrent)
     {
+        ArgumentNullException.ThrowIfNull(stillCurrent);
         var profile = ProfileStatus;
         if (profile.DesiredMode == DeadlockUiMode.DeadlockUi)
             return profile.Ui.Mode == DeadlockUiMode.DeadlockUi && !profile.RestorePending;
@@ -170,9 +190,19 @@ public sealed class DeadlockUiController
 
         lock (_profileTransactionGate)
         {
+            if (!stillCurrent())
+                return false;
             profile = ProfileStatus;
             if (profile.DesiredMode == DeadlockUiMode.DeadlockUi)
                 return profile.Ui.Mode == DeadlockUiMode.DeadlockUi && !profile.RestorePending;
+            // This two-command path is only safe after the complete forward
+            // presentation profile has been acknowledged. If a prior apply
+            // failed and restored Deadlock's physical state, a thin reassert
+            // must not retire that recovery debt or claim the desired mode.
+            if (profile.Ui.Mode != profile.DesiredMode ||
+                profile.TransactionInProgress ||
+                profile.ShouldRetryForwardProfile)
+                return false;
             if (!_replay.IsConnected)
                 return Fail(DeadlockUiError.CommandChannelUnavailable, "Deadlock's command channel is unavailable.");
 
@@ -182,7 +212,9 @@ public sealed class DeadlockUiController
             {
                 SendProfile(ReplayHudSuppressionCommands);
                 CompleteProfileApply(profile.DesiredMode, profile.AcknowledgementGeneration);
-                _log.Info("Deadlock HUD suppression reasserted.");
+                _log.Info(
+                    $"Deadlock HUD suppression reasserted " +
+                    $"({ReplayHudSuppressionCommands.Count} commands).");
                 return true;
             }
             catch (Exception ex)

@@ -77,7 +77,18 @@ struct ReplayTimelineGeometry {
 
 [[nodiscard]] constexpr bool ShouldLockReplayTimelineInput(
     const bool menu_open,
+    [[maybe_unused]] const bool replay_seek_in_progress) noexcept {
+    // A closed menu has no pointer by design. During a protected seek the menu
+    // remains interactive so playback speed can still be changed; individual
+    // tick/camera controls are disabled by the timeline renderer instead.
+    return !menu_open;
+}
+
+[[nodiscard]] constexpr bool ShouldLockCampathMiniMenuInput(
+    const bool menu_open,
     const bool replay_seek_in_progress) noexcept {
+    // Campath selection and destructive editing are unrelated to changing
+    // replay speed and must remain frozen while a protected seek is landing.
     return !menu_open || replay_seek_in_progress;
 }
 
@@ -123,6 +134,55 @@ struct ReplayTimelineGeometry {
     const std::uint64_t now_ms,
     const std::uint64_t retry_at_ms) noexcept {
     return request_pending && replay_active && current_tick >= 0 && now_ms >= retry_at_ms;
+}
+
+[[nodiscard]] constexpr bool ShouldSubmitReplayScrub(
+    const bool scrubbing,
+    const bool item_deactivated_after_edit,
+    const bool replay_seek_in_progress) noexcept {
+    return scrubbing && item_deactivated_after_edit && !replay_seek_in_progress;
+}
+
+constexpr void ClearPendingReplaySeekWhenDisabled(
+    const bool actions_enabled,
+    bool& request_pending,
+    std::uint64_t& retry_at_ms,
+    std::uint64_t& source_replay_session_generation) noexcept {
+    if (actions_enabled)
+        return;
+    request_pending = false;
+    retry_at_ms = 0;
+    source_replay_session_generation = 0;
+}
+
+constexpr void ClearReplayScrubWhenSeekActive(
+    const bool replay_seek_in_progress,
+    bool& scrubbing,
+    std::uint64_t& source_replay_session_generation) noexcept {
+    if (!replay_seek_in_progress)
+        return;
+    scrubbing = false;
+    source_replay_session_generation = 0;
+}
+
+constexpr void ClearReplayInputLeasesWhenSeekActive(
+    const bool replay_seek_in_progress,
+    bool& request_pending,
+    std::uint64_t& retry_at_ms,
+    std::uint64_t& pending_source_replay_session_generation,
+    bool& scrubbing,
+    std::uint64_t& scrub_source_replay_session_generation) noexcept {
+    if (!replay_seek_in_progress)
+        return;
+    ClearPendingReplaySeekWhenDisabled(
+        false,
+        request_pending,
+        retry_at_ms,
+        pending_source_replay_session_generation);
+    ClearReplayScrubWhenSeekActive(
+        true,
+        scrubbing,
+        scrub_source_replay_session_generation);
 }
 
 [[nodiscard]] constexpr bool IsReplayUiActionSessionCurrent(

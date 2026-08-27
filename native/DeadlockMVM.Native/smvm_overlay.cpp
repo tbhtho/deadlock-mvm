@@ -3,8 +3,14 @@
 #include "free_camera_input.hpp"
 #include "manual_camera_input_policy.hpp"
 #include "manual_mouse_fallback.hpp"
+#include "npc_healthbar_hook.hpp"
+#include "npc_healthbar_policy.hpp"
+#include "tower_fade_override.hpp"
+#include "tower_outline_hook.hpp"
+#include "tower_outline_policy.hpp"
 #include "recording_visual_policy.hpp"
 #include "render_camera_policy.hpp"
+#include "replay_launch_policy.hpp"
 #include "replay_timeline_policy.hpp"
 #include "smvm_input_route.hpp"
 
@@ -20,6 +26,7 @@
 #include <WinSock2.h>
 #include <WS2tcpip.h>
 #include <Windows.h>
+#include <shellapi.h>
 #include <windowsx.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
@@ -33,6 +40,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cwchar>
 #include <cstring>
 #include <optional>
 #include <span>
@@ -63,6 +71,13 @@ constexpr std::size_t kCameraMarkerLineCount = 9;
 // native backend connects. Keep polling without blocking shutdown.
 constexpr auto kInstallTimeout = std::chrono::seconds(120);
 constexpr auto kInstallRetryInterval = std::chrono::milliseconds(1);
+// client.dll can become visible to GetModuleHandle while its live image is not
+// ready for the exact RTTI/signature transaction. Retry missing presentation
+// owners after renderer capture instead of treating that first race as final.
+constexpr auto kPresentationInstallRetryInterval = std::chrono::milliseconds(1000);
+constexpr std::uint32_t kPresentationCreepHealthbarRetrying = 1u << 0;
+constexpr std::uint32_t kPresentationTowerOutlineRetrying = 1u << 1;
+constexpr std::uint32_t kPresentationTowerFadeRetrying = 1u << 2;
 constexpr std::uint8_t kManualRawKeyRoute = 1u << 0;
 constexpr std::uint8_t kManualWindowKeyRoute = 1u << 1;
 constexpr std::uint8_t kManualPolledKeyRoute = 1u << 2;
@@ -269,6 +284,12 @@ struct OverlayState final {
     std::atomic<bool> clean_view{false};
     std::atomic<std::uint32_t> presentation_mode{
         static_cast<std::uint32_t>(DeadlockUiMode::deadlock_ui)};
+    // +playdemo entities begin publishing particles/outlines before the
+    // managed owner can finish its VConsole profile. Keep creation-time
+    // presentation queries suppressed until an explicit Deadlock restore.
+    std::atomic<bool> bootstrap_replay_presentation_suppression{false};
+    std::atomic<std::uint32_t> presentation_install_retrying{0};
+    std::atomic<std::uint64_t> presentation_install_last_attempt_ms{0};
     std::atomic<std::uint32_t> previous_visible_mode{
         static_cast<std::uint32_t>(DeadlockUiMode::deadlock_ui)};
     std::atomic<std::uint32_t> last_vconsole_port{29000};
@@ -480,6 +501,31 @@ constexpr auto kMarker = Color(0x9A, 0x93, 0x8A, 200);
     return flags;
 }
 
+[[nodiscard]] std::uint32_t PresentationHookOverlayFlags() noexcept {
+    std::uint32_t flags = 0;
+    if (IsTrooperHealthbarHookInstalled())
+        flags |= smvm_overlay_creep_healthbar_hook_installed;
+    if (HasTrooperHealthbarSuppressionBeenObserved())
+        flags |= smvm_overlay_creep_healthbar_suppression_observed;
+    if (AreTowerOutlineHooksInstalled())
+        flags |= smvm_overlay_tower_outline_hooks_installed;
+    if (HasTowerOutlineSuppressionBeenObserved())
+        flags |= smvm_overlay_tower_outline_suppression_observed;
+    if (IsTowerFadeOverrideInstalled())
+        flags |= smvm_overlay_tower_fade_override_installed;
+    if (HasTowerFadeOverrideBeenEnforced())
+        flags |= smvm_overlay_tower_fade_override_enforced;
+    const auto retrying = g_overlay.presentation_install_retrying.load(
+        std::memory_order_acquire);
+    if ((retrying & kPresentationCreepHealthbarRetrying) != 0)
+        flags |= smvm_overlay_creep_healthbar_hook_retrying;
+    if ((retrying & kPresentationTowerOutlineRetrying) != 0)
+        flags |= smvm_overlay_tower_outline_hooks_retrying;
+    if ((retrying & kPresentationTowerFadeRetrying) != 0)
+        flags |= smvm_overlay_tower_fade_override_retrying;
+    return flags;
+}
+
 void PublishStatus(
     const SmvmRendererBackend backend,
     const SmvmRendererError error,
@@ -496,6 +542,7 @@ void PublishStatus(
     if (state.manual_mouse_observed.load(std::memory_order_acquire))
         flags |= smvm_overlay_manual_mouse_observed;
     flags |= ManualInputOverlayFlags();
+    flags |= PresentationHookOverlayFlags();
     if (frame_microseconds > 0)
         state.frame_microseconds.store(frame_microseconds, std::memory_order_release);
     state.last_renderer_error.store(static_cast<std::uint32_t>(error), std::memory_order_release);
@@ -702,6 +749,11 @@ void ReconcileRecordingProfileRecovery(const SmvmSnapshotPayload& snapshot) noex
         : DeadlockUiMode::deadlock_ui;
 }
 
+void ReleaseBootstrapReplayPresentationSuppression() noexcept {
+    g_overlay.bootstrap_replay_presentation_suppression.store(
+        false, std::memory_order_release);
+}
+
 void SetLocalPresentationMode(const DeadlockUiMode mode) noexcept {
     auto& state = g_overlay;
     if (mode != DeadlockUiMode::deadlock_ui) {
@@ -719,6 +771,7 @@ void SetLocalPresentationMode(const DeadlockUiMode mode) noexcept {
     } else {
         state.clean_view.store(mode == DeadlockUiMode::clean_footage, std::memory_order_release);
     }
+    static_cast<void>(PumpTowerFadeOverride());
 }
 
 [[nodiscard]] bool ToggleCleanFootage(
@@ -970,6 +1023,8 @@ void MarkRecordingProfileRecoveryActionQueued(const std::uint64_t generation) no
         state.recording_profile_recovery_action_queued.store(true, std::memory_order_relaxed);
         state.recording_profile_recovery_action_last_attempt_ms.store(
             GetTickCount64(), std::memory_order_relaxed);
+        if (target_mode == DeadlockUiMode::deadlock_ui)
+            ReleaseBootstrapReplayPresentationSuppression();
         SetLocalPresentationMode(target_mode);
     } else {
         // The new logical owner intent remains armed and will retry after the
@@ -1039,6 +1094,7 @@ void PumpEmergencyDeadlockUiRestore() noexcept {
         }
         state.recording_profile_native_restore_satisfied.store(true, std::memory_order_release);
         state.emergency_restore_attempted.store(false, std::memory_order_release);
+        ReleaseBootstrapReplayPresentationSuppression();
         SetLocalPresentationMode(DeadlockUiMode::deadlock_ui);
     } else {
         state.emergency_restore_attempted.store(false, std::memory_order_release);
@@ -1092,6 +1148,7 @@ void ReconcileRecordingProfileRecovery(const SmvmSnapshotPayload& snapshot) noex
             static_cast<std::uint32_t>(RecordingProfileRecoveryKind::replay_end_restore),
             std::memory_order_release);
         kind = RecordingProfileRecoveryKind::replay_end_restore;
+        ReleaseBootstrapReplayPresentationSuppression();
         SetLocalPresentationMode(DeadlockUiMode::deadlock_ui);
         ArmEmergencyDeadlockUiRestore(true);
         request_physical_restore = true;
@@ -1157,6 +1214,7 @@ void ReconcileRecordingProfileRecovery(const SmvmSnapshotPayload& snapshot) noex
                 std::memory_order_release);
             state.recording_profile_recovery_action_queued.store(false, std::memory_order_relaxed);
             state.recording_profile_recovery_action_last_attempt_ms.store(0, std::memory_order_relaxed);
+            ReleaseBootstrapReplayPresentationSuppression();
             SetLocalPresentationMode(DeadlockUiMode::deadlock_ui);
             request_physical_restore = true;
         } else {
@@ -1549,6 +1607,7 @@ void AddLine(
     if (g_overlay.manual_mouse_observed.load(std::memory_order_acquire))
         flags |= smvm_overlay_manual_mouse_observed;
     flags |= ManualInputOverlayFlags();
+    flags |= PresentationHookOverlayFlags();
     return flags;
 }
 
@@ -4430,6 +4489,7 @@ LRESULT CALLBACK SmvmWindowProcedure(
         ResetCinematicStartGate(true);
         SetMenuOpen(false);
         RequestManualPointerState(false);
+        ReleaseBootstrapReplayPresentationSuppression();
         SetLocalPresentationMode(DeadlockUiMode::deadlock_ui);
         const auto recovery_generation = BeginRecordingProfileRecovery(
             RecordingProfileRecoveryKind::explicit_restore,
@@ -5018,13 +5078,16 @@ LRESULT CALLBACK SmvmWindowProcedure(
     SmvmSnapshotPayload snapshot{};
     const auto snapshot_read = ReadSnapshot(snapshot);
     smvm_ui::ObserveReplaySession(snapshot_read ? &snapshot : nullptr, state.ui);
-    if (!snapshot_read)
+    if (!snapshot_read && ShouldNotifyRecordingVisualHostDisconnectOnSnapshotAbsence(
+            state.recording_profile_snapshot_observed.load(std::memory_order_acquire)))
         NotifySmvmHostDisconnected();
     if (!snapshot_read || (snapshot.flags & smvm_snapshot_internal_enabled) == 0 ||
         (snapshot.flags & smvm_snapshot_replay_active) == 0) {
         ResetCinematicStartGate(true);
         RequestManualPointerState(false);
         if (snapshot_read) {
+            if ((snapshot.flags & smvm_snapshot_replay_active) == 0)
+                ReleaseBootstrapReplayPresentationSuppression();
             const auto restore_debt =
                 state.recording_profile_restore_debt.load(std::memory_order_acquire);
             if ((state.recording_profile_may_be_active.load(std::memory_order_acquire) ||
@@ -5197,6 +5260,24 @@ HRESULT STDMETHODCALLTYPE FactoryCreateSwapchainHook(
     const auto protection = memory.Protect & 0xFF;
     return protection == PAGE_EXECUTE || protection == PAGE_EXECUTE_READ ||
            protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
+}
+
+[[nodiscard]] bool ShouldSuppressTrooperHealthbar() noexcept {
+    return g_overlay.bootstrap_replay_presentation_suppression.load(
+               std::memory_order_acquire) ||
+        ShouldSuppressTrooperHealthParticle(
+        static_cast<DeadlockUiMode>(
+            g_overlay.presentation_mode.load(std::memory_order_acquire)),
+        g_overlay.stop_requested.load(std::memory_order_acquire));
+}
+
+[[nodiscard]] bool ShouldSuppressTowerXray() noexcept {
+    return g_overlay.bootstrap_replay_presentation_suppression.load(
+               std::memory_order_acquire) ||
+        ShouldSuppressTowerOutline(
+        static_cast<DeadlockUiMode>(
+            g_overlay.presentation_mode.load(std::memory_order_acquire)),
+        g_overlay.stop_requested.load(std::memory_order_acquire));
 }
 
 struct ModuleTextView final {
@@ -5614,6 +5695,48 @@ void ReleaseObject(IUnknown*& object) noexcept {
     return true;
 }
 
+void PumpPresentationHookInstallation() noexcept {
+    auto& state = g_overlay;
+    const auto healthbar_installed = IsTrooperHealthbarHookInstalled();
+    const auto outline_installed = AreTowerOutlineHooksInstalled();
+    const auto fade_installed = IsTowerFadeOverrideInstalled();
+    if (healthbar_installed && outline_installed && fade_installed) {
+        state.presentation_install_retrying.store(0, std::memory_order_release);
+        static_cast<void>(PumpTowerFadeOverride());
+        return;
+    }
+
+    const auto client_module = GetModuleHandleW(L"client.dll");
+    if (client_module == nullptr)
+        return;
+    const auto now = GetTickCount64();
+    const auto previous = state.presentation_install_last_attempt_ms.load(
+        std::memory_order_acquire);
+    if (previous != 0 && now - previous <
+            static_cast<std::uint64_t>(kPresentationInstallRetryInterval.count()))
+        return;
+    state.presentation_install_last_attempt_ms.store(now, std::memory_order_release);
+
+    std::uint32_t retrying = 0;
+    if (!healthbar_installed && !InstallTrooperHealthbarHook(
+            client_module,
+            &ShouldSuppressTrooperHealthbar)) {
+        retrying |= kPresentationCreepHealthbarRetrying;
+    }
+    if (!outline_installed && !InstallTowerOutlineHooks(
+            client_module,
+            &ShouldSuppressTowerXray)) {
+        retrying |= kPresentationTowerOutlineRetrying;
+    }
+    if (!fade_installed && !InstallTowerFadeOverride(
+            client_module,
+            &ShouldSuppressTowerXray)) {
+        retrying |= kPresentationTowerFadeRetrying;
+    }
+    state.presentation_install_retrying.store(retrying, std::memory_order_release);
+    static_cast<void>(PumpTowerFadeOverride());
+}
+
 DWORD InstallerThreadBody() noexcept {
     const auto started = std::chrono::steady_clock::now();
     auto capture_attempted = false;
@@ -5623,6 +5746,7 @@ DWORD InstallerThreadBody() noexcept {
         // module discovery as well as after hook installation so a dead host
         // cannot strand X-ray, near-fade, or Panorama state with zero Presents.
         PumpEmergencyDeadlockUiRestore();
+        PumpPresentationHookInstallation();
         if (GetModuleHandleW(L"rendersystemvulkan.dll") != nullptr) {
             PublishStatus(SmvmRendererBackend::unsupported, SmvmRendererError::unsupported_renderer);
             break;
@@ -5648,6 +5772,8 @@ DWORD InstallerThreadBody() noexcept {
     }
     while (!g_overlay.stop_requested.load(std::memory_order_acquire)) {
         PumpEmergencyDeadlockUiRestore();
+        PumpPresentationHookInstallation();
+        static_cast<void>(PumpTowerFadeOverride());
         Sleep(100);
     }
     return 0;
@@ -5735,6 +5861,7 @@ HRESULT STDMETHODCALLTYPE PresentHook(
     if (!state.stop_requested.load(std::memory_order_acquire) &&
         state.hooks_installed.load(std::memory_order_acquire)) {
         state.present_observed.store(true, std::memory_order_release);
+        static_cast<void>(PumpTowerFadeOverride());
         const auto window_hook_healthy = state.output_window == nullptr ||
             SubclassOutputWindow(state.output_window);
         error = RenderFrameProtected(swapchain);
@@ -5789,6 +5916,18 @@ void ObserveSmvmRecordingVisualSnapshot(const SmvmSnapshotPayload& snapshot) noe
 
 void NotifySmvmHostDisconnected() noexcept {
     auto& state = g_overlay;
+    const auto current_mode = static_cast<DeadlockUiMode>(
+        state.presentation_mode.load(std::memory_order_acquire));
+    const auto disconnected_state = ResolveRecordingVisualHostDisconnectState({
+        state.bootstrap_replay_presentation_suppression.load(std::memory_order_acquire),
+        state.recording_profile_snapshot_observed.load(std::memory_order_acquire),
+        current_mode,
+    });
+    state.bootstrap_replay_presentation_suppression.store(
+        disconnected_state.bootstrap_suppression_armed,
+        std::memory_order_release);
+    if (disconnected_state.local_mode != current_mode)
+        SetLocalPresentationMode(disconnected_state.local_mode);
     // Snapshot expiry and a closed pipe are the same presentation-lease loss.
     // Edge-trigger the inverse/recovery boundary so a stalled render loop does
     // not rotate generations or issue VConsole batches every frame.
@@ -6135,6 +6274,20 @@ bool StartSmvmOverlay(const HMODULE self_module, const SmvmOverlayCallbacks& cal
     state.manual_relative_mouse_restore_pending = false;
     state.presentation_mode.store(
         static_cast<std::uint32_t>(DeadlockUiMode::deadlock_ui), std::memory_order_release);
+    const auto* const command_line = GetCommandLineW();
+    auto argument_count = 0;
+    auto** const arguments = command_line == nullptr
+        ? nullptr
+        : CommandLineToArgvW(command_line, &argument_count);
+    const auto replay_launch = arguments != nullptr &&
+        HasRequiredReplayLaunchArguments(argument_count, arguments);
+    if (arguments != nullptr)
+        LocalFree(arguments);
+    state.bootstrap_replay_presentation_suppression.store(
+        replay_launch,
+        std::memory_order_release);
+    state.presentation_install_retrying.store(0, std::memory_order_release);
+    state.presentation_install_last_attempt_ms.store(0, std::memory_order_release);
     state.previous_visible_mode.store(
         static_cast<std::uint32_t>(DeadlockUiMode::deadlock_ui), std::memory_order_release);
     state.last_vconsole_port.store(29000, std::memory_order_release);
@@ -6256,10 +6409,17 @@ bool StopSmvmOverlay() noexcept {
     state.recording_profile_recovery_kind.store(
         static_cast<std::uint32_t>(RecordingProfileRecoveryKind::none),
         std::memory_order_release);
+    ReleaseBootstrapReplayPresentationSuppression();
     SetLocalPresentationMode(DeadlockUiMode::deadlock_ui);
     ResetSmvmManualInput();
     if (!was_started)
         return true;
+    const auto tower_outlines_removed = RemoveTowerOutlineHooks();
+    const auto creep_healthbars_removed = RemoveTrooperHealthbarHook();
+    const auto tower_fade_removed = RemoveTowerFadeOverride();
+    if (!tower_outlines_removed || !creep_healthbars_removed || !tower_fade_removed)
+        return false;
+    state.presentation_install_retrying.store(0, std::memory_order_release);
 
     // Unsubclass first so no new input callback can begin while renderer hooks
     // are being withdrawn. A later subclass above SMVM is deliberately treated

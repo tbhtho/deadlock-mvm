@@ -351,12 +351,20 @@ void SeekToTickField(
     const FrameContext& context,
     const char* hint = "Tick",
     const float logical_width = 110.0F,
-    const bool timeline_field = false) noexcept {
+    const bool timeline_field = false,
+    const bool actions_enabled = true) noexcept {
     auto& state = *context.state;
     const auto& snapshot = *context.snapshot;
     const auto scale = smvm_theme::GetScale();
     const auto replay_active = (snapshot.flags & smvm_snapshot_replay_active) != 0;
+    ClearPendingReplaySeekWhenDisabled(
+        actions_enabled,
+        state.replay_seek_pending,
+        state.replay_seek_retry_at_ms,
+        state.replay_seek_session_generation);
     const auto try_pending_seek = [&]() noexcept {
+        if (!actions_enabled)
+            return;
         if (state.replay_seek_pending &&
             !IsReplayUiActionSessionCurrent(
                 replay_active,
@@ -399,7 +407,7 @@ void SeekToTickField(
     ImGui::PushID("go_to_tick");
     ImGui::SetNextItemWidth(logical_width * scale);
     const auto submit = [&]() noexcept -> bool {
-        if (!replay_active || state.go_to_tick[0] == '\0')
+        if (!actions_enabled || !replay_active || state.go_to_tick[0] == '\0')
             return false;
         state.replay_seek_target = std::strtoll(state.go_to_tick.data(), nullptr, 10);
         state.replay_seek_pending = true;
@@ -409,6 +417,7 @@ void SeekToTickField(
         try_pending_seek();
         return true;
     };
+    ImGui::BeginDisabled(!actions_enabled);
     ImGui::PushFont(smvm_theme::GetFonts().mono);
     const auto entered = ImGui::InputTextWithHint(
         "##tick", hint, state.go_to_tick.data(), state.go_to_tick.size(),
@@ -427,6 +436,7 @@ void SeekToTickField(
     ImGui::SameLine();
     if (smvm_theme::Button("Go", replay_active && state.go_to_tick[0] != '\0'))
         static_cast<void>(submit());
+    ImGui::EndDisabled();
     ImGui::PopID();
 }
 
@@ -1724,7 +1734,7 @@ void DrawCampathMiniMenu(const FrameContext& context) noexcept {
         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
         ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
         ImGuiWindowFlags_NoSavedSettings;
-    if (ShouldLockReplayTimelineInput(
+    if (ShouldLockCampathMiniMenuInput(
             context.params->menu_open,
             (snapshot.flags & smvm_snapshot_replay_seek_in_progress) != 0))
         window_flags |= ImGuiWindowFlags_NoInputs;
@@ -2054,11 +2064,13 @@ void DrawReplayTimeline(const FrameContext& context) noexcept {
     const auto open = ImGui::Begin(
         "##smvm_replay_timeline", nullptr, window_flags);
     if (open) {
+        const auto seek_in_progress =
+            (snapshot.flags & smvm_snapshot_replay_seek_in_progress) != 0;
         const auto paused = (snapshot.flags & smvm_snapshot_paused) != 0;
         const auto pause_known = (snapshot.flags & smvm_snapshot_pause_known) != 0;
         if (smvm_theme::PrimaryButton(
                 paused ? "Resume" : "Pause",
-                pause_known,
+                pause_known && !seek_in_progress,
                 ImVec2(72.0F * scale, 0.0F))) {
             // Index 1 means reach paused state; 0 means reach playing state.
             // The host keeps -1 as the legacy toggle value.
@@ -2074,7 +2086,7 @@ void DrawReplayTimeline(const FrameContext& context) noexcept {
             (snapshot.flags & smvm_snapshot_internal_enabled) != 0 &&
             (snapshot.flags & smvm_snapshot_replay_active) != 0 &&
             (snapshot.flags & smvm_snapshot_camera_readable) != 0 &&
-            !playing;
+            !playing && !seek_in_progress;
         ImGui::SameLine();
         const auto cinematic_button_x = ImGui::GetCursorPosX();
         if (smvm_theme::PrimaryButton(
@@ -2096,12 +2108,17 @@ void DrawReplayTimeline(const FrameContext& context) noexcept {
             smvm_theme::Tooltip(placement_hint.data());
         }
 
+        ClearReplayScrubWhenSeekActive(
+            seek_in_progress,
+            state.replay_scrubbing,
+            state.replay_scrub_session_generation);
         if (!state.replay_scrubbing)
             state.replay_scrub_tick = std::max<std::int64_t>(snapshot.current_tick, 0);
         const std::int64_t minimum = 0;
         const auto maximum = std::max<std::int64_t>(snapshot.total_ticks, 1);
         ImGui::SameLine();
         ImGui::SetNextItemWidth(std::max(96.0F * scale, geometry.width - (440.0F * scale)));
+        ImGui::BeginDisabled(seek_in_progress);
         if (ImGui::SliderScalar(
                 "##replay_progress", ImGuiDataType_S64, &state.replay_scrub_tick,
                 &minimum, &maximum, "", ImGuiSliderFlags_AlwaysClamp)) {
@@ -2133,7 +2150,10 @@ void DrawReplayTimeline(const FrameContext& context) noexcept {
                     selected ? 2.0F * scale : 1.0F * scale);
             }
         }
-        if (state.replay_scrubbing && ImGui::IsItemDeactivatedAfterEdit()) {
+        if (ShouldSubmitReplayScrub(
+                state.replay_scrubbing,
+                ImGui::IsItemDeactivatedAfterEdit(),
+                seek_in_progress)) {
             if (IsReplayUiActionSessionCurrent(
                     true,
                     snapshot.replay_session_generation,
@@ -2147,12 +2167,18 @@ void DrawReplayTimeline(const FrameContext& context) noexcept {
             state.replay_scrubbing = false;
             state.replay_scrub_session_generation = 0;
         }
+        ImGui::EndDisabled();
         ImGui::SameLine();
         std::array<char, 32> current_tick_hint{};
         static_cast<void>(std::snprintf(
             current_tick_hint.data(), current_tick_hint.size(), "%lld",
             static_cast<long long>(std::max<std::int64_t>(snapshot.current_tick, 0))));
-        SeekToTickField(context, current_tick_hint.data(), 82.0F, true);
+        SeekToTickField(
+            context,
+            current_tick_hint.data(),
+            82.0F,
+            true,
+            !seek_in_progress);
         ImGui::SameLine();
         std::array<char, 40> total_tick_text{};
         static_cast<void>(std::snprintf(
@@ -2313,6 +2339,13 @@ void DrawFrame(const SmvmUiFrameParams& params, SmvmUiState& state) noexcept {
         state.replay_scrubbing = false;
         state.replay_scrub_session_generation = 0;
     }
+    ClearReplayInputLeasesWhenSeekActive(
+        (params.snapshot->flags & smvm_snapshot_replay_seek_in_progress) != 0,
+        state.replay_seek_pending,
+        state.replay_seek_retry_at_ms,
+        state.replay_seek_session_generation,
+        state.replay_scrubbing,
+        state.replay_scrub_session_generation);
     if (!show_editor_ui || !params.menu_open)
         SmvmSetReplayTickInputActive(false);
     if (params.documents != nullptr) {

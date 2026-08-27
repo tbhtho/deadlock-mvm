@@ -17,6 +17,7 @@ public static class ReplayCommands
     public const string QueryTimescale = "host_timescale";
     public const string ResetLegacyDemoTimescale = "demo_timescale 1";
     public const string DisableFrameSpikeReports = "engine_frametime_warnings_enable 0";
+    public const string EnableFrameSpikeReports = "engine_frametime_warnings_enable 1";
     public const string EnableReplayDevelopmentConVars = "sv_cheats 1";
 
     /// <summary>Steps one tick and pauses (engine default).</summary>
@@ -38,10 +39,11 @@ public static class ReplayCommands
     public static IReadOnlyList<string> StartDemoPaused(string gamePath)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(gamePath);
-        // -dev enables Source 2's detailed per-spike VProf dumps by default.
-        // Disable those before demo activation: condebug remains available,
-        // but a struggling replay no longer performs a large diagnostic dump
-        // for every slow frame and feeds that work back into the next frame.
+        // Keep launch preparation narrow. Render/layout fallbacks are applied
+        // once through VConsole after the playback scene is authoritative;
+        // installing them during world construction can invalidate render
+        // resources in an old replay. Deadlock may reset the warning cvar while
+        // loading, so the post-scene profile reasserts it as well.
         return [
             "+engine_frametime_warnings_enable",
             "0",

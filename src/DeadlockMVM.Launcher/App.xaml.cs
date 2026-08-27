@@ -45,7 +45,7 @@ public partial class App : System.Windows.Application
         var launcher = new GameLauncher();
         var replayService = new ReplayService();
 
-        log.Info("=== Deadlock MVM Launcher v0.1.0 started ===");
+        log.Info($"=== {ProductInfo.Name} Launcher {ProductInfo.DisplayVersion} started ===");
 
         try
         {
@@ -57,13 +57,13 @@ public partial class App : System.Windows.Application
             var nativeCamera = new NativeCameraBackend(log);
             ICameraService camera = new CompositeCameraService(
                 new ReplayCameraService(transport), nativeCamera, controller, log);
+            var viewModel = new MainViewModel(steam, process, launcher, log, settings, replayService);
             var nativeSession = new NativeReplayCameraSession(
                 controller,
                 camera,
                 log,
-                Path.Combine(AppContext.BaseDirectory, "DeadlockMVM.Native.dll"));
-
-            var viewModel = new MainViewModel(steam, process, launcher, log, settings, replayService);
+                Path.Combine(AppContext.BaseDirectory, "DeadlockMVM.Native.dll"),
+                () => viewModel.DeadlockPath);
 
             // Internal SMVM editor: campath model, in-game menu pointer
             // forwarding, and the VConsole auto-connect loop.

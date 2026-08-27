@@ -145,7 +145,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                     _log.Info("Ignored replay-speed input from a superseded replay snapshot.");
                 return;
             }
-            if (action.Type == SmvmActionType.SetTimescale)
+            if (SmvmQueuedActionLeasePolicy.BypassesSerializedCameraActionGate(action))
             {
                 var speedReplay = replaySnapshot.State;
                 playbackSpeedReplayIdentity = IsReplayActive(speedReplay)
@@ -156,6 +156,9 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                     : null;
                 playbackSpeedOwnerIntentEpoch =
                     _demoPlaybackSpeed.MarkOwnerIntent(playbackSpeedReplayIdentity);
+                _log.Info(
+                    $"Replay speed input received: {action.Value * 100.0:0.##}%; " +
+                    "dispatching independently from camera and tick-update work.");
             }
             if (IsDemoStartupOwnerOverride(action))
             {
@@ -391,7 +394,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
             if (replay.IsPaused is not null)
                 _observedReplayPaused = replay.IsPaused;
             if (pauseChanged)
-                _ = ReassertMovieUiWithConnectionLeaseAsync(
+                _ = ReassertRuntimeSuppressionWithConnectionLeaseAsync(
                     CaptureForwardPresentationLease(),
                     processBoundaryEpoch);
         }
@@ -1114,19 +1117,22 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         DemoPlaybackSpeedActionLease playbackSpeedActionLease)
     {
         var acquired = false;
+        bool QueuedActionStillCurrent() =>
+            IsQueuedActionLeaseCurrent(action, queuedActionLease);
         try
         {
-            await _actionGate.WaitAsync(_stop.Token).ConfigureAwait(true);
-            acquired = true;
-            bool QueuedActionStillCurrent() =>
-                IsQueuedActionLeaseCurrent(action, queuedActionLease);
-            if (!QueuedActionStillCurrent())
+            // Playback speed is an engine-clock command, not a camera action.
+            // Do not strand it behind a protected seek, camera reacquisition,
+            // or Campath preparation holding the serialized camera gate.
+            if (SmvmQueuedActionLeasePolicy.BypassesSerializedCameraActionGate(action))
             {
-                _log.Info($"Ignored queued SMVM action {action.Type}: its process, native, or replay lease expired.");
-                return;
-            }
-            if (action.Type == SmvmActionType.SetTimescale)
-            {
+                if (!QueuedActionStillCurrent())
+                {
+                    _log.Info(
+                        $"Ignored queued SMVM action {action.Type}: its process, native, or replay lease expired.");
+                    ReleaseFailedPlaybackSpeedIntent(playbackSpeedActionLease);
+                    return;
+                }
                 try
                 {
                     if (!TryExecutePlaybackSpeedAction(
@@ -1140,6 +1146,14 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                     ReleaseFailedPlaybackSpeedIntent(playbackSpeedActionLease);
                     throw;
                 }
+                return;
+            }
+
+            await _actionGate.WaitAsync(_stop.Token).ConfigureAwait(true);
+            acquired = true;
+            if (!QueuedActionStillCurrent())
+            {
+                _log.Info($"Ignored queued SMVM action {action.Type}: its process, native, or replay lease expired.");
                 return;
             }
             var replayCommandLease = SmvmQueuedActionLeasePolicy.RequiresReplayLease(action)
@@ -1373,16 +1387,11 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                 };
                 if (!pauseCommandIssued || !actionStillCurrent())
                     return;
-                // Send suppression after the transport command in the same
-                // VConsole ordering window. The observed pause-state edge
-                // reasserts once more after the engine settles.
-                if (resolvedPresentationTarget is { } pauseTarget &&
-                    pauseTarget != DeadlockUiMode.DeadlockUi)
-                {
-                    ApplyDeadlockUiMode(
-                        pauseTarget,
-                        stillCurrent: forwardStillCurrent);
-                }
+                // Pause/resume can recreate Panorama, but it does not reset the
+                // entity presentation profile. Reassert only the two cheap
+                // runtime controls; the observed state edge does the same once
+                // more after the engine settles.
+                ReassertDeadlockUiIfCurrent(actionStillCurrent);
                 break;
             case SmvmActionType.SeekTick:
                 await ExecuteReplaySeekAsync(
@@ -1754,8 +1763,9 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         {
             lock (_presentationReplayGate)
             {
-                if (stillCurrent())
-                    _deadlockUi.ReassertSuppression(IsReplayActive(_controller.State));
+                _ = ReassertSuppressionForPresentationLease(
+                    IsReplayActive(_controller.State),
+                    stillCurrent);
             }
         }
     }
@@ -1947,18 +1957,48 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
             stillCurrent => processBoundaryEpoch is { } processEpoch
                 ? RunForProcessBoundary(
                     processEpoch,
-                    () => ReassertSuppressionForPresentationLease(
+                    () => ReassertFullPresentationForLease(
                         replayActive: true,
                         () => stillCurrent() && IsProcessBoundaryCurrent(processEpoch)))
-                : ReassertSuppressionForPresentationLease(
+                : ReassertFullPresentationForLease(
                     replayActive: true, stillCurrent),
-            "transport recording-profile reassert",
+            "full recording-profile reassert",
             processBoundaryEpoch is { } epoch
                 ? () => IsProcessBoundaryCurrent(epoch)
                 : null).ConfigureAwait(true);
     }
 
-    private bool ReassertSuppressionForPresentationLease(
+    private async Task<bool> ReassertRuntimeSuppressionWithConnectionLeaseAsync(
+        ForwardPresentationLease lease,
+        long? processBoundaryEpoch = null)
+    {
+        static bool IsForwardMode(DeadlockUiMode mode) =>
+            mode is DeadlockUiMode.SmvmReplayUi or DeadlockUiMode.CleanFootage;
+
+        if (processBoundaryEpoch is { } expectedEpoch &&
+            !IsProcessBoundaryCurrent(expectedEpoch))
+        {
+            return false;
+        }
+        if (!IsForwardMode(_deadlockUi.ProfileStatus.DesiredMode))
+            return true;
+        return await ApplyForwardPresentationWithLeaseAsync(
+            lease,
+            stillCurrent => processBoundaryEpoch is { } processEpoch
+                ? RunForProcessBoundary(
+                    processEpoch,
+                    () => ReassertSuppressionForPresentationLease(
+                        replayActive: true,
+                        () => stillCurrent() && IsProcessBoundaryCurrent(processEpoch)))
+                : ReassertSuppressionForPresentationLease(
+                    replayActive: true, stillCurrent),
+            "runtime HUD suppression reassert",
+            processBoundaryEpoch is { } epoch
+                ? () => IsProcessBoundaryCurrent(epoch)
+                : null).ConfigureAwait(true);
+    }
+
+    private bool ReassertFullPresentationForLease(
         bool replayActive,
         Func<bool> stillCurrent)
     {
@@ -1969,6 +2009,27 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                 profile.DesiredMode,
                 replayActive,
                 stillCurrent);
+    }
+
+    private bool ReassertSuppressionForPresentationLease(
+        bool replayActive,
+        Func<bool> stillCurrent)
+    {
+        var profile = _deadlockUi.ProfileStatus;
+        if (profile.DesiredMode == DeadlockUiMode.DeadlockUi)
+            return profile.Ui.Mode == DeadlockUiMode.DeadlockUi && !profile.RestorePending;
+        if (profile.ShouldRetryForwardProfile)
+        {
+            // A failed thin refresh first restores Deadlock's physical state.
+            // The next valid runtime edge performs one complete recovery rather
+            // than letting a two-command refresh falsely retire that debt.
+            return _deadlockUi.ApplyIfCurrent(
+                profile.DesiredMode,
+                replayActive,
+                stillCurrent,
+                profile.AcknowledgementGeneration);
+        }
+        return _deadlockUi.ReassertSuppressionIfCurrent(replayActive, stillCurrent);
     }
 
     private bool IsPresentationIntentCurrent(long expectedEpoch) =>

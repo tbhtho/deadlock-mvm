@@ -24,6 +24,7 @@ public sealed class ReplayController : IReplayPlaybackState, IDisposable
     private readonly ReplayStateParser _parser = new();
     private readonly object _gate = new();
     private readonly object _telemetryGate = new();
+    private readonly object _positionPollGate = new();
     private readonly Timer _pollTimer;
 
     private ReplayState _state = ReplayState.Empty;
@@ -33,6 +34,11 @@ public sealed class ReplayController : IReplayPlaybackState, IDisposable
     private int _consecutiveStalledPolls;
     private long _lastOutputUtcTicks;
     private bool _sentCommandSinceLastOutput;
+    private long _positionPollSequence;
+    private long _outstandingPositionPollToken;
+    private long _positionPollSentUtcTicks;
+    private long _lastPositionPollReplyUtcTicks;
+    private bool _hasIssuedPositionPoll;
     private string _host = "127.0.0.1";
     private int _port;
     private long _nextReconnectUtcTicks;
@@ -163,8 +169,7 @@ public sealed class ReplayController : IReplayPlaybackState, IDisposable
         SafeSend(ReplayCommands.QueryTimescale);
         SafeSend(ReplayCommands.QueryDemoInfo);
         Interlocked.Exchange(ref _lastDemoInfoRequestUtcTicks, DateTime.UtcNow.Ticks);
-        if (SafeSend(ReplayCommands.QueryPosition))
-            _sentCommandSinceLastOutput = true;
+        _ = TrySendPositionPoll(DateTime.UtcNow.Ticks);
         return generation;
     }
 
@@ -253,10 +258,11 @@ public sealed class ReplayController : IReplayPlaybackState, IDisposable
     public void SeekToTick(int tick) => Send(ReplayCommands.GotoTick(tick));
 
     /// <summary>
-    /// Issues a seek only while the caller's exact connection/demo identity is
-    /// still current. Holding the telemetry fence through the transport write
-    /// prevents a process reset or same-file reload from slipping between the
-    /// final lease check and command issuance.
+    /// Issues a runnable seek only while the caller's exact connection/demo
+    /// identity is still current. Deadlock can acknowledge demo_gototick while
+    /// remaining physically stuck at the old tick when the replay is paused,
+    /// so the seek and its explicit processing window are one fenced FIFO batch.
+    /// NativeReplayCameraSession pauses again only after authoritative landing.
     /// </summary>
     internal bool SeekToTickIfCurrent(
         int tick,
@@ -284,6 +290,7 @@ public sealed class ReplayController : IReplayPlaybackState, IDisposable
                     StringComparison.OrdinalIgnoreCase))
                 return false;
 
+            Send(ReplayCommands.Resume);
             Send(ReplayCommands.GotoTick(tick));
             return true;
         }
@@ -369,8 +376,9 @@ public sealed class ReplayController : IReplayPlaybackState, IDisposable
         // OutputStaleTimeout means another client owns the console (or the
         // connection died silently). Drop it; auto-reconnect re-establishes
         // and our polls then evict whoever holds the slot.
+        var now = DateTime.UtcNow.Ticks;
         if (_sentCommandSinceLastOutput &&
-            DateTime.UtcNow.Ticks - Interlocked.Read(ref _lastOutputUtcTicks) > OutputStaleTimeout.Ticks)
+            now - Interlocked.Read(ref _lastOutputUtcTicks) > OutputStaleTimeout.Ticks)
         {
             ScheduleReconnect();
             _transport.Disconnect();
@@ -378,17 +386,20 @@ public sealed class ReplayController : IReplayPlaybackState, IDisposable
             return;
         }
 
-        if (!SafeSend(ReplayCommands.QueryPosition))
+        // VConsole can buffer command replies for several seconds. Keep only
+        // one live position request so a delayed batch cannot grow without
+        // bound. If other console output proves the socket is healthy while a
+        // particular position reply is lost, replace that request only after
+        // the same bounded timeout used by the stale-connection watchdog.
+        _ = TrySendPositionPoll(now);
+        if (!_transport.IsConnected)
             return;
-
-        _sentCommandSinceLastOutput = true;
 
         // VConsole can connect before +playdemo has finished loading. A one-shot
         // demo_info at connect then has no server_start_tick, which used to leave
         // the native backend unavailable for the entire otherwise healthy run.
         // Retry only while calibration is absent, at a bounded cadence, and stop
         // immediately once the engine supplies the real offset.
-        var now = DateTime.UtcNow.Ticks;
         bool needsCalibration;
         lock (_telemetryGate)
             needsCalibration = _ready && _parser.GameTickOffset is null;
@@ -454,7 +465,14 @@ public sealed class ReplayController : IReplayPlaybackState, IDisposable
 
                 var parsed = _parser.ParseLine(line);
                 if (parsed is not null)
-                    changedState = MergeEngineState(parsed);
+                {
+                    var isPositionReply = IsPositionReply(parsed);
+                    var isDistinctPositionPollReply =
+                        !isPositionReply ||
+                        ConsumeOutstandingPositionPoll() ||
+                        !HasIssuedPositionPoll();
+                    changedState = MergeEngineState(parsed, isDistinctPositionPollReply);
+                }
                 if (_parser.TryParseSeekCompletedTick(line, out var parsedSeekTick))
                     completedSeekTick = parsedSeekTick;
             }
@@ -478,16 +496,16 @@ public sealed class ReplayController : IReplayPlaybackState, IDisposable
         ApplyConnected(false);
     }
 
-    private ReplayState MergeEngineState(ReplayState update)
+    private ReplayState MergeEngineState(
+        ReplayState update,
+        bool isDistinctPositionPollReply)
     {
         ReplayState merged;
 
         lock (_gate)
         {
             var current = _state;
-            var isPositionReply = update.CurrentTick is not null &&
-                                  update.TotalTicks is not null &&
-                                  update.ReplayName is not null;
+            var isPositionReply = IsPositionReply(update);
             var sessionBoundary = false;
             var boundaryCameFromLoadMarker = false;
             if (isPositionReply)
@@ -560,8 +578,14 @@ public sealed class ReplayController : IReplayPlaybackState, IDisposable
                     Interlocked.Exchange(
                         ref _authoritativeTelemetryGeneration,
                         ConnectionGeneration);
-                    var reachedEnd = merged.TotalTicks is { } total && tick >= total;
-                    if (reachedEnd)
+                    if (!isDistinctPositionPollReply)
+                    {
+                        // A reply consumes exactly one issued query. Any
+                        // additional full position lines in the same buffered
+                        // batch remain useful state, but are not separate time
+                        // intervals and therefore cannot infer a pause.
+                    }
+                    else if (merged.TotalTicks is { } total && tick >= total)
                     {
                         _hasLastPolledTick = false;
                         _lastPolledTick = null;
@@ -626,6 +650,7 @@ public sealed class ReplayController : IReplayPlaybackState, IDisposable
             lock (_telemetryGate)
             {
                 _parser.ResetGameTickOffset();
+                ResetPositionPollState();
                 lock (_gate)
                 {
                     _state = ReplayState.Empty with
@@ -658,6 +683,7 @@ public sealed class ReplayController : IReplayPlaybackState, IDisposable
             _parser.ResetGameTickOffset();
             _replayLoadPending = false;
             Interlocked.Exchange(ref _lastDemoInfoRequestUtcTicks, 0);
+            ResetPositionPollState();
             lock (_gate)
             {
                 _state = ReplayState.Empty with
@@ -682,6 +708,7 @@ public sealed class ReplayController : IReplayPlaybackState, IDisposable
             _replayLoadPending = true;
             _parser.ResetGameTickOffset();
             Interlocked.Exchange(ref _lastDemoInfoRequestUtcTicks, 0);
+            ClearOutstandingPositionPoll();
             _hasLastPolledTick = false;
             _lastPolledTick = null;
             _consecutiveStalledPolls = 0;
@@ -696,6 +723,101 @@ public sealed class ReplayController : IReplayPlaybackState, IDisposable
         }
         return started;
     }
+
+    private bool TrySendPositionPoll(long nowUtcTicks)
+    {
+        long token;
+        lock (_positionPollGate)
+        {
+            var minimumReplySpacingTicks = PollInterval > TimeSpan.Zero &&
+                                           PollInterval != Timeout.InfiniteTimeSpan
+                ? PollInterval.Ticks
+                : 0;
+            if (_lastPositionPollReplyUtcTicks != 0 &&
+                nowUtcTicks - _lastPositionPollReplyUtcTicks < minimumReplySpacingTicks)
+            {
+                return false;
+            }
+
+            if (_outstandingPositionPollToken != 0 &&
+                nowUtcTicks - _positionPollSentUtcTicks < OutputStaleTimeout.Ticks)
+            {
+                return false;
+            }
+
+            token = ++_positionPollSequence;
+            _outstandingPositionPollToken = token;
+            _positionPollSentUtcTicks = nowUtcTicks;
+            _hasIssuedPositionPoll = true;
+        }
+
+        // Set this before writing: test transports (and some adapters) may
+        // deliver a synchronous reply from SendCommand itself.
+        _sentCommandSinceLastOutput = true;
+        if (SafeSend(ReplayCommands.QueryPosition))
+            return true;
+
+        ClearOutstandingPositionPoll(token);
+        return false;
+    }
+
+    private bool ConsumeOutstandingPositionPoll()
+    {
+        lock (_positionPollGate)
+        {
+            if (_outstandingPositionPollToken == 0)
+                return false;
+
+            _outstandingPositionPollToken = 0;
+            _positionPollSentUtcTicks = 0;
+            _lastPositionPollReplyUtcTicks = DateTime.UtcNow.Ticks;
+            return true;
+        }
+    }
+
+    private void ClearOutstandingPositionPoll(long token)
+    {
+        lock (_positionPollGate)
+        {
+            if (_outstandingPositionPollToken != token)
+                return;
+
+            _outstandingPositionPollToken = 0;
+            _positionPollSentUtcTicks = 0;
+            _lastPositionPollReplyUtcTicks = 0;
+        }
+    }
+
+    private void ClearOutstandingPositionPoll()
+    {
+        lock (_positionPollGate)
+        {
+            _outstandingPositionPollToken = 0;
+            _positionPollSentUtcTicks = 0;
+        }
+    }
+
+    private bool HasIssuedPositionPoll()
+    {
+        lock (_positionPollGate)
+            return _hasIssuedPositionPoll;
+    }
+
+    private void ResetPositionPollState()
+    {
+        lock (_positionPollGate)
+        {
+            _outstandingPositionPollToken = 0;
+            _positionPollSentUtcTicks = 0;
+            _lastPositionPollReplyUtcTicks = 0;
+            _hasIssuedPositionPoll = false;
+        }
+    }
+
+    private static bool IsPositionReply(ReplayState state) =>
+        state.CurrentTick is not null &&
+        state.TotalTicks is not null &&
+        state.ReplayName is not null;
 
     private static string CreateConfirmedReplayIdentity(string replayName, int totalTicks)
     {
