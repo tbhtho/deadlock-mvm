@@ -32,6 +32,7 @@ public sealed class CameraStatePoller : IDisposable
         if (IsRunning)
             return;
 
+        _cts?.Dispose();
         _cts = new CancellationTokenSource();
         _loop = RunAsync(_cts.Token);
     }

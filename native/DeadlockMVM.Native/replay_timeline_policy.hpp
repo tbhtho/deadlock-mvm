@@ -5,6 +5,12 @@
 
 namespace deadlock_mvm {
 
+[[nodiscard]] constexpr bool ShouldEnterCleanFootage(
+    const bool clean_view,
+    const bool editor_visible) noexcept {
+    return !clean_view && editor_visible;
+}
+
 struct ReplayTimelineGeometry {
     float x{};
     float y{};
@@ -29,7 +35,11 @@ struct ReplayTimelineGeometry {
     const bool timeline_available,
     const bool hidden_for_cinematic,
     const bool menu_open) noexcept {
-    return timeline_available && (!hidden_for_cinematic || menu_open);
+    // Tab is the editor's recovery route. The menu must remain drawable even
+    // when a stale/accidental presentation transition has hidden the timeline;
+    // otherwise the user loses the only in-game control that can restore the
+    // SRC2MVM presentation.
+    return menu_open || (timeline_available && !hidden_for_cinematic);
 }
 
 [[nodiscard]] constexpr ReplayTimelineGeometry ComputeReplayTimelineGeometry(

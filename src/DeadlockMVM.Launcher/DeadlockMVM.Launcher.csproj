@@ -19,6 +19,10 @@
              Link="THIRD_PARTY_LICENSES\DearImGui-LICENSE.txt"
              CopyToOutputDirectory="PreserveNewest"
              CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="..\..\native\third_party\libgmavi\LICENSE"
+             Link="THIRD_PARTY_LICENSES\libgmavi-LICENSE.txt"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
   <PropertyGroup>

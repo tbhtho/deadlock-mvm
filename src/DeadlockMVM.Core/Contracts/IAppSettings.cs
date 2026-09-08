@@ -1,6 +1,7 @@
 namespace DeadlockMVM.Core.Contracts;
 
 using DeadlockMVM.Core.Native.InProcess;
+using DeadlockMVM.Core.Services;
 
 /// <summary>Persists user-configurable launcher settings.</summary>
 public interface IAppSettings
@@ -85,6 +86,19 @@ public interface IAppSettings
     SmvmNotificationAnchor SmvmStatusHudAnchor { get; set; }
     double SmvmStatusHudScale { get; set; }
     double SmvmStatusHudOpacity { get; set; }
+    int SmvmMovieCaptureFps { get; set; }
+    MovieRecordingPreset SmvmMovieRecordingPreset { get; set; }
+    MovieOutputMode SmvmMovieOutputMode { get; set; }
+    MovieOutputResolution SmvmMovieOutputResolution { get; set; }
+    MovieCapturePass SmvmMovieCapturePasses { get; set; }
+    string SmvmMovieCaptureRoot { get; set; }
+    bool SmvmMovieDisablePostProcessing { get; set; }
+    bool SmvmMovieMuteDialogue { get; set; }
+    bool SmvmRuleOfThirds { get; set; }
+    bool SmvmCustomFogEnabled { get; set; }
+    FogConfiguration SmvmCustomFog { get; set; }
+    GreenscreenMode SmvmGreenscreenMode { get; set; }
+    uint SmvmGreenscreenColorRgb { get; set; }
 
     void Load();
 

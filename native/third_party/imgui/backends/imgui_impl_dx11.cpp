@@ -68,8 +68,14 @@ struct ImGui_ImplDX11_Data
     ID3D11DepthStencilState*    pDepthStencilState;
     int                         VertexBufferSize;
     int                         IndexBufferSize;
+    ImDrawVert*                 pVertexUpload;
+    ImDrawIdx*                  pIndexUpload;
+    int                         LastVertexCount;
+    int                         LastIndexCount;
+    bool                        HasVertexConstantBuffer;
+    float                       LastVertexMvp[4][4];
 
-    ImGui_ImplDX11_Data()       { memset((void*)this, 0, sizeof(*this)); VertexBufferSize = 5000; IndexBufferSize = 10000; }
+    ImGui_ImplDX11_Data()       { memset((void*)this, 0, sizeof(*this)); VertexBufferSize = 5000; IndexBufferSize = 10000; LastVertexCount = -1; LastIndexCount = -1; }
 };
 
 struct VERTEX_CONSTANT_BUFFER_DX11
@@ -100,23 +106,24 @@ static void ImGui_ImplDX11_SetupRenderState(ImDrawData* draw_data, ID3D11DeviceC
 
     // Setup orthographic projection matrix into our constant buffer
     // Our visible imgui space lies from draw_data->DisplayPos (top left) to draw_data->DisplayPos+data_data->DisplaySize (bottom right). DisplayPos is (0,0) for single viewport apps.
-    D3D11_MAPPED_SUBRESOURCE mapped_resource;
-    if (device_ctx->Map(bd->pVertexConstantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped_resource) == S_OK)
+    VERTEX_CONSTANT_BUFFER_DX11 constant_buffer = {};
+    float L = draw_data->DisplayPos.x;
+    float R = draw_data->DisplayPos.x + draw_data->DisplaySize.x;
+    float T = draw_data->DisplayPos.y;
+    float B = draw_data->DisplayPos.y + draw_data->DisplaySize.y;
+    float mvp[4][4] =
     {
-        VERTEX_CONSTANT_BUFFER_DX11* constant_buffer = (VERTEX_CONSTANT_BUFFER_DX11*)mapped_resource.pData;
-        float L = draw_data->DisplayPos.x;
-        float R = draw_data->DisplayPos.x + draw_data->DisplaySize.x;
-        float T = draw_data->DisplayPos.y;
-        float B = draw_data->DisplayPos.y + draw_data->DisplaySize.y;
-        float mvp[4][4] =
-        {
-            { 2.0f/(R-L),   0.0f,           0.0f,       0.0f },
-            { 0.0f,         2.0f/(T-B),     0.0f,       0.0f },
-            { 0.0f,         0.0f,           0.5f,       0.0f },
-            { (R+L)/(L-R),  (T+B)/(B-T),    0.5f,       1.0f },
-        };
-        memcpy(&constant_buffer->mvp, mvp, sizeof(mvp));
-        device_ctx->Unmap(bd->pVertexConstantBuffer, 0);
+        { 2.0f/(R-L),   0.0f,           0.0f,       0.0f },
+        { 0.0f,         2.0f/(T-B),     0.0f,       0.0f },
+        { 0.0f,         0.0f,           0.5f,       0.0f },
+        { (R+L)/(L-R),  (T+B)/(B-T),    0.5f,       1.0f },
+    };
+    memcpy(&constant_buffer.mvp, mvp, sizeof(mvp));
+    if (!bd->HasVertexConstantBuffer || memcmp(bd->LastVertexMvp, mvp, sizeof(mvp)) != 0)
+    {
+        device_ctx->UpdateSubresource(bd->pVertexConstantBuffer, 0, nullptr, &constant_buffer, 0, 0);
+        memcpy(bd->LastVertexMvp, mvp, sizeof(mvp));
+        bd->HasVertexConstantBuffer = true;
     }
 
     // Setup shader and vertex buffers
@@ -153,50 +160,88 @@ void ImGui_ImplDX11_RenderDrawData(ImDrawData* draw_data)
     ID3D11DeviceContext* device = bd->pd3dDeviceContext;
 
     // Create and grow vertex/index buffers if needed
-    if (!bd->pVB || bd->VertexBufferSize < draw_data->TotalVtxCount)
+    const bool grow_vertex_buffer = bd->VertexBufferSize < draw_data->TotalVtxCount;
+    if (!bd->pVB || grow_vertex_buffer)
     {
         if (bd->pVB) { bd->pVB->Release(); bd->pVB = nullptr; }
-        bd->VertexBufferSize = draw_data->TotalVtxCount + 5000;
+        if (grow_vertex_buffer)
+        {
+            bd->VertexBufferSize = draw_data->TotalVtxCount + 5000;
+            if (bd->pVertexUpload) { IM_FREE(bd->pVertexUpload); bd->pVertexUpload = nullptr; }
+        }
+        if (!bd->pVertexUpload)
+            bd->pVertexUpload = (ImDrawVert*)IM_ALLOC((size_t)bd->VertexBufferSize * sizeof(ImDrawVert));
+        if (!bd->pVertexUpload)
+            return;
         D3D11_BUFFER_DESC desc = {};
-        desc.Usage = D3D11_USAGE_DYNAMIC;
+        desc.Usage = D3D11_USAGE_DEFAULT;
         desc.ByteWidth = bd->VertexBufferSize * sizeof(ImDrawVert);
         desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        desc.CPUAccessFlags = 0;
         desc.MiscFlags = 0;
         if (bd->pd3dDevice->CreateBuffer(&desc, nullptr, &bd->pVB) < 0)
             return;
+        bd->LastVertexCount = -1;
     }
-    if (!bd->pIB || bd->IndexBufferSize < draw_data->TotalIdxCount)
+    const bool grow_index_buffer = bd->IndexBufferSize < draw_data->TotalIdxCount;
+    if (!bd->pIB || grow_index_buffer)
     {
         if (bd->pIB) { bd->pIB->Release(); bd->pIB = nullptr; }
-        bd->IndexBufferSize = draw_data->TotalIdxCount + 10000;
+        if (grow_index_buffer)
+        {
+            bd->IndexBufferSize = draw_data->TotalIdxCount + 10000;
+            if (bd->pIndexUpload) { IM_FREE(bd->pIndexUpload); bd->pIndexUpload = nullptr; }
+        }
+        if (!bd->pIndexUpload)
+            bd->pIndexUpload = (ImDrawIdx*)IM_ALLOC((size_t)bd->IndexBufferSize * sizeof(ImDrawIdx));
+        if (!bd->pIndexUpload)
+            return;
         D3D11_BUFFER_DESC desc = {};
-        desc.Usage = D3D11_USAGE_DYNAMIC;
+        desc.Usage = D3D11_USAGE_DEFAULT;
         desc.ByteWidth = bd->IndexBufferSize * sizeof(ImDrawIdx);
         desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
-        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        desc.CPUAccessFlags = 0;
         if (bd->pd3dDevice->CreateBuffer(&desc, nullptr, &bd->pIB) < 0)
             return;
+        bd->LastIndexCount = -1;
     }
 
-    // Upload vertex/index data into a single contiguous GPU buffer
-    D3D11_MAPPED_SUBRESOURCE vtx_resource, idx_resource;
-    if (device->Map(bd->pVB, 0, D3D11_MAP_WRITE_DISCARD, 0, &vtx_resource) != S_OK)
-        return;
-    if (device->Map(bd->pIB, 0, D3D11_MAP_WRITE_DISCARD, 0, &idx_resource) != S_OK)
-        return;
-    ImDrawVert* vtx_dst = (ImDrawVert*)vtx_resource.pData;
-    ImDrawIdx* idx_dst = (ImDrawIdx*)idx_resource.pData;
+    // Deadlock tracks WRITE_DISCARD backing allocations in a signed 16-bit
+    // CVertexBufferDx11 registry. Per-frame discard maps can exhaust that
+    // registry during long replay seeks, even though the D3D buffer objects are
+    // reused. Keep stable DEFAULT buffers and upload into them without mapping.
+    ImDrawVert* vtx_dst = bd->pVertexUpload;
+    ImDrawIdx* idx_dst = bd->pIndexUpload;
+    bool vertex_changed = bd->LastVertexCount != draw_data->TotalVtxCount;
+    bool index_changed = bd->LastIndexCount != draw_data->TotalIdxCount;
     for (int n = 0; n < draw_data->CmdListsCount; n++)
     {
         const ImDrawList* draw_list = draw_data->CmdLists[n];
-        memcpy(vtx_dst, draw_list->VtxBuffer.Data, draw_list->VtxBuffer.Size * sizeof(ImDrawVert));
-        memcpy(idx_dst, draw_list->IdxBuffer.Data, draw_list->IdxBuffer.Size * sizeof(ImDrawIdx));
+        const size_t vertex_bytes = (size_t)draw_list->VtxBuffer.Size * sizeof(ImDrawVert);
+        const size_t index_bytes = (size_t)draw_list->IdxBuffer.Size * sizeof(ImDrawIdx);
+        if (!vertex_changed && vertex_bytes > 0 &&
+            memcmp(vtx_dst, draw_list->VtxBuffer.Data, vertex_bytes) != 0)
+            vertex_changed = true;
+        if (!index_changed && index_bytes > 0 &&
+            memcmp(idx_dst, draw_list->IdxBuffer.Data, index_bytes) != 0)
+            index_changed = true;
+        memcpy(vtx_dst, draw_list->VtxBuffer.Data, vertex_bytes);
+        memcpy(idx_dst, draw_list->IdxBuffer.Data, index_bytes);
         vtx_dst += draw_list->VtxBuffer.Size;
         idx_dst += draw_list->IdxBuffer.Size;
     }
-    device->Unmap(bd->pVB, 0);
-    device->Unmap(bd->pIB, 0);
+    if (vertex_changed && draw_data->TotalVtxCount > 0)
+    {
+        D3D11_BOX box = { 0, 0, 0, (UINT)((size_t)draw_data->TotalVtxCount * sizeof(ImDrawVert)), 1, 1 };
+        device->UpdateSubresource(bd->pVB, 0, &box, bd->pVertexUpload, 0, 0);
+    }
+    if (index_changed && draw_data->TotalIdxCount > 0)
+    {
+        D3D11_BOX box = { 0, 0, 0, (UINT)((size_t)draw_data->TotalIdxCount * sizeof(ImDrawIdx)), 1, 1 };
+        device->UpdateSubresource(bd->pIB, 0, &box, bd->pIndexUpload, 0, 0);
+    }
+    bd->LastVertexCount = draw_data->TotalVtxCount;
+    bd->LastIndexCount = draw_data->TotalIdxCount;
 
     // Backup DX state that will be modified to restore it afterwards (unfortunately this is very ugly looking and verbose. Close your eyes!)
     struct BACKUP_DX11_STATE
@@ -446,9 +491,9 @@ bool    ImGui_ImplDX11_CreateDeviceObjects()
         {
             D3D11_BUFFER_DESC desc = {};
             desc.ByteWidth = sizeof(VERTEX_CONSTANT_BUFFER_DX11);
-            desc.Usage = D3D11_USAGE_DYNAMIC;
+            desc.Usage = D3D11_USAGE_DEFAULT;
             desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-            desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+            desc.CPUAccessFlags = 0;
             desc.MiscFlags = 0;
             bd->pd3dDevice->CreateBuffer(&desc, nullptr, &bd->pVertexConstantBuffer);
         }
@@ -563,6 +608,9 @@ void    ImGui_ImplDX11_InvalidateDeviceObjects()
     if (bd->pVertexConstantBuffer)  { bd->pVertexConstantBuffer->Release(); bd->pVertexConstantBuffer = nullptr; }
     if (bd->pInputLayout)           { bd->pInputLayout->Release(); bd->pInputLayout = nullptr; }
     if (bd->pVertexShader)          { bd->pVertexShader->Release(); bd->pVertexShader = nullptr; }
+    bd->LastVertexCount = -1;
+    bd->LastIndexCount = -1;
+    bd->HasVertexConstantBuffer = false;
 }
 
 bool    ImGui_ImplDX11_Init(ID3D11Device* device, ID3D11DeviceContext* device_context)
@@ -605,6 +653,8 @@ void ImGui_ImplDX11_Shutdown()
     ImGuiIO& io = ImGui::GetIO();
 
     ImGui_ImplDX11_InvalidateDeviceObjects();
+    if (bd->pVertexUpload)       { IM_FREE(bd->pVertexUpload); bd->pVertexUpload = nullptr; }
+    if (bd->pIndexUpload)        { IM_FREE(bd->pIndexUpload); bd->pIndexUpload = nullptr; }
     if (bd->pFactory)             { bd->pFactory->Release(); }
     if (bd->pd3dDevice)           { bd->pd3dDevice->Release(); }
     if (bd->pd3dDeviceContext)    { bd->pd3dDeviceContext->Release(); }

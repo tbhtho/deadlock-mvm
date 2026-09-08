@@ -354,7 +354,7 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         }
     }
 
-    public async Task PlayAsync(CampathPlayMode mode)
+    public async Task PlayAsync(CampathPlayMode mode, Func<bool>? beforePlayback = null)
     {
         _operationInFlight = true;
         RaiseCommandStates();
@@ -368,7 +368,8 @@ public sealed class CampathViewModel : INotifyPropertyChanged
             await _native.PlayCampathAsync(
                 path,
                 mode,
-                CampathEndBehavior.StopAndRelease).ConfigureAwait(true);
+                CampathEndBehavior.StopAndRelease,
+                beforePlayback).ConfigureAwait(true);
             Status = "Playing path.";
         }
         catch (Exception ex)
@@ -491,7 +492,7 @@ public sealed class CampathViewModel : INotifyPropertyChanged
         OnEditorStateChanged();
     }
 
-    public IReadOnlyList<CampathKeyframe> GetKeyframeSnapshot() => Keyframes.ToArray();
+    public CampathKeyframe[] GetKeyframeSnapshot() => Keyframes.ToArray();
 
     public void SaveCurrent()
     {

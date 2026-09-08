@@ -1,6 +1,7 @@
 #include "replay_camera.hpp"
 
 #include "campath_math.hpp"
+#include "camera_startup_policy.hpp"
 #include "hook_lifecycle.hpp"
 #include "manual_camera_math.hpp"
 #include "pattern_scan.hpp"
@@ -560,7 +561,11 @@ void RevokeCameraOwnership(Backend& backend, const ErrorCode error) noexcept {
            backend->smvm_snapshot.Load(snapshot);
 }
 
-[[nodiscard]] bool OverlayReadRenderedCamera(void* context, CameraSample& camera) noexcept {
+[[nodiscard]] bool OverlayReadRenderedCamera(
+    void* context,
+    CameraSample& camera,
+    std::int64_t& replay_tick,
+    std::uint64_t& frame_sequence) noexcept {
     auto* backend = static_cast<Backend*>(context);
     if (backend == nullptr || !backend->pipe_connected.load(std::memory_order_acquire) ||
         !backend->camera_observed.load(std::memory_order_acquire))
@@ -568,9 +573,7 @@ void RevokeCameraOwnership(Backend& backend, const ErrorCode error) noexcept {
     const auto observed_at = backend->camera_observed_milliseconds.load(std::memory_order_acquire);
     if (observed_at == 0 || GetTickCount64() - observed_at > kCameraObservationFreshMilliseconds)
         return false;
-    std::int64_t ignored_tick{};
-    std::uint64_t ignored_sequence{};
-    return backend->observed_frame.Load(camera, ignored_tick, ignored_sequence) &&
+    return backend->observed_frame.Load(camera, replay_tick, frame_sequence) &&
            ValidateSample(camera);
 }
 
@@ -872,6 +875,54 @@ void OverlayPublishStatus(
     camera = reinterpret_cast<void*>(camera_address);
     vtable = reinterpret_cast<void**>(vtable_address);
     return true;
+}
+
+[[nodiscard]] bool ResolveEntityHandle(
+    const Backend& backend,
+    const std::uint32_t handle,
+    std::uintptr_t& entity) noexcept {
+    entity = 0;
+    if (handle == 0xFFFFFFFFu || handle == 0xFFFFFFFEu)
+        return false;
+    std::uintptr_t entity_system = 0;
+    if (!ReadPointer(backend.entity_system_global, entity_system))
+        return false;
+    __try {
+        const auto index = handle & 0x7FFFu;
+        const auto chunk = *reinterpret_cast<const std::uintptr_t*>(
+            entity_system + 8ull * (index >> 9));
+        if (chunk == 0)
+            return false;
+        const auto entry = chunk + 112ull * (index & 0x1FFu);
+        if (*reinterpret_cast<const std::uint32_t*>(entry + 0x10) != handle)
+            return false;
+        entity = *reinterpret_cast<const std::uintptr_t*>(entry);
+        return entity != 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        entity = 0;
+        return false;
+    }
+}
+
+[[nodiscard]] bool ReadObserverServices(
+    const Backend& backend,
+    std::uintptr_t& services) noexcept {
+    services = 0;
+    std::uintptr_t controller = 0;
+    if (!ReadPointer(backend.controllers, controller))
+        return false;
+    __try {
+        const auto pawn_handle =
+            *reinterpret_cast<const std::uint32_t*>(controller + kControllerPawnHandle);
+        std::uintptr_t pawn = 0;
+        if (!ResolveEntityHandle(backend, pawn_handle, pawn))
+            return false;
+        services = *reinterpret_cast<const std::uintptr_t*>(pawn + kPawnObserverServices);
+        return services != 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        services = 0;
+        return false;
+    }
 }
 
 [[nodiscard]] bool IsObserverRoaming(const Backend& backend) noexcept {
@@ -1811,6 +1862,18 @@ enum class PipeConnectionResult : std::uint8_t {
         std::array<std::uint8_t, kMaxMessageBytes> payload{};
         if (header.payload_size != 0 && !ReadExact(pipe, io_event, payload.data(), header.payload_size))
             break;
+
+        // Early injection can precede client.dll by more than the initial wait
+        // under load. Retry on the pipe thread once it arrives; never retry a
+        // signature or hook failure, or race resolution against camera commands.
+        if (ShouldRetryCameraStartup(
+                backend.resolved.load(std::memory_order_acquire),
+                backend.error.load(std::memory_order_acquire),
+                hello_received,
+                GetModuleHandleW(L"client.dll") != nullptr)) {
+            if (!ResolveStaticTargets(backend))
+                backend.state.store(BackendState::failed, std::memory_order_release);
+        }
 
         SmvmSnapshotPayload current_snapshot{};
         const auto current_snapshot_available =

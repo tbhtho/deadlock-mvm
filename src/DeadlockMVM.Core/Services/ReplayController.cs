@@ -115,6 +115,14 @@ public sealed class ReplayController : IReplayPlaybackState, IDisposable
     /// </summary>
     public TimeSpan OutputStaleTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
+    /// <summary>
+    /// Offline movie writers can intentionally stall Deadlock's main/present
+    /// thread long enough that VConsole cannot answer within wall-clock time.
+    /// The coordinator supplies this guard only while a native movie transaction
+    /// is active; ordinary console loss keeps the normal five-second recovery.
+    /// </summary>
+    public Func<bool>? OutputSilenceExpected { get; set; }
+
     /// <summary>Automatically re-connect after an unexpected disconnect.</summary>
     public bool AutoReconnect { get; set; } = true;
 
@@ -377,8 +385,11 @@ public sealed class ReplayController : IReplayPlaybackState, IDisposable
         // connection died silently). Drop it; auto-reconnect re-establishes
         // and our polls then evict whoever holds the slot.
         var now = DateTime.UtcNow.Ticks;
-        if (_sentCommandSinceLastOutput &&
-            now - Interlocked.Read(ref _lastOutputUtcTicks) > OutputStaleTimeout.Ticks)
+        if (ShouldDisconnectForOutputStall(
+                _sentCommandSinceLastOutput,
+                now - Interlocked.Read(ref _lastOutputUtcTicks),
+                OutputStaleTimeout,
+                OutputSilenceExpected?.Invoke() == true))
         {
             ScheduleReconnect();
             _transport.Disconnect();
@@ -413,6 +424,13 @@ public sealed class ReplayController : IReplayPlaybackState, IDisposable
         // The response arrives asynchronously via OnOutputLine; stall detection
         // happens once the reply updates CurrentTick (see MergeEngineState).
     }
+
+    internal static bool ShouldDisconnectForOutputStall(
+        bool commandAwaitingOutput,
+        long silenceTicks,
+        TimeSpan staleTimeout,
+        bool silenceExpected) =>
+        commandAwaitingOutput && !silenceExpected && silenceTicks > staleTimeout.Ticks;
 
     private void TryAutoReconnect()
     {

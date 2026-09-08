@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using DeadlockMVM.Core.Models;
+using DeadlockMVM.Core.Services;
 
 namespace DeadlockMVM.Core.Native.InProcess;
 
@@ -104,6 +105,12 @@ public enum SmvmOverlayFlags : uint
     CreepHealthbarHookRetrying = 1 << 22,
     TowerOutlineHooksRetrying = 1 << 23,
     TowerFadeOverrideRetrying = 1 << 24,
+    MovieRecordingActive = 1 << 25,
+    WorldDepthAvailable = 1 << 26,
+    WorldDepthFailed = 1 << 27,
+    MovieAviAvailable = 1 << 28,
+    WorldDepthIncomplete = 1 << 29,
+    MovieFrameReady = 1 << 30,
 }
 
 [Flags]
@@ -140,6 +147,32 @@ public enum SmvmSnapshotFlags : uint
     ReplaySeekInProgress = 1 << 27,
     RecordingProfileRestorePending = 1 << 28,
     RecordingProfileTransactionInProgress = 1 << 29,
+}
+
+[Flags]
+public enum MovieRecordingFlags : uint
+{
+    None = 0,
+    DisablePostProcessing = 1 << 0,
+    MuteDialogue = 1 << 1,
+    WorldDepth = 1 << 3,
+    Active = 1 << 4,
+    Armed = 1 << 5,
+    Finalizing = 1 << 6,
+}
+
+public enum MovieRecordingOption
+{
+    DisablePostProcessing = 0,
+    MuteDialogue = 1,
+}
+
+[Flags]
+public enum MovieToolFlags : uint
+{
+    None = 0,
+    RuleOfThirds = 1 << 0,
+    CustomFog = 1 << 1,
 }
 
 public enum SmvmCaptureStage : uint
@@ -387,6 +420,24 @@ public enum SmvmActionType : uint
     SetStatusHudAnchor = 72,
     SetStatusHudScale = 73,
     SetStatusHudOpacity = 74,
+    SetMovieRecordingOption = 75,
+    StartMovieRecording = 76,
+    StopMovieRecording = 77,
+    SetMovieRecordingFps = 78,
+    SetMovieRecordingPreset = 79,
+    SetMovieOutputMode = 80,
+    SetMovieCapturePass = 81,
+    OpenMovieCaptureFolder = 82,
+    SetRuleOfThirds = 83,
+    SetCustomFogEnabled = 84,
+    SetCustomFogValue = 85,
+    SetCustomFogColor = 86,
+    ResetCustomFog = 87,
+    SetGreenscreenMode = 88,
+    RetiredCameraAttachment = 89,
+    RetiredCameraAttachmentOffset = 90,
+    ChooseMovieCaptureFolder = 91,
+    SetMovieOutputResolution = 92,
 }
 
 public sealed record SmvmAction(
@@ -485,7 +536,23 @@ public sealed record SmvmSnapshot(
     double StatusHudScale = 1.0,
     double StatusHudOpacity = 0.92,
     ulong RecordingProfileAcknowledgementGeneration = 0,
-    long ReplaySessionGeneration = 0);
+    long ReplaySessionGeneration = 0,
+    MovieRecordingFlags MovieRecordingFlags = MovieRecordingFlags.None,
+    string MovieRecordingName = "",
+    int MovieRecordingFps = MovieRecordingController.DefaultCaptureFps,
+    MovieRecordingPreset MovieRecordingPreset = MovieRecordingPreset.EditSequence,
+    MovieOutputMode MovieOutputMode = MovieOutputMode.ImageSequence,
+    MovieCapturePass MovieCapturePasses = MovieCapturePass.Beauty,
+    MovieToolFlags MovieToolFlags = MovieToolFlags.None,
+    GreenscreenMode GreenscreenMode = GreenscreenMode.Off,
+    FogConfiguration CustomFog = default,
+    uint GreenscreenColorRgb = 0x00FF00,
+    string MovieCapturePath = "",
+    MovieOutputResolution MovieOutputResolution = MovieOutputResolution.Game,
+    MovieCapturePass MovieActivePasses = MovieCapturePass.Beauty,
+    MovieCompositingStage MovieCompositingStage = MovieCompositingStage.None,
+    bool MovieCaptureAudio = true,
+    ulong MovieExpectedFrameCount = 0);
 
 [Flags]
 public enum InProcessStatusFlags : uint
@@ -542,10 +609,10 @@ public sealed record InProcessCameraStatus(
 internal static class InProcessProtocol
 {
     public const uint Magic = 0x4D564D43;
-    public const ushort Version = 16;
+    public const ushort Version = 24;
     public const int HeaderSize = 28;
     public const int StatusSize = 272;
-    public const int SmvmSnapshotSize = 744;
+    public const int SmvmSnapshotSize = 1128;
     public const int CameraSampleSize = 56;
     public const int CampathKeyframeSize = 64;
     public const int CampathHeaderSize = 16;
@@ -701,8 +768,58 @@ internal static class InProcessProtocol
         if (snapshot.RecordingProfileAcknowledgementGeneration > long.MaxValue ||
             snapshot.ReplaySessionGeneration < 0)
             throw new ArgumentOutOfRangeException(nameof(snapshot));
+        const MovieRecordingFlags knownMovieRecordingFlags =
+            MovieRecordingFlags.DisablePostProcessing |
+            MovieRecordingFlags.MuteDialogue |
+            MovieRecordingFlags.WorldDepth |
+            MovieRecordingFlags.Active |
+            MovieRecordingFlags.Armed |
+            MovieRecordingFlags.Finalizing;
+        const MovieCapturePass knownMovieCapturePasses =
+            MovieCapturePass.Beauty |
+            MovieCapturePass.WorldDepthPfm |
+            MovieCapturePass.WorldDepthAvi |
+            MovieCapturePass.GreenscreenFreeCamera;
+        const MovieToolFlags knownMovieToolFlags =
+            MovieToolFlags.RuleOfThirds | MovieToolFlags.CustomFog;
+        var customFog = snapshot.CustomFog == default
+            ? FogConfiguration.Default
+            : snapshot.CustomFog;
+        var recordingActive = (snapshot.MovieRecordingFlags & MovieRecordingFlags.Active) != 0;
+        var recordingArmed = (snapshot.MovieRecordingFlags & MovieRecordingFlags.Armed) != 0;
+        var recordingFinalizing =
+            (snapshot.MovieRecordingFlags & MovieRecordingFlags.Finalizing) != 0;
+        if ((snapshot.MovieRecordingFlags & ~knownMovieRecordingFlags) != 0 ||
+            (recordingActive ? 1 : 0) + (recordingArmed ? 1 : 0) +
+                (recordingFinalizing ? 1 : 0) > 1 ||
+            (recordingActive || recordingArmed || recordingFinalizing) !=
+                !string.IsNullOrEmpty(snapshot.MovieRecordingName) ||
+            snapshot.MovieRecordingName.Length >= 64 ||
+            snapshot.MovieRecordingName.Any(static character =>
+                !char.IsAsciiLetterOrDigit(character) && character is not '-' and not '_') ||
+            snapshot.MovieRecordingFps is < MovieRecordingController.MinimumCaptureFps or
+                > MovieRecordingController.MaximumCaptureFps ||
+            !Enum.IsDefined(snapshot.MovieRecordingPreset) ||
+            !Enum.IsDefined(snapshot.MovieOutputMode) ||
+            snapshot.MovieCapturePasses == MovieCapturePass.None ||
+            (snapshot.MovieCapturePasses & ~knownMovieCapturePasses) != 0 ||
+            snapshot.MovieActivePasses == MovieCapturePass.None ||
+            (snapshot.MovieActivePasses & ~knownMovieCapturePasses) != 0 ||
+            !Enum.IsDefined(snapshot.MovieOutputResolution) ||
+            !Enum.IsDefined(snapshot.MovieCompositingStage) ||
+            (snapshot.MovieToolFlags & ~knownMovieToolFlags) != 0 ||
+            !Enum.IsDefined(snapshot.GreenscreenMode) ||
+            !customFog.IsValid ||
+            snapshot.GreenscreenColorRgb > 0xFFFFFF ||
+            System.Text.Encoding.UTF8.GetByteCount(snapshot.MovieCapturePath) >= 192 ||
+            snapshot.MovieCapturePath.Any(static character => character is '\r' or '\n' or '\0'))
+            throw new ArgumentOutOfRangeException(nameof(snapshot));
+        if (snapshot.MovieExpectedFrameCount > long.MaxValue ||
+            (snapshot.MovieCompositingStage == MovieCompositingStage.Chroma) !=
+                (snapshot.MovieExpectedFrameCount > 0))
+            throw new ArgumentOutOfRangeException(nameof(snapshot));
         var payload = new byte[SmvmSnapshotSize];
-        BinaryPrimitives.WriteUInt32LittleEndian(payload, 9);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload, 13);
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(4), (uint)snapshot.Flags);
         BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(8), snapshot.CurrentTick);
         BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(16), snapshot.TotalTicks);
@@ -786,6 +903,37 @@ internal static class InProcessProtocol
             payload.AsSpan(728), snapshot.RecordingProfileAcknowledgementGeneration);
         BinaryPrimitives.WriteInt64LittleEndian(
             payload.AsSpan(736), snapshot.ReplaySessionGeneration);
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            payload.AsSpan(744), (uint)snapshot.MovieRecordingFlags);
+        WriteUtf8(payload.AsSpan(748, 64), snapshot.MovieRecordingName);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(816), checked((uint)snapshot.MovieRecordingFps));
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(820), (uint)snapshot.MovieRecordingPreset);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(824), (uint)snapshot.MovieOutputMode);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(828), (uint)snapshot.MovieCapturePasses);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(832), (uint)snapshot.MovieToolFlags);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(836), (uint)snapshot.GreenscreenMode);
+        WriteDouble(payload, 840, customFog.Start);
+        WriteDouble(payload, 848, customFog.End);
+        WriteDouble(payload, 856, customFog.MaximumDensity);
+        WriteDouble(payload, 864, customFog.Exponent);
+        var fogColor = (uint)(customFog.Red << 16 |
+                              customFog.Green << 8 |
+                              customFog.Blue);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(872), fogColor);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(876), snapshot.GreenscreenColorRgb);
+        // 880..911 are retired player-attachment fields retained as zeroed
+        // padding retained from snapshot v11 so the established prefix remains stable.
+        WriteUtf8(payload.AsSpan(912, 192), snapshot.MovieCapturePath);
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            payload.AsSpan(1104), (uint)snapshot.MovieOutputResolution);
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            payload.AsSpan(1108), (uint)snapshot.MovieActivePasses);
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            payload.AsSpan(1112), (uint)snapshot.MovieCompositingStage);
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            payload.AsSpan(1116), snapshot.MovieCaptureAudio ? 1u : 0u);
+        BinaryPrimitives.WriteUInt64LittleEndian(
+            payload.AsSpan(1120), snapshot.MovieExpectedFrameCount);
         return payload;
     }
 
@@ -859,7 +1007,13 @@ internal static class InProcessProtocol
             SmvmOverlayFlags.TowerFadeOverrideEnforced |
             SmvmOverlayFlags.CreepHealthbarHookRetrying |
             SmvmOverlayFlags.TowerOutlineHooksRetrying |
-            SmvmOverlayFlags.TowerFadeOverrideRetrying;
+            SmvmOverlayFlags.TowerFadeOverrideRetrying |
+            SmvmOverlayFlags.MovieRecordingActive |
+            SmvmOverlayFlags.WorldDepthAvailable |
+            SmvmOverlayFlags.WorldDepthFailed |
+            SmvmOverlayFlags.MovieAviAvailable |
+            SmvmOverlayFlags.WorldDepthIncomplete |
+            SmvmOverlayFlags.MovieFrameReady;
         if (!Enum.IsDefined(state) || !Enum.IsDefined(error) || (flags & ~knownStatusFlags) != 0 ||
             !Enum.IsDefined(rendererBackend) || !Enum.IsDefined(rendererError) ||
             (overlayFlags & ~knownOverlayFlags) != 0)
@@ -892,6 +1046,43 @@ internal static class InProcessProtocol
             throw new InvalidDataException("Native status contains an untagged emergency UI restore.");
         if (actionType == SmvmActionType.SetDeadlockUiMode && actionTick == long.MinValue)
             throw new InvalidDataException("Native status contains an invalid UI owner generation.");
+        if (actionType == SmvmActionType.SetMovieRecordingOption &&
+            (!Enum.IsDefined((MovieRecordingOption)BinaryPrimitives.ReadInt32LittleEndian(payload[124..])) ||
+             actionValue is not 0.0 and not 1.0))
+            throw new InvalidDataException("Native status contains an invalid movie-recording option action.");
+        if (actionType == SmvmActionType.SetMovieRecordingFps &&
+            (actionValue < MovieRecordingController.MinimumCaptureFps ||
+             actionValue > MovieRecordingController.MaximumCaptureFps ||
+             actionValue != Math.Truncate(actionValue)))
+            throw new InvalidDataException("Native status contains an invalid movie-recording FPS action.");
+        if (actionType == SmvmActionType.SetMovieRecordingPreset &&
+            !Enum.IsDefined((MovieRecordingPreset)BinaryPrimitives.ReadInt32LittleEndian(payload[124..])))
+            throw new InvalidDataException("Native status contains an invalid movie-recording preset action.");
+        if (actionType == SmvmActionType.SetMovieOutputMode &&
+            !Enum.IsDefined((MovieOutputMode)BinaryPrimitives.ReadInt32LittleEndian(payload[124..])))
+            throw new InvalidDataException("Native status contains an invalid movie output action.");
+        if (actionType == SmvmActionType.SetMovieCapturePass &&
+            (BinaryPrimitives.ReadInt32LittleEndian(payload[124..]) is < 0 or > 3 ||
+             actionValue is not 0.0 and not 1.0))
+            throw new InvalidDataException("Native status contains an invalid movie pass action.");
+        if (actionType == SmvmActionType.SetMovieOutputResolution &&
+            !Enum.IsDefined((MovieOutputResolution)BinaryPrimitives.ReadInt32LittleEndian(payload[124..])))
+            throw new InvalidDataException("Native status contains an invalid movie resolution action.");
+        if ((actionType is SmvmActionType.SetRuleOfThirds or SmvmActionType.SetCustomFogEnabled) &&
+            actionValue is not 0.0 and not 1.0)
+            throw new InvalidDataException("Native status contains an invalid movie visual toggle.");
+        if (actionType == SmvmActionType.SetCustomFogValue &&
+            BinaryPrimitives.ReadInt32LittleEndian(payload[124..]) is < 0 or > 3)
+            throw new InvalidDataException("Native status contains an invalid custom fog action.");
+        if (actionType == SmvmActionType.SetCustomFogColor &&
+            BinaryPrimitives.ReadInt32LittleEndian(payload[124..]) is < 0 or > 0xFFFFFF)
+            throw new InvalidDataException("Native status contains an invalid custom fog color.");
+        if (actionType == SmvmActionType.SetGreenscreenMode &&
+            !Enum.IsDefined((GreenscreenMode)BinaryPrimitives.ReadInt32LittleEndian(payload[124..])))
+            throw new InvalidDataException("Native status contains an invalid greenscreen mode.");
+        if (actionType is SmvmActionType.RetiredCameraAttachment or
+            SmvmActionType.RetiredCameraAttachmentOffset)
+            throw new InvalidDataException("Native status contains a retired camera attachment action.");
         if (actionType == SmvmActionType.CaptureDiagnostic)
         {
             var stage = (SmvmCaptureStage)BinaryPrimitives.ReadInt32LittleEndian(payload[124..]);

@@ -18,6 +18,7 @@ public sealed class VConsoleConnectionService : IDisposable
     private readonly int _port;
     private readonly ILogService _log;
     private readonly DispatcherTimer _timer;
+    private string? _lastConnectionError;
 
     public VConsoleConnectionService(
         ReplayController controller,
@@ -51,10 +52,17 @@ public sealed class VConsoleConnectionService : IDisposable
         try
         {
             _controller.Connect("127.0.0.1", _port);
+            _lastConnectionError = null;
+            _log.Info($"Connected to Deadlock console at 127.0.0.1:{_port}.");
         }
-        catch
+        catch (Exception ex)
         {
-            // Game not ready yet; the timer retries.
+            var detail = ex.GetBaseException().Message;
+            if (detail != _lastConnectionError)
+            {
+                _log.Warn($"Waiting for Deadlock console at 127.0.0.1:{_port}: {detail} Retrying every two seconds.");
+                _lastConnectionError = detail;
+            }
         }
     }
 
@@ -62,13 +70,26 @@ public sealed class VConsoleConnectionService : IDisposable
     {
         foreach (var name in GameProcessNames)
         {
-            foreach (var process in Process.GetProcessesByName(name))
+            var processes = Process.GetProcessesByName(name);
+            try
             {
-                using (process)
+                foreach (var process in processes)
                 {
-                    if (process.MainWindowHandle != IntPtr.Zero)
-                        return true;
+                    try
+                    {
+                        if (process.MainWindowHandle != IntPtr.Zero)
+                            return true;
+                    }
+                    catch (InvalidOperationException)
+                    {
+                        // The game can exit between enumeration and inspection.
+                    }
                 }
+            }
+            finally
+            {
+                foreach (var process in processes)
+                    process.Dispose();
             }
         }
         return false;

@@ -7,6 +7,8 @@ namespace DeadlockMVM.Core.Services;
 /// <summary>JSON-backed settings store for user configurable options.</summary>
 public sealed class AppSettings : IAppSettings
 {
+    private static readonly JsonSerializerOptions SaveOptions = new() { WriteIndented = true };
+
     private sealed class SettingsDocument
     {
         public string DeadlockPath { get; set; } = string.Empty;
@@ -78,6 +80,19 @@ public sealed class AppSettings : IAppSettings
         public SmvmNotificationAnchor SmvmStatusHudAnchor { get; set; } = SmvmNotificationAnchor.TopRight;
         public double SmvmStatusHudScale { get; set; } = 1;
         public double SmvmStatusHudOpacity { get; set; } = 0.92;
+        public int SmvmMovieCaptureFps { get; set; } = MovieRecordingController.DefaultCaptureFps;
+        public MovieRecordingPreset SmvmMovieRecordingPreset { get; set; } = MovieRecordingPreset.EditSequence;
+        public MovieOutputMode SmvmMovieOutputMode { get; set; } = MovieOutputMode.ImageSequence;
+        public MovieOutputResolution SmvmMovieOutputResolution { get; set; } = MovieOutputResolution.Game;
+        public MovieCapturePass SmvmMovieCapturePasses { get; set; } = MovieCapturePass.Beauty;
+        public string SmvmMovieCaptureRoot { get; set; } = string.Empty;
+        public bool SmvmMovieDisablePostProcessing { get; set; }
+        public bool SmvmMovieMuteDialogue { get; set; } = true;
+        public bool SmvmRuleOfThirds { get; set; }
+        public bool SmvmCustomFogEnabled { get; set; }
+        public FogConfiguration SmvmCustomFog { get; set; } = FogConfiguration.Default;
+        public GreenscreenMode SmvmGreenscreenMode { get; set; } = GreenscreenMode.Off;
+        public uint SmvmGreenscreenColorRgb { get; set; } = 0x00FF00;
     }
 
     private readonly string _filePath;
@@ -492,6 +507,134 @@ public sealed class AppSettings : IAppSettings
         set => _document.SmvmStatusHudOpacity = ClampFinite(value, 0.35, 1, 0.92);
     }
 
+    public int SmvmMovieCaptureFps
+    {
+        get => Math.Clamp(
+            _document.SmvmMovieCaptureFps,
+            MovieRecordingController.MinimumCaptureFps,
+            MovieRecordingController.MaximumCaptureFps);
+        set => _document.SmvmMovieCaptureFps = Math.Clamp(
+            value,
+            MovieRecordingController.MinimumCaptureFps,
+            MovieRecordingController.MaximumCaptureFps);
+    }
+
+    public MovieRecordingPreset SmvmMovieRecordingPreset
+    {
+        get => Enum.IsDefined(_document.SmvmMovieRecordingPreset)
+            ? _document.SmvmMovieRecordingPreset
+            : MovieRecordingPreset.EditSequence;
+        set => _document.SmvmMovieRecordingPreset = Enum.IsDefined(value)
+            ? value
+            : MovieRecordingPreset.EditSequence;
+    }
+
+    public MovieOutputMode SmvmMovieOutputMode
+    {
+        get => Enum.IsDefined(_document.SmvmMovieOutputMode)
+            ? _document.SmvmMovieOutputMode
+            : MovieOutputMode.ImageSequence;
+        set => _document.SmvmMovieOutputMode = Enum.IsDefined(value)
+            ? value
+            : MovieOutputMode.ImageSequence;
+    }
+
+    public MovieOutputResolution SmvmMovieOutputResolution
+    {
+        get => Enum.IsDefined(_document.SmvmMovieOutputResolution)
+            ? _document.SmvmMovieOutputResolution
+            : MovieOutputResolution.Game;
+        set => _document.SmvmMovieOutputResolution = Enum.IsDefined(value)
+            ? value
+            : MovieOutputResolution.Game;
+    }
+
+    public MovieCapturePass SmvmMovieCapturePasses
+    {
+        get
+        {
+            var passes = _document.SmvmMovieCapturePasses &
+                (MovieCapturePass.Beauty | MovieCapturePass.WorldDepthPfm |
+                 MovieCapturePass.WorldDepthAvi | MovieCapturePass.GreenscreenFreeCamera);
+            return passes == MovieCapturePass.None ? MovieCapturePass.Beauty : passes;
+        }
+        set => _document.SmvmMovieCapturePasses = value &
+            (MovieCapturePass.Beauty | MovieCapturePass.WorldDepthPfm |
+             MovieCapturePass.WorldDepthAvi | MovieCapturePass.GreenscreenFreeCamera);
+    }
+
+    public string SmvmMovieCaptureRoot
+    {
+        get
+        {
+            if (string.IsNullOrWhiteSpace(_document.SmvmMovieCaptureRoot))
+                return MovieRecordingController.DefaultCaptureRoot;
+            try
+            {
+                return Path.GetFullPath(_document.SmvmMovieCaptureRoot.Trim());
+            }
+            catch
+            {
+                return MovieRecordingController.DefaultCaptureRoot;
+            }
+        }
+        set
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                _document.SmvmMovieCaptureRoot = string.Empty;
+                return;
+            }
+            _document.SmvmMovieCaptureRoot = Path.GetFullPath(value.Trim());
+        }
+    }
+
+    public bool SmvmMovieDisablePostProcessing
+    {
+        get => _document.SmvmMovieDisablePostProcessing;
+        set => _document.SmvmMovieDisablePostProcessing = value;
+    }
+
+    public bool SmvmMovieMuteDialogue
+    {
+        get => _document.SmvmMovieMuteDialogue;
+        set => _document.SmvmMovieMuteDialogue = value;
+    }
+
+    public bool SmvmRuleOfThirds
+    {
+        get => _document.SmvmRuleOfThirds;
+        set => _document.SmvmRuleOfThirds = value;
+    }
+
+    public bool SmvmCustomFogEnabled
+    {
+        get => _document.SmvmCustomFogEnabled;
+        set => _document.SmvmCustomFogEnabled = value;
+    }
+
+    public FogConfiguration SmvmCustomFog
+    {
+        get => _document.SmvmCustomFog.IsValid ? _document.SmvmCustomFog : FogConfiguration.Default;
+        set => _document.SmvmCustomFog = value.IsValid ? value : FogConfiguration.Default;
+    }
+
+    public GreenscreenMode SmvmGreenscreenMode
+    {
+        get => Enum.IsDefined(_document.SmvmGreenscreenMode)
+            ? _document.SmvmGreenscreenMode
+            : GreenscreenMode.Off;
+        set => _document.SmvmGreenscreenMode = Enum.IsDefined(value)
+            ? value
+            : GreenscreenMode.Off;
+    }
+
+    public uint SmvmGreenscreenColorRgb
+    {
+        get => _document.SmvmGreenscreenColorRgb & 0xFFFFFF;
+        set => _document.SmvmGreenscreenColorRgb = value & 0xFFFFFF;
+    }
+
     public void Load()
     {
         try
@@ -511,15 +654,27 @@ public sealed class AppSettings : IAppSettings
 
     public void Save()
     {
+        string? temporary = null;
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(_filePath)!);
-            var json = JsonSerializer.Serialize(_document, new JsonSerializerOptions { WriteIndented = true });
-            File.WriteAllText(_filePath, json);
+            var json = JsonSerializer.Serialize(_document, SaveOptions);
+            temporary = _filePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            File.WriteAllText(temporary, json);
+            File.Move(temporary, _filePath, overwrite: true);
         }
         catch
         {
             // Intentionally ignored: settings persistence must not crash the launcher.
+        }
+        finally
+        {
+            if (temporary is not null)
+            {
+                try { File.Delete(temporary); }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
         }
     }
 

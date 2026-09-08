@@ -10,7 +10,16 @@ public sealed class SystemProcessQuery : IProcessQuery
     {
         try
         {
-            return Process.GetProcessesByName(processNameWithoutExtension).Length > 0;
+            var processes = Process.GetProcessesByName(processNameWithoutExtension);
+            try
+            {
+                return processes.Length > 0;
+            }
+            finally
+            {
+                foreach (var process in processes)
+                    process.Dispose();
+            }
         }
         catch
         {

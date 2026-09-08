@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 
 namespace deadlock_mvm {
 
@@ -18,6 +19,30 @@ enum class MovieMakerShortcutAction {
     decrease_camera_speed,
     increase_camera_speed,
 };
+
+enum class RecordingEscapeAction {
+    none,
+    cancel_armed_take,
+    stop_active_take,
+};
+
+// Recording owns Escape before the normal closed-menu Free Camera exit. This
+// is intentionally independent from menu state: an active writer must always
+// have one obvious, modifier-free emergency stop that cannot leak into
+// Deadlock's pause menu.
+[[nodiscard]] constexpr RecordingEscapeAction ResolveRecordingEscapeShortcut(
+    const bool escape_matches,
+    const bool modifiers_clear,
+    const bool recording_armed,
+    const bool recording_active) noexcept {
+    if (!escape_matches || !modifiers_clear)
+        return RecordingEscapeAction::none;
+    if (recording_active)
+        return RecordingEscapeAction::stop_active_take;
+    if (recording_armed)
+        return RecordingEscapeAction::cancel_armed_take;
+    return RecordingEscapeAction::none;
+}
 
 [[nodiscard]] constexpr MovieMakerShortcutAction ResolveMovieMakerShortcut(
     const bool fixed_pause_matches,
@@ -117,6 +142,26 @@ enum class MovieMakerShortcutAction {
         return false;
     const auto physically_down = event_down || (polling_armed && polled_down);
     return physically_down && (!input_takeover || smvm_route_owned);
+}
+
+// Placement is an instantaneous editor action, not a movement chord. A
+// modifier-free Mouse3 binding must therefore remain usable while Shift boost
+// (or another movement modifier) is held. Explicit modifiers are still
+// required when the owner deliberately binds a chord such as Ctrl+Mouse3.
+[[nodiscard]] constexpr bool EditorPlacementModifiersMatch(
+    const std::uint32_t required_modifiers,
+    const std::uint32_t active_modifiers) noexcept {
+    return (active_modifiers & required_modifiers) == required_modifiers;
+}
+
+// N is a fixed transport action as well as the configurable replay-pause
+// binding. Shift is commonly held for Free Camera boost, so it must not block
+// this instantaneous action. Ctrl, Alt, and Windows-key chords remain reserved
+// for their explicitly configured bindings.
+[[nodiscard]] constexpr bool PlainReplayPauseModifiersMatch(
+    const std::uint32_t active_modifiers) noexcept {
+    constexpr auto kShiftModifier = 4u;
+    return (active_modifiers & ~kShiftModifier) == 0;
 }
 
 // The restart workflow intentionally exposes one coarse camera-speed control:

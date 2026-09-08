@@ -1,14 +1,18 @@
 #pragma once
 
+#include "movie_frame_resize_policy.hpp"
+
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 namespace deadlock_mvm {
 
 constexpr std::uint32_t kProtocolMagic = 0x4D564D43; // "CMVM" little-endian
-constexpr std::uint16_t kProtocolVersion = 16;
+constexpr std::uint16_t kProtocolVersion = 24;
 constexpr std::size_t kMaxCampathKeyframes = 128;
 constexpr double kMinFov = 5.0;
 constexpr double kMaxFov = 170.0;
@@ -217,6 +221,12 @@ enum SmvmOverlayFlags : std::uint32_t {
     smvm_overlay_creep_healthbar_hook_retrying = 1u << 22,
     smvm_overlay_tower_outline_hooks_retrying = 1u << 23,
     smvm_overlay_tower_fade_override_retrying = 1u << 24,
+    smvm_overlay_movie_recording_active = 1u << 25,
+    smvm_overlay_world_depth_available = 1u << 26,
+    smvm_overlay_world_depth_failed = 1u << 27,
+    smvm_overlay_movie_avi_available = 1u << 28,
+    smvm_overlay_world_depth_incomplete = 1u << 29,
+    smvm_overlay_movie_frame_ready = 1u << 30,
 };
 
 enum SmvmSnapshotFlags : std::uint32_t {
@@ -250,6 +260,77 @@ enum SmvmSnapshotFlags : std::uint32_t {
     smvm_snapshot_replay_seek_in_progress = 1u << 27,
     smvm_snapshot_recording_profile_restore_pending = 1u << 28,
     smvm_snapshot_recording_profile_transaction_in_progress = 1u << 29,
+};
+
+enum MovieRecordingFlags : std::uint32_t {
+    movie_recording_none = 0,
+    movie_recording_disable_post_processing = 1u << 0,
+    movie_recording_mute_dialogue = 1u << 1,
+    movie_recording_world_depth = 1u << 3,
+    movie_recording_active = 1u << 4,
+    movie_recording_armed = 1u << 5,
+    movie_recording_finalizing = 1u << 6,
+};
+
+constexpr std::uint32_t kKnownMovieRecordingFlags =
+    movie_recording_disable_post_processing |
+    movie_recording_mute_dialogue |
+    movie_recording_world_depth |
+    movie_recording_active |
+    movie_recording_armed |
+    movie_recording_finalizing;
+
+enum class MovieRecordingOption : std::int32_t {
+    disable_post_processing = 0,
+    mute_dialogue = 1,
+};
+
+enum class MovieRecordingPreset : std::uint32_t {
+    edit_sequence = 0,
+    fast_avi = 1,
+    compositing = 2,
+    custom = 3,
+    greenscreen = 4,
+};
+
+enum class MovieOutputMode : std::uint32_t {
+    image_sequence = 0,
+    avi = 1,
+    both = 2,
+};
+
+enum class MovieCompositingStage : std::uint32_t {
+    none = 0,
+    world = 1,
+    chroma = 2,
+};
+
+enum MovieCapturePassFlags : std::uint32_t {
+    movie_capture_pass_none = 0,
+    movie_capture_pass_beauty = 1u << 0,
+    movie_capture_pass_world_depth_pfm = 1u << 1,
+    movie_capture_pass_world_depth_avi = 1u << 2,
+    movie_capture_pass_greenscreen_free_camera = 1u << 3,
+};
+
+constexpr std::uint32_t kKnownMovieCapturePassFlags =
+    movie_capture_pass_beauty |
+    movie_capture_pass_world_depth_pfm |
+    movie_capture_pass_world_depth_avi |
+    movie_capture_pass_greenscreen_free_camera;
+
+enum MovieToolFlags : std::uint32_t {
+    movie_tool_none = 0,
+    movie_tool_rule_of_thirds = 1u << 0,
+    movie_tool_custom_fog = 1u << 1,
+};
+
+constexpr std::uint32_t kKnownMovieToolFlags =
+    movie_tool_rule_of_thirds | movie_tool_custom_fog;
+
+enum class GreenscreenMode : std::uint32_t {
+    off = 0,
+    free_camera = 1,
 };
 
 enum class SmvmCampathSession : std::uint32_t {
@@ -410,6 +491,24 @@ enum class SmvmActionType : std::uint32_t {
     set_status_hud_anchor = 72,
     set_status_hud_scale = 73,
     set_status_hud_opacity = 74,
+    set_movie_recording_option = 75,
+    start_movie_recording = 76,
+    stop_movie_recording = 77,
+    set_movie_recording_fps = 78,
+    set_movie_recording_preset = 79,
+    set_movie_output_mode = 80,
+    set_movie_capture_pass = 81,
+    open_movie_capture_folder = 82,
+    set_rule_of_thirds = 83,
+    set_custom_fog_enabled = 84,
+    set_custom_fog_value = 85,
+    set_custom_fog_color = 86,
+    reset_custom_fog = 87,
+    set_greenscreen_mode = 88,
+    retired_camera_attachment = 89,
+    retired_camera_attachment_offset = 90,
+    choose_movie_capture_folder = 91,
+    set_movie_output_resolution = 92,
 };
 
 #pragma pack(push, 1)
@@ -537,6 +636,32 @@ struct SmvmSnapshotPayload final {
     double status_hud_opacity;
     std::uint64_t recording_profile_ack_generation;
     std::uint64_t replay_session_generation;
+    std::uint32_t movie_recording_flags;
+    std::array<char, 64> movie_recording_name;
+    std::uint32_t movie_recording_reserved;
+    std::uint32_t movie_recording_fps;
+    MovieRecordingPreset movie_recording_preset;
+    MovieOutputMode movie_output_mode;
+    std::uint32_t movie_capture_pass_flags;
+    std::uint32_t movie_tool_flags;
+    GreenscreenMode greenscreen_mode;
+    double custom_fog_start;
+    double custom_fog_end;
+    double custom_fog_max_density;
+    double custom_fog_exponent;
+    std::uint32_t custom_fog_color_rgb;
+    std::uint32_t greenscreen_color_rgb;
+    std::uint32_t retired_camera_attachment_enabled;
+    std::uint32_t retired_camera_attachment_bone;
+    double retired_camera_attachment_offset_x;
+    double retired_camera_attachment_offset_y;
+    double retired_camera_attachment_offset_z;
+    std::array<char, 192> movie_capture_path;
+    MovieOutputResolution movie_output_resolution;
+    std::uint32_t movie_active_pass_flags;
+    MovieCompositingStage movie_compositing_stage;
+    std::uint32_t movie_capture_audio;
+    std::uint64_t movie_expected_frame_count;
 };
 
 constexpr std::size_t kMaxCampathDocuments = 32;
@@ -593,7 +718,7 @@ static_assert(sizeof(CameraSample) == 56);
 static_assert(sizeof(RollPayload) == 8);
 static_assert(sizeof(CampathKeyframe) == 64);
 static_assert(sizeof(CampathPayloadHeader) == 16);
-static_assert(sizeof(SmvmSnapshotPayload) == 744);
+static_assert(sizeof(SmvmSnapshotPayload) == 1128);
 static_assert(sizeof(SmvmActionPayload) == 152);
 static_assert(sizeof(StatusPayload) == 272);
 static_assert(sizeof(CampathDocumentEntry) == 144);
@@ -728,7 +853,71 @@ constexpr std::size_t kMaxMessageBytes =
     constexpr auto known_ui_capabilities = deadlock_ui_capability_hide_panorama |
         deadlock_ui_capability_restore_panorama | deadlock_ui_capability_smvm_replay_ui |
         deadlock_ui_capability_clean_footage;
-    if (snapshot.snapshot_version != 9 || (snapshot.flags & ~known_flags) != 0 ||
+    const auto recording_active =
+        (snapshot.movie_recording_flags & movie_recording_active) != 0;
+    const auto recording_armed =
+        (snapshot.movie_recording_flags & movie_recording_armed) != 0;
+    const auto recording_finalizing =
+        (snapshot.movie_recording_flags & movie_recording_finalizing) != 0;
+    const auto recording_name_valid =
+        [&snapshot, recording_active, recording_armed, recording_finalizing]() noexcept {
+        if (snapshot.movie_recording_name.back() != '\0')
+            return false;
+        const auto end = std::find(
+            snapshot.movie_recording_name.begin(),
+            snapshot.movie_recording_name.end(),
+            '\0');
+        if (static_cast<unsigned>(recording_active) +
+                static_cast<unsigned>(recording_armed) +
+                static_cast<unsigned>(recording_finalizing) > 1u)
+            return false;
+        if (!recording_active && !recording_armed && !recording_finalizing)
+            return end == snapshot.movie_recording_name.begin();
+        if (end == snapshot.movie_recording_name.begin())
+            return false;
+        return std::all_of(
+            snapshot.movie_recording_name.begin(), end, [](const char value) noexcept {
+                return (value >= 'a' && value <= 'z') ||
+                       (value >= 'A' && value <= 'Z') ||
+                       (value >= '0' && value <= '9') || value == '-' || value == '_';
+            });
+    }();
+    if (snapshot.snapshot_version != 13 || (snapshot.flags & ~known_flags) != 0 ||
+        (snapshot.movie_recording_flags & ~kKnownMovieRecordingFlags) != 0 ||
+        !recording_name_valid ||
+        snapshot.movie_recording_reserved != 0 ||
+        snapshot.movie_recording_fps < 1 || snapshot.movie_recording_fps > 1000 ||
+        snapshot.movie_recording_preset > MovieRecordingPreset::greenscreen ||
+        snapshot.movie_output_mode > MovieOutputMode::both ||
+        snapshot.movie_capture_pass_flags == movie_capture_pass_none ||
+        (snapshot.movie_capture_pass_flags & ~kKnownMovieCapturePassFlags) != 0 ||
+        snapshot.movie_active_pass_flags == movie_capture_pass_none ||
+        (snapshot.movie_active_pass_flags & ~kKnownMovieCapturePassFlags) != 0 ||
+        snapshot.movie_output_resolution > MovieOutputResolution::full_hd ||
+        snapshot.movie_compositing_stage > MovieCompositingStage::chroma ||
+        snapshot.movie_capture_audio > 1u ||
+        snapshot.movie_expected_frame_count >
+            static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) ||
+        ((snapshot.movie_compositing_stage == MovieCompositingStage::chroma) !=
+         (snapshot.movie_expected_frame_count > 0)) ||
+        (snapshot.movie_tool_flags & ~kKnownMovieToolFlags) != 0 ||
+        snapshot.greenscreen_mode > GreenscreenMode::free_camera ||
+        !std::isfinite(snapshot.custom_fog_start) ||
+        snapshot.custom_fog_start < -100000.0 || snapshot.custom_fog_start > 100000.0 ||
+        !std::isfinite(snapshot.custom_fog_end) ||
+        snapshot.custom_fog_end < snapshot.custom_fog_start ||
+        snapshot.custom_fog_end > 100000.0 ||
+        !std::isfinite(snapshot.custom_fog_max_density) ||
+        snapshot.custom_fog_max_density < 0.0 || snapshot.custom_fog_max_density > 1.0 ||
+        !std::isfinite(snapshot.custom_fog_exponent) ||
+        snapshot.custom_fog_exponent < 0.01 || snapshot.custom_fog_exponent > 10.0 ||
+        (snapshot.custom_fog_color_rgb & 0xFF000000u) != 0 ||
+        (snapshot.greenscreen_color_rgb & 0xFF000000u) != 0 ||
+        snapshot.retired_camera_attachment_enabled != 0 ||
+        snapshot.retired_camera_attachment_bone != 0 ||
+        snapshot.retired_camera_attachment_offset_x != 0.0 ||
+        snapshot.retired_camera_attachment_offset_y != 0.0 ||
+        snapshot.retired_camera_attachment_offset_z != 0.0 ||
         (snapshot.capabilities & ~known_capabilities) != 0 ||
         snapshot.deadlock_ui_mode > DeadlockUiMode::death_notices_only ||
         snapshot.deadlock_ui_error > DeadlockUiError::restore_failed ||
@@ -806,7 +995,8 @@ constexpr std::size_t kMaxMessageBytes =
     if ((snapshot.flags & smvm_snapshot_camera_readable) != 0 && !ValidateSample(snapshot.camera))
         return false;
     return snapshot.replay_name.back() == '\0' && snapshot.path_name.back() == '\0' &&
-           snapshot.status.back() == '\0' && snapshot.camera_status.back() == '\0';
+           snapshot.status.back() == '\0' && snapshot.camera_status.back() == '\0' &&
+           snapshot.movie_capture_path.back() == '\0';
 }
 
 [[nodiscard]] inline bool ValidateCampath(

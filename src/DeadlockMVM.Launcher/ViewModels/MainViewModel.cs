@@ -671,9 +671,10 @@ public sealed class MainViewModel : ViewModelBase
                              DeadlockConstants.GameProcessNameAlt,
                          })
                 {
-                    foreach (var process in Process.GetProcessesByName(processName))
+                    var processes = Process.GetProcessesByName(processName);
+                    try
                     {
-                        using (process)
+                        foreach (var process in processes)
                         {
                             try
                             {
@@ -702,6 +703,11 @@ public sealed class MainViewModel : ViewModelBase
                                 lastFailure = ex.Message;
                             }
                         }
+                    }
+                    finally
+                    {
+                        foreach (var process in processes)
+                            process.Dispose();
                     }
                 }
 

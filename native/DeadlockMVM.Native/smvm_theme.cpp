@@ -366,7 +366,7 @@ bool SliderInput(
     ImGui::BeginDisabled(!enabled);
     auto* storage = ImGui::GetStateStorage();
     const auto width = ImGui::GetContentRegionAvail().x;
-    const auto field_width = 64.0F * g_scale;
+    const auto field_width = 84.0F * g_scale;
     const auto label_width = label != nullptr
         ? ImGui::CalcTextSize(label).x + ImGui::GetStyle().ItemSpacing.x
         : 0.0F;
@@ -388,6 +388,7 @@ bool SliderInput(
     const auto epsilon = std::max(0.0005F, (maximum - minimum) * 0.00001F);
     static_cast<void>(ReconcileOptimisticEdit(
         current, ImGui::GetTime(), kPendingTimeoutSeconds, epsilon, value, pending_since));
+    value = std::clamp(value, minimum, maximum);
     storage->SetFloat(value_id, value);
     storage->SetFloat(pending_id, static_cast<float>(pending_since));
 
@@ -399,16 +400,65 @@ bool SliderInput(
         edited = true;
     }
     ImGui::SameLine();
-    // Cap the slider so trailing SameLine content (presets, captions, buttons)
-    // stays on the same row instead of being pushed outside the card.
-    ImGui::SetNextItemWidth(std::min(
-        std::max(40.0F * g_scale,
-                 width - field_width - label_width - ImGui::GetStyle().ItemSpacing.x * 2.0F),
-        220.0F * g_scale));
-    // The numeric field already shows the exact value; an empty slider format
-    // avoids drawing it a second time inside the track.
-    ImGui::SliderFloat("##slider", &value, minimum, maximum, "");
-    edited = edited || ImGui::IsItemEdited();
+    // Match the proven archived in-process-menu pattern: the whole visible
+    // track is one InvisibleButton and an active hold maps the cursor's
+    // absolute X position to the value range. This does not depend on drag
+    // deltas surviving a slow or collapsed render frame.
+    const auto track_width = std::max(
+        80.0F * g_scale,
+        width - field_width - label_width - ImGui::GetStyle().ItemSpacing.x * 2.0F);
+    const auto track_height = ImGui::GetFrameHeight();
+    const auto track_position = ImGui::GetCursorScreenPos();
+    static_cast<void>(ImGui::InvisibleButton(
+        "##slider",
+        ImVec2(track_width, track_height)));
+    const auto track_hovered = ImGui::IsItemHovered();
+    const auto track_active = enabled && ImGui::IsItemActive();
+    if (track_active && track_width > 0.0F && maximum > minimum) {
+        const auto fraction = std::clamp(
+            (ImGui::GetIO().MousePos.x - track_position.x) / track_width,
+            0.0F,
+            1.0F);
+        const auto next = minimum + fraction * (maximum - minimum);
+        if (std::fabs(next - value) > epsilon) {
+            value = next;
+            edited = true;
+        }
+    }
+    auto* draw_list = ImGui::GetWindowDrawList();
+    const auto track_max = ImVec2(
+        track_position.x + track_width,
+        track_position.y + track_height);
+    const auto track_color = track_active
+        ? colors::kControlActive
+        : track_hovered ? colors::kControlHover : colors::kControl;
+    draw_list->AddRectFilled(
+        track_position,
+        track_max,
+        track_color,
+        ImGui::GetStyle().FrameRounding);
+    draw_list->AddRect(
+        track_position,
+        track_max,
+        track_active ? colors::kAccent : colors::kHairline,
+        ImGui::GetStyle().FrameRounding);
+    const auto fraction = maximum > minimum
+        ? std::clamp((value - minimum) / (maximum - minimum), 0.0F, 1.0F)
+        : 0.0F;
+    const auto knob_radius = std::max(3.0F * g_scale, track_height * 0.22F);
+    const auto knob_x = std::clamp(
+        track_position.x + fraction * track_width,
+        track_position.x + knob_radius,
+        track_max.x - knob_radius);
+    draw_list->AddLine(
+        ImVec2(track_position.x + 3.0F * g_scale, track_position.y + track_height * 0.5F),
+        ImVec2(knob_x, track_position.y + track_height * 0.5F),
+        colors::kAccent,
+        std::max(2.0F, 2.0F * g_scale));
+    draw_list->AddCircleFilled(
+        ImVec2(knob_x, track_position.y + track_height * 0.5F),
+        knob_radius,
+        colors::kAccent);
     if (edited) {
         MarkOptimisticEdit(value, minimum, maximum, ImGui::GetTime(), value, pending_since);
         storage->SetFloat(value_id, value);

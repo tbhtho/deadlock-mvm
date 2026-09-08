@@ -106,9 +106,10 @@ int SegmentedControl(
 // Switch-style toggle; returns true when clicked (caller queues the action).
 bool Toggle(const char* label, bool value, bool enabled = true) noexcept;
 
-// Numeric field + slider pair with a visible caption on the right. Keeps the
-// in-flight edit stable while the authoritative value catches up.
-// Returns true and sets out_value on edit.
+// Numeric field + full-width held track with a visible caption on the right.
+// While held, the cursor's absolute X position maps directly to the value
+// range. The in-flight edit stays stable while the authoritative value catches
+// up. Returns true and sets out_value on edit.
 bool SliderInput(
     const char* id,
     float current,

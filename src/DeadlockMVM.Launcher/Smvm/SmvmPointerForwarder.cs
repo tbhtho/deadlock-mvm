@@ -13,6 +13,7 @@ namespace DeadlockMVM.Launcher.Smvm;
 public sealed class SmvmPointerForwarder : IDisposable
 {
     private const int WhMouseLl = 14;
+    private const int WmMouseMove = 0x0200;
     private const int WmLButtonDown = 0x0201;
     private const int WmLButtonUp = 0x0202;
     private const int WmRButtonDown = 0x0204;
@@ -33,6 +34,10 @@ public sealed class SmvmPointerForwarder : IDisposable
     private readonly Func<bool>? _internalMenuOwnsPointer;
     private readonly Action<string>? _debugLog;
     private uint _ownedMenuPointerButtons;
+    private IntPtr _ownedMenuPointerWindow;
+    private NativePoint _pendingMovePoint;
+    private IntPtr _pendingMoveWindow;
+    private bool _pointerMoveQueued;
     private IntPtr _mouseHook;
     private bool _disposed;
 
@@ -68,18 +73,14 @@ public sealed class SmvmPointerForwarder : IDisposable
 
     private bool TryForwardOwnedMenuPointer(int message, IntPtr hookData)
     {
-        var supported = message is WmLButtonDown or WmLButtonUp or WmRButtonDown or WmRButtonUp or
+        var supported = message is WmMouseMove or WmLButtonDown or WmLButtonUp or WmRButtonDown or WmRButtonUp or
             WmMButtonDown or WmMButtonUp or WmXButtonDown or WmXButtonUp or WmMouseWheel;
         if (!supported)
             return false;
-        if (!TryGetForegroundDeadlockWindow(out var window))
-        {
-            _debugLog?.Invoke($"SMVM pointer: msg={message:X} skipped (deadlock not foreground)");
-            return false;
-        }
         if (_internalMenuOwnsPointer?.Invoke() != true)
         {
             _ownedMenuPointerButtons = 0;
+            _ownedMenuPointerWindow = IntPtr.Zero;
             return false;
         }
 
@@ -88,50 +89,63 @@ public sealed class SmvmPointerForwarder : IDisposable
             X = Marshal.ReadInt32(hookData),
             Y = Marshal.ReadInt32(hookData, sizeof(int)),
         };
-        var pointInClient = ValidateOwnedMenuPointer(window, point);
         var mouseData = unchecked((uint)Marshal.ReadInt32(hookData, sizeof(int) * 2));
-        _debugLog?.Invoke(
-            $"SMVM pointer: msg={message:X} at {point.X},{point.Y} inClient={pointInClient} owned={_ownedMenuPointerButtons}");
+        if (message == WmMouseMove)
+        {
+            var ownedWindow = _ownedMenuPointerWindow;
+            if ((_ownedMenuPointerButtons & 1u) == 0 || ownedWindow == IntPtr.Zero)
+                return false;
+            QueueOwnedMenuPointerMotion(ownedWindow, point);
+            return true;
+        }
 
         if (TryGetPointerButton(message, mouseData, out var buttonMask, out var downMessage,
                 out var isDown))
         {
             if (isDown)
             {
-                if (!pointInClient)
+                if (!TryGetForegroundDeadlockWindow(out var foregroundWindow))
+                {
+                    _debugLog?.Invoke($"SMVM pointer: msg={message:X} skipped (deadlock not foreground)");
                     return false;
-                if (!RefreshInternalMenuPointerIsolation(window))
-                    return true;
+                }
 
+                _ownedMenuPointerWindow = foregroundWindow;
                 _ownedMenuPointerButtons |= buttonMask;
+                if (buttonMask == 1u)
+                    QueueOwnedMenuPointerMessage(foregroundWindow, WmLButtonDown, point, mouseData);
                 return true;
             }
 
             var ownedPress = (_ownedMenuPointerButtons & buttonMask) != 0;
+            var ownedWindow = _ownedMenuPointerWindow;
             _ownedMenuPointerButtons &= ~buttonMask;
+            if (_ownedMenuPointerButtons == 0)
+                _ownedMenuPointerWindow = IntPtr.Zero;
             if (!ownedPress)
                 return false;
-            if (!pointInClient)
-                return true;
-            if (!RefreshInternalMenuPointerIsolation(window))
+            if (ownedWindow == IntPtr.Zero)
                 return true;
 
-            QueueOwnedMenuPointerActivation(window, downMessage, point, mouseData);
+            if (buttonMask == 1u)
+            {
+                QueueOwnedMenuPointerMessage(ownedWindow, WmLButtonUp, point, mouseData);
+                return true;
+            }
+            QueueOwnedMenuPointerActivation(ownedWindow, downMessage, point, mouseData);
             return true;
         }
 
-        if (!pointInClient)
-            return false;
-        if (!RefreshInternalMenuPointerIsolation(window))
+        if (!TryGetForegroundDeadlockWindow(out var wheelWindow))
         {
-            // Do not synthesize an editor click unless the in-process window
-            // thread has first withdrawn any raw mouse registration that a
-            // spectator-mode transition may have re-enabled. The physical
-            // low-level event is still withheld from the normal message path.
-            return true;
+            _debugLog?.Invoke($"SMVM pointer: msg={message:X} skipped (deadlock not foreground)");
+            return false;
         }
 
-        QueueOwnedMenuPointerMessage(window, message, point, mouseData);
+        // The hook only captures and schedules. Cross-process validation and
+        // cursor-isolation refresh run later on the dispatcher so Windows can
+        // never silently remove this low-level hook for blocking too long.
+        QueueOwnedMenuPointerMessage(wheelWindow, message, point, mouseData);
         return true;
     }
 
@@ -167,6 +181,25 @@ public sealed class SmvmPointerForwarder : IDisposable
                 expectedWindow, message, screenPoint, mouseData, _debugLog);
         });
 
+    private void QueueOwnedMenuPointerMotion(IntPtr expectedWindow, NativePoint screenPoint)
+    {
+        _pendingMoveWindow = expectedWindow;
+        _pendingMovePoint = screenPoint;
+        if (_pointerMoveQueued)
+            return;
+        _pointerMoveQueued = true;
+        _dispatcher.BeginInvoke(() =>
+        {
+            _pointerMoveQueued = false;
+            var window = _pendingMoveWindow;
+            var point = _pendingMovePoint;
+            if (!CanForwardOwnedMenuPointer(window))
+                return;
+            _ = ForwardOwnedMenuPointerAction(
+                window, WmMouseMove, point, 0, _debugLog);
+        });
+    }
+
     private bool CanForwardOwnedMenuPointer(IntPtr expectedWindow) =>
         !_disposed && _internalMenuOwnsPointer?.Invoke() == true &&
         TryGetForegroundDeadlockWindow(out var foregroundWindow) &&
@@ -181,7 +214,9 @@ public sealed class SmvmPointerForwarder : IDisposable
     {
         var action = message switch
         {
-            WmLButtonDown => 1u,
+            WmLButtonDown => 8u,
+            WmLButtonUp => 9u,
+            WmMouseMove => 10u,
             WmRButtonDown => 2u,
             WmMButtonDown => 3u,
             WmXButtonDown when (mouseData >> 16) == 1 => 4u,
@@ -247,20 +282,6 @@ public sealed class SmvmPointerForwarder : IDisposable
     private static IntPtr PackPoint(NativePoint point) =>
         (IntPtr)unchecked((nint)((uint)(ushort)point.X | ((uint)(ushort)point.Y << 16)));
 
-    private static bool ValidateOwnedMenuPointer(IntPtr window, NativePoint screenPoint)
-    {
-        const nuint validateAction = 7;
-        var sent = SendMessageTimeout(
-            window,
-            WmSmvmPointerAction,
-            (IntPtr)validateAction,
-            PackPoint(screenPoint),
-            SmtoBlock | SmtoAbortIfHung,
-            PointerTransitionTimeoutMs,
-            out var result);
-        return sent != IntPtr.Zero && result != IntPtr.Zero;
-    }
-
     internal static bool IsAllowedForegroundProcess(string? processName) =>
         string.Equals(processName, "deadlock", StringComparison.OrdinalIgnoreCase) ||
         string.Equals(processName, "project8", StringComparison.OrdinalIgnoreCase);
@@ -295,6 +316,8 @@ public sealed class SmvmPointerForwarder : IDisposable
             return;
         _disposed = true;
         _ownedMenuPointerButtons = 0;
+        _ownedMenuPointerWindow = IntPtr.Zero;
+        _pointerMoveQueued = false;
         if (_mouseHook != IntPtr.Zero) UnhookWindowsHookEx(_mouseHook);
         _mouseHook = IntPtr.Zero;
     }

@@ -79,7 +79,9 @@ public static class SmvmQueuedActionLeasePolicy
         if (action.Type == SmvmActionType.SetTimescale)
             return SmvmQueuedActionScope.PlaybackSpeed;
         if (action.Type is SmvmActionType.RestoreDeadlockUi or
-            SmvmActionType.ToggleManualCamera ||
+            SmvmActionType.ToggleManualCamera or
+            SmvmActionType.StopCampath or
+            SmvmActionType.StopMovieRecording ||
             action.Type == SmvmActionType.SetDeadlockUiMode &&
             action.Index == (int)DeadlockUiMode.DeadlockUi)
         {
@@ -126,7 +128,6 @@ public static class SmvmQueuedActionLeasePolicy
         SmvmActionType.SetEasing or
         SmvmActionType.PlayFromStart or
         SmvmActionType.PlayFromCurrent or
-        SmvmActionType.StopCampath or
         SmvmActionType.SetEndBehavior or
         SmvmActionType.UndoEdit or
         SmvmActionType.RedoEdit or
@@ -144,6 +145,19 @@ public static class SmvmQueuedActionLeasePolicy
         SmvmActionType.DiscardDraft or
         SmvmActionType.RequestPathList or
         SmvmActionType.CaptureDiagnostic or
+        SmvmActionType.SetMovieRecordingOption or
+        SmvmActionType.SetMovieRecordingFps or
+        SmvmActionType.SetMovieRecordingPreset or
+        SmvmActionType.SetMovieOutputMode or
+        SmvmActionType.SetMovieCapturePass or
+        SmvmActionType.SetMovieOutputResolution or
+        SmvmActionType.StartMovieRecording or
+        SmvmActionType.SetRuleOfThirds or
+        SmvmActionType.SetCustomFogEnabled or
+        SmvmActionType.SetCustomFogValue or
+        SmvmActionType.SetCustomFogColor or
+        SmvmActionType.ResetCustomFog or
+        SmvmActionType.SetGreenscreenMode or
         SmvmActionType.SetDeadlockUiMode or
         SmvmActionType.CycleReplayInterface;
 }

@@ -58,6 +58,9 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
     private long _lastVisibilityOriginWarningTimestamp;
     private int _loggedLiveVisibilitySync;
     private CampathPath? _activePath;
+    private long _campathReplaySessionGeneration;
+    private int _campathGameTickOffset = -1;
+    private int _campathTelemetryProtectionActive;
     private CampathEndBehavior _endBehavior = CampathEndBehavior.StopAndRelease;
     private SmvmRendererBackend _loggedRendererBackend;
     private SmvmRendererError _loggedRendererError;
@@ -910,6 +913,7 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         CampathPath path,
         CampathPlayMode playMode = CampathPlayMode.FromStart,
         CampathEndBehavior endBehavior = CampathEndBehavior.StopAndRelease,
+        Func<bool>? beforePlayback = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(path);
@@ -965,11 +969,17 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             originalTransportWasPaused = originalState.IsPaused;
             originalTransportCaptured = true;
             var currentTick = originalState.CurrentTick!.Value;
+            var moviePlayback = beforePlayback is not null;
+            var firstPathTick = checked((int)path.Keyframes[0].DemoTick);
+            var startSeekTick = ResolveCampathStartSeekTick(firstPathTick, moviePlayback);
             int? observationExpectedTick = playMode == CampathPlayMode.FromStart
-                ? checked((int)path.Keyframes[0].DemoTick)
+                ? startSeekTick
                 : null;
             var startSeekRequired = playMode == CampathPlayMode.FromStart &&
-                                    Math.Abs((long)currentTick - path.Keyframes[0].DemoTick) > 2;
+                                    RequiresCampathStartSeek(
+                                        currentTick,
+                                        startSeekTick,
+                                        moviePlayback);
             var seamlessManualHandoff = CanUseSeamlessManualToPathHandoff(
                 IsManualCameraEstablished(ManualCameraDesired, _status),
                 startSeekRequired);
@@ -988,22 +998,28 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
 
             if (playMode == CampathPlayMode.FromStart)
             {
-                var startTick = checked((int)path.Keyframes[0].DemoTick);
+                var startTick = firstPathTick;
                 if (startSeekRequired)
                 {
                     Transition(CampathPlaybackState.SeekingToStart,
-                        "SKIPPING TO CAMPATH START", startTick, currentTick);
+                        moviePlayback
+                            ? "SKIPPING TO MOVIE PREROLL"
+                            : "SKIPPING TO CAMPATH START",
+                        startSeekTick,
+                        currentTick);
                     Transition(CampathPlaybackState.WaitingForLandedTick,
-                        "Waiting for Deadlock to report the landed replay tick.", startTick, currentTick);
+                        "Waiting for Deadlock to report the landed replay tick.",
+                        startSeekTick,
+                        currentTick);
                     int landed;
                     try
                     {
-                        landed = await SeekToPathStartAsync(startTick, cancellationToken).ConfigureAwait(false);
+                        landed = await SeekToPathStartAsync(startSeekTick, cancellationToken).ConfigureAwait(false);
                     }
                     catch (TimeoutException ex)
                     {
                         ThrowStartFailure(CampathStartFailure.SeekTimedOut,
-                            $"Deadlock did not land at Campath start tick {startTick} within 15 seconds.", ex);
+                            $"Deadlock did not land at Campath start boundary {startSeekTick} within 15 seconds.", ex);
                         throw;
                     }
                     catch (Exception ex) when (ex is not OperationCanceledException and not CampathStartException)
@@ -1018,7 +1034,7 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                         throw new InvalidOperationException(
                             "Replay changed or did not confirm pause after landing at the Campath start tick.");
                     Transition(CampathPlaybackState.ReacquiringFreeRoam,
-                        "Reacquiring Free Roam after the landed seek.", startTick, landed);
+                        "Reacquiring Free Roam after the landed seek.", startSeekTick, landed);
                     try
                     {
                         ThrowIfQueuedActionLeaseExpired();
@@ -1107,6 +1123,33 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                 ownershipEpoch).ConfigureAwait(false);
 
             ThrowIfOwnershipOperationSuperseded(ownershipEpoch);
+            if (beforePlayback is not null)
+            {
+                if (!beforePlayback())
+                    ThrowStartFailure(
+                        CampathStartFailure.UnexpectedFailure,
+                        "The armed movie recording could not start before Campath playback.");
+
+                // Publish the active take immediately and prove that the
+                // presentation hook has opened its writer before demo_resume.
+                // The periodic 50 ms snapshot alone can miss the first frames
+                // of a high-FPS Campath.
+                await PublishFreshSmvmSnapshotAsync(client, required: true, cancellationToken)
+                    .ConfigureAwait(false);
+                status = await client.GetStatusAsync(cancellationToken).ConfigureAwait(false);
+                UpdateStatus(status);
+                status = await WaitForNativeAsync(
+                    client,
+                    IsMoviePassReadyForPlayback,
+                    TimeSpan.FromSeconds(3),
+                    CampathStartFailure.UnexpectedFailure,
+                    "The native movie writer or selected visual pass did not become ready before Campath playback.",
+                    status,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            var committedReplay = _controller.State;
+            _campathReplaySessionGeneration = committedReplay.ReplaySessionGeneration;
+            _campathGameTickOffset = _controller.GameTickOffset ?? -1;
             _campathPlaying = true;
             _holdingKeyframe = false;
             _activePath = path;
@@ -1171,8 +1214,24 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             new CampathPath(new[] { path.From, path.To }),
             CampathPlayMode.FromStart,
             CampathEndBehavior.StopAndRelease,
+            beforePlayback: null,
             cancellationToken);
     }
+
+    internal static bool IsMoviePassReadyForPlayback(InProcessCameraStatus status) =>
+        status.OverlayFlags.HasFlag(SmvmOverlayFlags.MovieRecordingActive) &&
+        status.OverlayFlags.HasFlag(SmvmOverlayFlags.MovieFrameReady);
+
+    internal static int ResolveCampathStartSeekTick(int firstPathTick, bool moviePlayback) =>
+        moviePlayback && firstPathTick > 0 ? firstPathTick - 1 : firstPathTick;
+
+    internal static bool RequiresCampathStartSeek(
+        int currentTick,
+        int targetTick,
+        bool moviePlayback) =>
+        moviePlayback
+            ? currentTick != targetTick
+            : Math.Abs((long)currentTick - targetTick) > 2;
 
     internal static bool CanUseSeamlessManualToPathHandoff(
         bool manualCameraEstablished,
@@ -2185,6 +2244,7 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         _campathPlaying = false;
         _holdingKeyframe = false;
         _activePath = null;
+        Interlocked.Exchange(ref _campathTelemetryProtectionActive, 0);
         var manualResumeArmed = false;
         var manualResumeConfirmed = false;
         if (client?.Connected == true)
@@ -2521,7 +2581,10 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         NativeReplayCameraClient client,
         CancellationToken cancellationToken)
     {
-        var heartbeatReplayLease = _queuedActionContext.Value is null
+        var campathTransactionActive = _campathPlaying &&
+                                       _activePath is not null &&
+                                       _playback.Status.State == CampathPlaybackState.Playing;
+        var heartbeatReplayLease = _queuedActionContext.Value is null && !campathTransactionActive
             ? CaptureCurrentReplayCommandLease()
             : null;
         using var heartbeatActionLease = heartbeatReplayLease is { } replayLease
@@ -2529,8 +2592,30 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             : null;
         ThrowIfQueuedActionLeaseExpired();
         var replay = _controller.State;
-        var replayActive = IsConfirmedReplay(replay);
-        var freeRoam = _camera.Selection.Mode == SpecCameraMode.FreeRoam;
+        var heartbeat = CampathTelemetryLeasePolicy.ResolveHeartbeat(
+            replay,
+            _controller.GameTickOffset,
+            _camera.Selection.Mode,
+            _campathPlaying,
+            _playback.Status.State,
+            _campathReplaySessionGeneration,
+            _campathGameTickOffset,
+            _status);
+        if (heartbeat.ProtectingCampath)
+        {
+            if (Interlocked.Exchange(ref _campathTelemetryProtectionActive, 1) == 0)
+            {
+                _log.Warn(
+                    "Native camera: VConsole telemetry is temporarily unavailable; " +
+                    "the validated native Campath clock remains authoritative and manual input stays locked.");
+            }
+        }
+        else if (Interlocked.Exchange(ref _campathTelemetryProtectionActive, 0) != 0)
+        {
+            _log.Info("Native camera: VConsole telemetry recovered without releasing Campath ownership.");
+        }
+        var replayActive = heartbeat.ReplayActive;
+        var freeRoam = heartbeat.FreeRoam;
         var playbackInterrupted = _playback.Status.State != CampathPlaybackState.Idle &&
                                   !_playback.Status.IsTerminal;
         var hadManualCamera = ManualCameraDesired ||
@@ -2539,8 +2624,8 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         var status = await client.HeartbeatAsync(
             replayActive,
             freeRoam,
-            replay.CurrentTick ?? -1,
-            _controller.GameTickOffset ?? -1,
+            heartbeat.ReplayTick,
+            heartbeat.GameTickOffset,
             cancellationToken).ConfigureAwait(false);
         var responseReplayLease =
             _queuedActionContext.Value?.ReplayLease ?? heartbeatReplayLease;
@@ -2601,14 +2686,15 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
             }
             else if (!status.OverrideActive &&
                      _playback.Status.State == CampathPlaybackState.Playing &&
-                     _camera.Selection.Mode == SpecCameraMode.FreeRoam)
+                     Interlocked.CompareExchange(ref _ownershipCleanupQueued, 1, 0) == 0)
             {
                 var failure = MapNativeFailure(status, CampathStartFailure.CameraOwnershipRejected);
                 _playback.Fail(failure,
                     $"Campath lost native camera ownership ({DescribeNativeStatus(status)})." );
                 RaiseCampathState();
-                if (CaptureCurrentReplayCommandLease() is { } ownershipLossLease)
-                    _ = StopAfterOwnershipLossAsync(_playback.Status.Detail, ownershipLossLease);
+                _ = StopAfterOwnershipLossAsync(
+                    _playback.Status.Detail,
+                    CaptureCurrentReplayCommandLease());
             }
         }
         if (_holdingKeyframe && currentReplayActive && !status.OverrideActive &&
@@ -3308,15 +3394,25 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
 
     private async Task StopAfterOwnershipLossAsync(
         string message,
-        ReplayCommandLease replayLease)
+        ReplayCommandLease? replayLease)
     {
-        using var actionLease = BeginQueuedActionLease(static () => true, replayLease);
+        using var actionLease = replayLease is { } exactReplayLease
+            ? BeginQueuedActionLease(static () => true, exactReplayLease)
+            : null;
         try
         {
+            // Stop the failed take before recovering Free Camera. Preserve the
+            // owner's intent; explicit exits still cancel recovery through its
+            // ownership epoch and replay lease.
             await StopCampathAsync(_stop.Token).ConfigureAwait(false);
             _message = message;
             _log.Warn($"Native camera: {message}");
             OnStatusChanged();
+            QueueAutomaticManualCameraRecovery(
+                message,
+                releaseManualCamera: true,
+                releaseFullOverride: false,
+                forceInternalFreeRoam: true);
         }
         catch (OperationCanceledException) when (_stop.IsCancellationRequested)
         {
@@ -4120,19 +4216,34 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
     {
         foreach (var processName in new[] { "deadlock", "project8" })
         {
-            foreach (var process in Process.GetProcessesByName(processName))
+            var processes = Process.GetProcessesByName(processName);
+            Process? selected = null;
+            try
             {
-                try
+                foreach (var process in processes)
                 {
-                    if (NativeReplayModuleLoader.IsEligibleReplayProcess(
-                            process, expectedExecutablePath, out _))
-                        return process;
+                    try
+                    {
+                        if (NativeReplayModuleLoader.IsEligibleReplayProcess(
+                                process, expectedExecutablePath, out _))
+                        {
+                            selected = process;
+                            return selected;
+                        }
+                    }
+                    catch (Exception ex) when (ex is InvalidOperationException or Win32Exception)
+                    {
+                        // Process exited or was inaccessible during validation.
+                    }
                 }
-                catch (Exception ex) when (ex is InvalidOperationException or Win32Exception)
+            }
+            finally
+            {
+                foreach (var process in processes)
                 {
-                    // Process exited or was inaccessible between enumeration and validation.
+                    if (!ReferenceEquals(process, selected))
+                        process.Dispose();
                 }
-                process.Dispose();
             }
         }
         return null;

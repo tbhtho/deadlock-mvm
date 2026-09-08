@@ -16,8 +16,9 @@ Source builds need the SDK named in `global.json` and Visual Studio 2022 with C+
 - Camera paths with keyframes, linear or smooth interpolation, undo/redo, and saved shots.
 - Replay browsing, pause, seeking, tick stepping, and playback speed.
 - HUD, health-bar, outline, and near-camera fade controls.
+- Movie capture: World, Z-Depth, and Green Screen passes, TGA/PFM sequences, AVI output, and WAV audio.
 
-This snapshot has no native video capture or export pipeline. Camera paths do not provide editable tangents, layered paths, or a graph editor.
+Audio and Green Screen are unreliable. Camera/UI recovery and character tint while pausing during slides have known issues.
 
 ## Controls
 

@@ -1,5 +1,6 @@
 #include "smvm_ui.hpp"
 
+#include "movie_recording_progress.hpp"
 #include "replay_timeline_policy.hpp"
 #include "smvm_theme.hpp"
 
@@ -400,7 +401,7 @@ void SeekToTickField(
         }
         // A freshly loaded replay can expose the timeline one or two frames
         // before the managed action channel is ready. Retain the owner's first
-        // request and retry quietly instead of making them press Go again.
+        // request and retry quietly instead of making them submit it again.
         state.replay_seek_retry_at_ms = now + 100;
     };
     try_pending_seek();
@@ -422,20 +423,17 @@ void SeekToTickField(
     const auto entered = ImGui::InputTextWithHint(
         "##tick", hint, state.go_to_tick.data(), state.go_to_tick.size(),
         ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_EnterReturnsTrue);
+    const auto finished_editing = ImGui::IsItemDeactivatedAfterEdit();
     ImGui::PopFont();
     if (timeline_field)
         state.replay_tick_input_active = ImGui::IsItemActive();
-    smvm_theme::Tooltip("Type an absolute replay tick and press Enter.");
-    if (entered && submit()) {
-        // Move keyboard focus to the following Go button. Enter must finish
-        // text editing so Free Camera input can be reacquired immediately.
-        ImGui::SetKeyboardFocusHere();
-        if (timeline_field)
+    smvm_theme::Tooltip("Type an absolute replay tick. Press Enter or click away to seek.");
+    if ((entered || finished_editing) && submit()) {
+        if (entered)
+            ImGui::SetKeyboardFocusHere();
+        if (timeline_field && entered)
             state.replay_tick_input_active = false;
     }
-    ImGui::SameLine();
-    if (smvm_theme::Button("Go", replay_active && state.go_to_tick[0] != '\0'))
-        static_cast<void>(submit());
     ImGui::EndDisabled();
     ImGui::PopID();
 }
@@ -1690,6 +1688,503 @@ void DrawMinimalPill(const FrameContext& context) noexcept {
         smvm_theme::colors::kText, text.data());
 }
 
+void DrawMovieRecordingMenu(const FrameContext& context) noexcept {
+    if (!context.params->menu_open)
+        return;
+
+    const auto& snapshot = *context.snapshot;
+    auto& state = *context.state;
+    if (state.page == SmvmPage::replay || state.page == SmvmPage::camera)
+        state.page = SmvmPage::capture;
+    const auto scale = smvm_theme::GetScale();
+    const auto width = std::min(660.0F * scale, context.params->viewport_width - (32.0F * scale));
+    const auto height = std::min(570.0F * scale, context.params->viewport_height - (32.0F * scale));
+    const auto x = std::max(16.0F * scale, (context.params->viewport_width - width) * 0.5F);
+    const auto y = std::max(16.0F * scale, (context.params->viewport_height - height) * 0.5F);
+
+    ImGui::SetNextWindowPos(ImVec2(x, y), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(width, height), ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.97F);
+    ImGui::PushStyleVar(
+        ImGuiStyleVar_WindowPadding,
+        ImVec2(20.0F * scale, 16.0F * scale));
+    const auto open = ImGui::Begin(
+        "##deadlockmvm_movie_tools",
+        nullptr,
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+            ImGuiWindowFlags_NoSavedSettings);
+    if (open) {
+        const auto active =
+            (snapshot.movie_recording_flags & movie_recording_active) != 0;
+        const auto armed =
+            (snapshot.movie_recording_flags & movie_recording_armed) != 0;
+        const auto finalizing =
+            (snapshot.movie_recording_flags & movie_recording_finalizing) != 0;
+        const auto ready = context.params->cinematic_start_ready;
+        const auto status_color = active
+            ? smvm_theme::colors::kWarning
+            : (armed || ready ? smvm_theme::colors::kSuccess : smvm_theme::colors::kMuted);
+        ImGui::TextColored(
+            smvm_theme::Vec4(status_color),
+            "%s",
+            active ? "RECORDING" :
+            finalizing ? "FINISHING FILES" :
+            armed ? "READY TO RECORD" :
+            ready ? "CINEMATIC READY" : "TAKE SETTINGS");
+        ImGui::SameLine();
+        ImGui::TextDisabled("%u FPS", snapshot.movie_recording_fps);
+        ImGui::SameLine(width - (72.0F * scale));
+        if (smvm_theme::Button(kTimes, true, ImVec2(30.0F * scale, 0.0F)))
+            SmvmCloseMenu();
+
+        const auto tab_width =
+            (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 2.0F) / 3.0F;
+        const auto tab = [&state, tab_width](const char* label, const SmvmPage page) noexcept {
+            const auto selected = state.page == page;
+            if (selected)
+                ImGui::PushStyleColor(ImGuiCol_Button, smvm_theme::Vec4(smvm_theme::colors::kAccent));
+            const auto pressed = ImGui::Button(label, ImVec2(tab_width, 0.0F));
+            if (selected)
+                ImGui::PopStyleColor();
+            if (pressed)
+                state.page = page;
+        };
+        tab("RECORD", SmvmPage::capture);
+        ImGui::SameLine();
+        tab("PASSES", SmvmPage::settings);
+        ImGui::SameLine();
+        tab("LOOK", SmvmPage::visuals);
+        ImGui::Separator();
+
+        const auto draw_recording_option = [&context, &snapshot](
+            const char* label,
+            const std::uint32_t flag,
+            const MovieRecordingOption option,
+            const char* tooltip) noexcept {
+            auto enabled = (snapshot.movie_recording_flags & flag) != 0;
+            if (ImGui::Checkbox(label, &enabled))
+                QueueAction(
+                    context,
+                    SmvmActionType::set_movie_recording_option,
+                    static_cast<std::int32_t>(option),
+                    -1,
+                    enabled ? 1.0 : 0.0);
+            smvm_theme::Tooltip(tooltip);
+        };
+        const auto draw_pass = [&context, &snapshot](
+            const char* label,
+            const std::uint32_t flag,
+            const std::int32_t index,
+            const char* tooltip) noexcept {
+            auto enabled = (snapshot.movie_capture_pass_flags & flag) != 0;
+            const auto is_last_pass = enabled && snapshot.movie_capture_pass_flags == flag;
+            ImGui::BeginDisabled(is_last_pass);
+            if (ImGui::Checkbox(label, &enabled))
+                QueueAction(
+                    context,
+                    SmvmActionType::set_movie_capture_pass,
+                    index,
+                    -1,
+                    enabled ? 1.0 : 0.0);
+            ImGui::EndDisabled();
+            smvm_theme::Tooltip(
+                is_last_pass ? "Keep at least one file." : tooltip);
+        };
+
+        ImGui::BeginChild(
+            "##movie_setup_page",
+            ImVec2(0.0F, height - (235.0F * scale)),
+            false,
+            ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar |
+                ImGuiWindowFlags_NoScrollWithMouse);
+        ImGui::BeginDisabled(active || armed || finalizing);
+        if (state.page == SmvmPage::capture) {
+            auto preset = static_cast<int>(snapshot.movie_recording_preset);
+            ImGui::SetNextItemWidth(250.0F * scale);
+            if (ImGui::Combo(
+                    "Preset",
+                    &preset,
+                    "Best Quality\0Quick AVI\0World + Depth + Green Screen\0Custom\0Green Screen\0")) {
+                QueueAction(context, SmvmActionType::set_movie_recording_preset, preset);
+            }
+            smvm_theme::Tooltip("Pick a starting setup.");
+
+            auto output = static_cast<int>(snapshot.movie_output_mode);
+            ImGui::SetNextItemWidth(250.0F * scale);
+            const auto greenscreen_plate =
+                (snapshot.movie_capture_pass_flags &
+                 movie_capture_pass_greenscreen_free_camera) != 0;
+            ImGui::BeginDisabled(greenscreen_plate);
+            if (ImGui::Combo("Output", &output, "TGA + WAV\0AVI + WAV\0TGA + AVI + WAV\0"))
+                QueueAction(context, SmvmActionType::set_movie_output_mode, output);
+            ImGui::EndDisabled();
+            if (greenscreen_plate)
+                smvm_theme::Tooltip("Green Screen saves as AVI.");
+
+            auto output_resolution = static_cast<int>(snapshot.movie_output_resolution);
+            ImGui::SetNextItemWidth(250.0F * scale);
+            if (ImGui::Combo(
+                    "Resolution",
+                    &output_resolution,
+                    "Game resolution\0Full HD - 1920 x 1080\0")) {
+                QueueAction(
+                    context,
+                    SmvmActionType::set_movie_output_resolution,
+                    output_resolution);
+            }
+            smvm_theme::Tooltip(
+                "Full HD saves every pass at 1920x1080.");
+            if (snapshot.movie_output_resolution == MovieOutputResolution::full_hd) {
+                ImGui::TextDisabled(
+                    "Game %ux%u  ->  output 1920x1080%s",
+                    static_cast<unsigned>(std::max(0.0F, context.params->viewport_width)),
+                    static_cast<unsigned>(std::max(0.0F, context.params->viewport_height)),
+                    context.params->viewport_width == 1920.0F &&
+                            context.params->viewport_height == 1080.0F
+                        ? " (native)"
+                        : " (scaled)");
+            }
+
+            if (!state.movie_capture_fps_initialized ||
+                state.movie_capture_fps_snapshot != snapshot.movie_recording_fps) {
+                state.movie_capture_fps = static_cast<std::int32_t>(snapshot.movie_recording_fps);
+                state.movie_capture_fps_snapshot = snapshot.movie_recording_fps;
+                state.movie_capture_fps_initialized = true;
+            }
+            ImGui::SetNextItemWidth(110.0F * scale);
+            ImGui::InputInt("Capture FPS", &state.movie_capture_fps, 1, 10);
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                state.movie_capture_fps = std::clamp(state.movie_capture_fps, 1, 1000);
+                QueueAction(
+                    context,
+                    SmvmActionType::set_movie_recording_fps,
+                    -1,
+                    -1,
+                    static_cast<double>(state.movie_capture_fps));
+            }
+            ImGui::SameLine();
+            constexpr std::array<std::int32_t, 6> fps_choices{24, 30, 60, 120, 300, 600};
+            for (std::size_t index = 0; index < fps_choices.size(); ++index) {
+                if (index > 0)
+                    ImGui::SameLine();
+                std::array<char, 12> label{};
+                static_cast<void>(std::snprintf(label.data(), label.size(), "%d", fps_choices[index]));
+                if (ImGui::SmallButton(label.data()))
+                    QueueAction(
+                        context,
+                        SmvmActionType::set_movie_recording_fps,
+                        -1,
+                        -1,
+                        static_cast<double>(fps_choices[index]));
+            }
+            const auto timeline_slowdown =
+                static_cast<double>(snapshot.movie_recording_fps) / 60.0;
+            if (snapshot.movie_output_mode != MovieOutputMode::image_sequence &&
+                (snapshot.movie_capture_pass_flags & movie_capture_pass_beauty) != 0) {
+                const auto output_dimensions = ResolveMovieOutputDimensions(
+                    snapshot.movie_output_resolution,
+                    static_cast<std::uint32_t>(std::max(0.0F, context.params->viewport_width)),
+                    static_cast<std::uint32_t>(std::max(0.0F, context.params->viewport_height)));
+                const auto gib_per_second =
+                    static_cast<double>(output_dimensions.width) *
+                    static_cast<double>(output_dimensions.height) * 3.0 *
+                    static_cast<double>(snapshot.movie_recording_fps) /
+                    (1024.0 * 1024.0 * 1024.0);
+                const auto world_avi_count =
+                    ((snapshot.movie_capture_pass_flags & movie_capture_pass_beauty) != 0 ? 1u : 0u) +
+                    ((snapshot.movie_capture_pass_flags & movie_capture_pass_world_depth_avi) != 0 ? 1u : 0u);
+                const auto chroma_avi_count =
+                    (snapshot.movie_capture_pass_flags &
+                     movie_capture_pass_greenscreen_free_camera) != 0 ? 1u : 0u;
+                const auto peak_avi_count = std::max(1u, std::max(world_avi_count, chroma_avi_count));
+                ImGui::TextDisabled(
+                    "%.1fx slow motion at 60 FPS  |  ~%.1f GiB/s",
+                    timeline_slowdown,
+                    gib_per_second * peak_avi_count);
+            } else {
+                ImGui::TextDisabled(
+                    "%.1fx slow motion at 60 FPS",
+                    timeline_slowdown);
+            }
+            const auto cinematic_speed =
+                snapshot.timescale > 0.0 && std::isfinite(snapshot.timescale)
+                    ? snapshot.timescale
+                    : 1.0;
+            ImGui::TextColored(
+                smvm_theme::Vec4(smvm_theme::colors::kSuccess),
+                "Cinematic speed: %.2fx",
+                cinematic_speed);
+
+            draw_recording_option(
+                "Post-processing off",
+                movie_recording_disable_post_processing,
+                MovieRecordingOption::disable_post_processing,
+                "Saves a cleaner source for color work.");
+            draw_recording_option(
+                "Mute dialogue",
+                movie_recording_mute_dialogue,
+                MovieRecordingOption::mute_dialogue,
+                "Keeps other game sounds.");
+        } else if (state.page == SmvmPage::settings) {
+            ImGui::TextUnformatted("Choose your files");
+            draw_pass(
+                "World",
+                movie_capture_pass_beauty,
+                0,
+                "Normal color video.");
+            draw_pass(
+                "Depth",
+                movie_capture_pass_world_depth_pfm,
+                1,
+                "High-quality PFM files for effects.");
+            draw_pass(
+                "Depth Video",
+                movie_capture_pass_world_depth_avi,
+                2,
+                "Grayscale depth AVI for your editor.");
+            draw_pass(
+                "Green Screen",
+                movie_capture_pass_greenscreen_free_camera,
+                3,
+                "Records a second matching play on green.");
+            ImGui::Spacing();
+            if ((snapshot.movie_capture_pass_flags & movie_capture_pass_beauty) != 0 &&
+                (snapshot.movie_capture_pass_flags &
+                 movie_capture_pass_greenscreen_free_camera) != 0) {
+                ImGui::TextColored(
+                    smvm_theme::Vec4(smvm_theme::colors::kAccent),
+                    "RECORDS TWICE: WORLD + DEPTH, THEN GREEN SCREEN");
+            }
+            ImGui::TextDisabled("Stopped or incomplete files are marked PARTIAL.");
+        } else if (state.page == SmvmPage::visuals) {
+            auto thirds = (snapshot.movie_tool_flags & movie_tool_rule_of_thirds) != 0;
+            if (ImGui::Checkbox("Rule of thirds", &thirds))
+                QueueAction(
+                    context,
+                    SmvmActionType::set_rule_of_thirds,
+                    -1,
+                    -1,
+                    thirds ? 1.0 : 0.0);
+            smvm_theme::Tooltip("Preview guide only; it is never burned into captures.");
+
+            const auto greenscreen =
+                snapshot.greenscreen_mode == GreenscreenMode::free_camera;
+            ImGui::TextUnformatted("Preview");
+            ImGui::SameLine();
+            ImGui::TextColored(
+                smvm_theme::Vec4(
+                    greenscreen ? smvm_theme::colors::kSuccess : smvm_theme::colors::kMuted),
+                "%s",
+                greenscreen ? "GREEN SCREEN" : "WORLD");
+
+            auto fog_enabled = (snapshot.movie_tool_flags & movie_tool_custom_fog) != 0;
+            ImGui::BeginDisabled(greenscreen);
+            if (ImGui::Checkbox("Fog", &fog_enabled))
+                QueueAction(
+                    context,
+                    SmvmActionType::set_custom_fog_enabled,
+                    -1,
+                    -1,
+                    fog_enabled ? 1.0 : 0.0);
+            ImGui::TextDisabled("Appears in the game and World video.");
+            ImGui::BeginDisabled(!fog_enabled);
+            auto fog_value = 0.0F;
+            const auto maximum_fog_start = static_cast<float>(std::clamp(
+                snapshot.custom_fog_end - 100.0, -250.0, 4000.0));
+            if (smvm_theme::SliderInput(
+                    "fog_start", static_cast<float>(snapshot.custom_fog_start),
+                    -250.0F, maximum_fog_start, fog_value, "%.0f", true, "Start"))
+                QueueAction(context, SmvmActionType::set_custom_fog_value, 0, -1, fog_value);
+            const auto minimum_fog_end = static_cast<float>(std::clamp(
+                snapshot.custom_fog_start + 100.0, 100.0, 8000.0));
+            if (smvm_theme::SliderInput(
+                    "fog_end", static_cast<float>(snapshot.custom_fog_end),
+                    minimum_fog_end, 8000.0F, fog_value, "%.0f", true, "End"))
+                QueueAction(context, SmvmActionType::set_custom_fog_value, 1, -1, fog_value);
+            if (smvm_theme::SliderInput(
+                    "fog_density", static_cast<float>(snapshot.custom_fog_max_density),
+                    0.05F, 1.0F, fog_value, "%.2f", true, "Density"))
+                QueueAction(context, SmvmActionType::set_custom_fog_value, 2, -1, fog_value);
+            if (smvm_theme::SliderInput(
+                    "fog_exponent", static_cast<float>(snapshot.custom_fog_exponent),
+                    0.1F, 4.0F, fog_value, "%.2f", true, "Falloff"))
+                QueueAction(context, SmvmActionType::set_custom_fog_value, 3, -1, fog_value);
+            smvm_theme::Tooltip("Shapes how quickly fog builds between Start and End.");
+            std::array<float, 3> fog_color{
+                static_cast<float>((snapshot.custom_fog_color_rgb >> 16) & 0xFFu) / 255.0F,
+                static_cast<float>((snapshot.custom_fog_color_rgb >> 8) & 0xFFu) / 255.0F,
+                static_cast<float>(snapshot.custom_fog_color_rgb & 0xFFu) / 255.0F,
+            };
+            if (ImGui::ColorEdit3("Fog color", fog_color.data(), ImGuiColorEditFlags_NoInputs)) {
+                const auto red = static_cast<std::uint32_t>(std::clamp(fog_color[0], 0.0F, 1.0F) * 255.0F + 0.5F);
+                const auto green = static_cast<std::uint32_t>(std::clamp(fog_color[1], 0.0F, 1.0F) * 255.0F + 0.5F);
+                const auto blue = static_cast<std::uint32_t>(std::clamp(fog_color[2], 0.0F, 1.0F) * 255.0F + 0.5F);
+                QueueAction(
+                    context,
+                    SmvmActionType::set_custom_fog_color,
+                    static_cast<std::int32_t>((red << 16) | (green << 8) | blue));
+            }
+            ImGui::EndDisabled();
+            ImGui::EndDisabled();
+            if (greenscreen)
+                ImGui::TextDisabled("Fog is off during Green Screen.");
+        }
+        ImGui::EndDisabled();
+        ImGui::EndChild();
+
+        ImGui::Separator();
+        ImGui::TextDisabled(active || armed || finalizing ? "SAVING TO" : "CAPTURE FOLDER");
+        ImGui::SameLine();
+        ImGui::TextWrapped("%s", snapshot.movie_capture_path.data());
+        if (ImGui::SmallButton("Open folder"))
+            QueueAction(context, SmvmActionType::open_movie_capture_folder);
+        ImGui::SameLine();
+        ImGui::BeginDisabled(active || armed || finalizing);
+        if (ImGui::SmallButton("Choose folder"))
+            QueueAction(context, SmvmActionType::choose_movie_capture_folder);
+        ImGui::EndDisabled();
+        if (active) {
+            const auto wants_depth =
+                (snapshot.movie_active_pass_flags &
+                 (movie_capture_pass_world_depth_pfm |
+                  movie_capture_pass_world_depth_avi |
+                  movie_capture_pass_greenscreen_free_camera)) != 0;
+            const auto wants_avi =
+                (snapshot.movie_output_mode != MovieOutputMode::image_sequence &&
+                 (snapshot.movie_active_pass_flags & movie_capture_pass_beauty) != 0) ||
+                (snapshot.movie_active_pass_flags &
+                 (movie_capture_pass_world_depth_avi |
+                  movie_capture_pass_greenscreen_free_camera)) != 0;
+            const auto native_active =
+                (context.params->overlay_flags & smvm_overlay_movie_recording_active) != 0;
+            const auto depth_available =
+                (context.params->overlay_flags & smvm_overlay_world_depth_available) != 0;
+            const auto avi_available =
+                (context.params->overlay_flags & smvm_overlay_movie_avi_available) != 0;
+            const auto capture_failed =
+                (context.params->overlay_flags & smvm_overlay_world_depth_failed) != 0;
+            const auto depth_incomplete =
+                (context.params->overlay_flags & smvm_overlay_world_depth_incomplete) != 0;
+            if (capture_failed) {
+                ImGui::TextColored(
+                    smvm_theme::Vec4(smvm_theme::colors::kError),
+                    "RECORDING FAILED - CHECK CAPTURE REPORT");
+            } else if (context.params->movie_depth_observer_failed && wants_depth) {
+                ImGui::TextColored(
+                    smvm_theme::Vec4(smvm_theme::colors::kError),
+                    "DEPTH FAILED - WORLD VIDEO CONTINUES");
+            } else if (depth_incomplete && wants_depth) {
+                ImGui::TextColored(
+                    smvm_theme::Vec4(smvm_theme::colors::kWarning),
+                    "DEPTH INCOMPLETE - FILE MARKED PARTIAL");
+            } else if (context.params->movie_audio_failed) {
+                ImGui::TextColored(
+                    smvm_theme::Vec4(smvm_theme::colors::kError),
+                    "AUDIO FAILED - VIDEO CONTINUES");
+            } else if (wants_depth || wants_avi) {
+                ImGui::TextDisabled(
+                    "VIDEO %s  |  AUDIO %s  |  DEPTH %s  |  AVI %s",
+                    native_active ? "ACTIVE" : "STARTING",
+                    context.params->movie_audio_active ? "RECORDING" : "STARTING",
+                    !wants_depth ? "N/A" :
+                        context.params->movie_depth_observer_active ? "ARMED" :
+                        depth_available ? "DIRECT" : "WAITING",
+                    !wants_avi ? "N/A" : avi_available ? "WRITING" : "WAITING");
+            } else {
+                ImGui::TextDisabled(
+                    "VIDEO %s  |  AUDIO %s",
+                    native_active ? "WRITING" : "STARTING",
+                    context.params->movie_audio_active ? "RECORDING" : "STARTING");
+            }
+            if (native_active) {
+                ImGui::TextDisabled(
+                    "FRAMES  TGA %llu  |  WORLD %llu  |  PFM %llu  |  DEPTH %llu  |  GREEN %llu  /  %llu",
+                    static_cast<unsigned long long>(
+                        context.params->movie_beauty_tga_frames_written),
+                    static_cast<unsigned long long>(
+                        context.params->movie_beauty_frames_written),
+                    static_cast<unsigned long long>(
+                        context.params->movie_depth_pfm_frames_written),
+                    static_cast<unsigned long long>(
+                        context.params->movie_depth_avi_frames_written),
+                    static_cast<unsigned long long>(
+                        context.params->movie_depth_key_frames_written),
+                    static_cast<unsigned long long>(
+                        context.params->movie_frames_observed));
+                if (context.params->movie_repeated_visual_samples_captured != 0) {
+                    ImGui::TextColored(
+                        smvm_theme::Vec4(smvm_theme::colors::kWarning),
+                        "CADENCE  VISUAL %llu  |  %llu DUPLICATE PRESENTS SKIPPED  |  QUEUE %u/%u  |  %llu WAITS (MAX %llu MS)",
+                        static_cast<unsigned long long>(
+                            context.params->movie_repeated_visual_samples_captured),
+                        static_cast<unsigned long long>(
+                            context.params->movie_repeated_camera_sequences_captured),
+                        context.params->movie_maximum_queue_depth,
+                        context.params->movie_queue_capacity,
+                        static_cast<unsigned long long>(
+                            context.params->movie_queue_backpressure_events),
+                        static_cast<unsigned long long>(
+                            context.params->movie_maximum_queue_wait_microseconds / 1000u));
+                } else if (context.params->movie_repeated_camera_sequences_captured != 0) {
+                    ImGui::TextDisabled(
+                        "%llu DUPLICATE PRESENTS SKIPPED  |  QUEUE %u/%u  |  %llu WAITS",
+                        static_cast<unsigned long long>(
+                            context.params->movie_repeated_camera_sequences_captured),
+                        context.params->movie_maximum_queue_depth,
+                        context.params->movie_queue_capacity,
+                        static_cast<unsigned long long>(
+                            context.params->movie_queue_backpressure_events));
+                }
+            }
+        }
+        const auto seek_in_progress =
+            (snapshot.flags & smvm_snapshot_replay_seek_in_progress) != 0;
+        const auto playing =
+            (snapshot.flags & smvm_snapshot_campath_playing) != 0;
+        const auto can_arm = (snapshot.flags & smvm_snapshot_replay_active) != 0 &&
+            snapshot.keyframe_count >= 3 && !playing && !seek_in_progress;
+        if (active) {
+            if (smvm_theme::PrimaryButton(
+                    "Stop recording",
+                    true,
+                    ImVec2(ImGui::GetContentRegionAvail().x, 0.0F)))
+                QueueAction(context, SmvmActionType::stop_movie_recording);
+        } else if (finalizing) {
+            smvm_theme::PrimaryButton(
+                "Finishing files...",
+                false,
+                ImVec2(ImGui::GetContentRegionAvail().x, 0.0F));
+        } else {
+            const auto main_label = armed ? "Cancel recording" :
+                (ready ? "Record this cinematic" : "Record next cinematic");
+            if (smvm_theme::PrimaryButton(
+                    main_label,
+                    armed || can_arm,
+                    ImVec2((ImGui::GetContentRegionAvail().x - (8.0F * scale)) * 0.62F, 0.0F))) {
+                if (QueueAction(
+                        context,
+                        armed ? SmvmActionType::stop_movie_recording
+                              : SmvmActionType::start_movie_recording))
+                    SmvmCloseMenu();
+            }
+            ImGui::SameLine();
+            const auto secondary_label = ready ? "Play without recording" :
+                (armed ? "Cancel and close" : "Close");
+            if (ImGui::Button(
+                    secondary_label,
+                    ImVec2(ImGui::GetContentRegionAvail().x, 0.0F))) {
+                if (armed)
+                    QueueAction(context, SmvmActionType::stop_movie_recording);
+                SmvmCloseMenu();
+            }
+        }
+    }
+    ImGui::End();
+    ImGui::PopStyleVar(2);
+}
+
 void DrawCampathMiniMenu(const FrameContext& context) noexcept {
     if (context.params->path_header == nullptr || context.params->keyframes == nullptr ||
         !ShouldShowCampathPlacementList(
@@ -1881,11 +2376,10 @@ void DrawPlaybackSpeedControls(const FrameContext& context) noexcept {
         "%.2f%%",
         ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_EnterReturnsTrue);
     state.playback_speed_input_active = ImGui::IsItemActive();
+    const auto finished_editing = ImGui::IsItemDeactivatedAfterEdit();
     ImGui::PopFont();
-    smvm_theme::Tooltip("Custom replay playback percentage (1% to 1000%).");
-    ImGui::SameLine();
-    const auto apply = smvm_theme::Button("Apply", true, ImVec2(52.0F * scale, 0.0F));
-    if (entered || apply) {
+    smvm_theme::Tooltip("Custom replay playback percentage (1% to 1000%). Press Enter or click away to apply.");
+    if (entered || finished_editing) {
         const auto timescale = PlaybackSpeedFromPercent(state.playback_speed_percent);
         state.playback_speed_percent = static_cast<float>(timescale * 100.0);
         QueueAction(context, SmvmActionType::set_timescale, -1, -1, timescale);
@@ -1940,11 +2434,10 @@ void DrawManualFovControl(const FrameContext& context) noexcept {
         "%.1f",
         ImGuiInputTextFlags_CharsDecimal | ImGuiInputTextFlags_EnterReturnsTrue);
     state.manual_fov_input_active = ImGui::IsItemActive();
+    const auto finished_editing = ImGui::IsItemDeactivatedAfterEdit();
     ImGui::PopFont();
-    smvm_theme::Tooltip("Type the rendered SMVM Free Camera FOV (5 to 170 degrees). Press Enter or Set.");
-    ImGui::SameLine();
-    const auto apply = smvm_theme::Button("Set", camera_ready, ImVec2(40.0F * scale, 0.0F));
-    if (entered || apply) {
+    smvm_theme::Tooltip("Type the rendered SMVM Free Camera FOV (5 to 170 degrees). Press Enter or click away to apply.");
+    if (entered || finished_editing) {
         const auto target = std::clamp(
             static_cast<double>(state.manual_fov), kMinFov, kMaxFov);
         state.manual_fov = static_cast<float>(target);
@@ -2317,6 +2810,153 @@ void ObserveReplaySession(
     SmvmSetReplayTickInputActive(false);
 }
 
+void DrawRuleOfThirdsGuide(const FrameContext& context) noexcept {
+    if ((context.snapshot->movie_tool_flags & movie_tool_rule_of_thirds) == 0)
+        return;
+    const auto width = context.params->viewport_width;
+    const auto height = context.params->viewport_height;
+    if (width <= 0.0F || height <= 0.0F)
+        return;
+    auto* draw = ImGui::GetForegroundDrawList();
+    constexpr auto color = IM_COL32(255, 255, 255, 118);
+    const auto thickness = std::max(1.0F, smvm_theme::GetScale());
+    draw->AddLine(ImVec2(width / 3.0F, 0.0F), ImVec2(width / 3.0F, height), color, thickness);
+    draw->AddLine(ImVec2(width * 2.0F / 3.0F, 0.0F), ImVec2(width * 2.0F / 3.0F, height), color, thickness);
+    draw->AddLine(ImVec2(0.0F, height / 3.0F), ImVec2(width, height / 3.0F), color, thickness);
+    draw->AddLine(ImVec2(0.0F, height * 2.0F / 3.0F), ImVec2(width, height * 2.0F / 3.0F), color, thickness);
+}
+
+void DrawMovieRecordingProgress(const FrameContext& context) noexcept {
+    const auto& snapshot = *context.snapshot;
+    auto& state = *context.state;
+    const auto active = (snapshot.movie_recording_flags & movie_recording_active) != 0;
+    if (!active) {
+        state.movie_progress_active = false;
+        state.movie_progress_start_tick = 0;
+        state.movie_progress_end_tick = 0;
+        return;
+    }
+
+    const auto has_progress_path = context.params->has_path &&
+        context.params->path_header != nullptr &&
+        context.params->keyframes != nullptr &&
+        context.params->path_header->keyframe_count >= 2;
+    if (!state.movie_progress_active && has_progress_path) {
+        state.movie_progress_active = true;
+        const auto count = std::min<std::uint32_t>(
+            context.params->path_header->keyframe_count,
+            static_cast<std::uint32_t>(kMaxCampathKeyframes));
+        state.movie_progress_start_tick = context.params->keyframes[0].demo_tick;
+        state.movie_progress_end_tick = context.params->keyframes[count - 1].demo_tick;
+        if (state.movie_progress_end_tick < state.movie_progress_start_tick)
+            std::swap(state.movie_progress_start_tick, state.movie_progress_end_tick);
+    }
+
+    const auto progress = ComputeMovieRecordingTickProgress(
+        state.movie_progress_active ? state.movie_progress_start_tick : snapshot.current_tick,
+        state.movie_progress_active ? state.movie_progress_end_tick : snapshot.current_tick,
+        snapshot.current_tick);
+    std::array<char, 176> tick_text{};
+    std::array<char, 160> frame_text{};
+    std::array<char, 160> cadence_text{};
+    static_cast<void>(std::snprintf(
+        tick_text.data(), tick_text.size(),
+        "RECORDING  %lld / %lld TICKS  |  %lld TICKS LEFT  |  ESC TO PAUSE + END",
+        static_cast<long long>(progress.completed),
+        static_cast<long long>(progress.total),
+        static_cast<long long>(progress.remaining)));
+    const auto native_pass_active =
+        (snapshot.movie_output_mode != MovieOutputMode::image_sequence &&
+         (snapshot.movie_active_pass_flags & movie_capture_pass_beauty) != 0) ||
+        (snapshot.movie_active_pass_flags &
+         (movie_capture_pass_world_depth_pfm |
+          movie_capture_pass_world_depth_avi |
+          movie_capture_pass_greenscreen_free_camera)) != 0;
+    if (native_pass_active) {
+        static_cast<void>(std::snprintf(
+            frame_text.data(), frame_text.size(),
+            "%s  |  WORLD %llu  PFM %llu  Z %llu  CHROMA %llu  |  CAPTURED %llu / %llu",
+            snapshot.movie_compositing_stage == MovieCompositingStage::world
+                ? "PASS 1/2 WORLD + Z"
+                : snapshot.movie_compositing_stage == MovieCompositingStage::chroma
+                    ? "PASS 2/2 CHROMA"
+                    : "PASS",
+            static_cast<unsigned long long>(context.params->movie_beauty_frames_written),
+            static_cast<unsigned long long>(context.params->movie_depth_pfm_frames_written),
+            static_cast<unsigned long long>(context.params->movie_depth_avi_frames_written),
+            static_cast<unsigned long long>(context.params->movie_depth_key_frames_written),
+            static_cast<unsigned long long>(context.params->movie_frames_observed),
+            static_cast<unsigned long long>(
+                snapshot.movie_expected_frame_count != 0
+                    ? snapshot.movie_expected_frame_count
+                    : context.params->movie_frames_observed)));
+    } else {
+        static_cast<void>(std::snprintf(
+            frame_text.data(), frame_text.size(), "STOCK TGA/WAV WRITER ACTIVE"));
+    }
+    const auto cadence_warning = native_pass_active &&
+        context.params->movie_repeated_visual_samples_captured != 0;
+    const auto duplicates_suppressed = native_pass_active &&
+        context.params->movie_repeated_camera_sequences_captured != 0;
+    if (cadence_warning) {
+        static_cast<void>(std::snprintf(
+            cadence_text.data(), cadence_text.size(),
+            "CADENCE WARNING  VISUAL %llu  |  %llu DUPLICATE PRESENTS SKIPPED  |  QUEUE %u/%u  |  %llu WAITS",
+            static_cast<unsigned long long>(
+                context.params->movie_repeated_visual_samples_captured),
+            static_cast<unsigned long long>(
+                context.params->movie_repeated_camera_sequences_captured),
+            context.params->movie_maximum_queue_depth,
+            context.params->movie_queue_capacity,
+            static_cast<unsigned long long>(
+                context.params->movie_queue_backpressure_events)));
+    } else if (duplicates_suppressed) {
+        static_cast<void>(std::snprintf(
+            cadence_text.data(), cadence_text.size(),
+            "CADENCE CLEANUP  %llu DUPLICATE PRESENTS SKIPPED  |  QUEUE %u/%u  |  %llu WAITS",
+            static_cast<unsigned long long>(
+                context.params->movie_repeated_camera_sequences_captured),
+            context.params->movie_maximum_queue_depth,
+            context.params->movie_queue_capacity,
+            static_cast<unsigned long long>(
+                context.params->movie_queue_backpressure_events)));
+    }
+
+    const auto scale = smvm_theme::GetScale();
+    const auto width = std::min(520.0F * scale, context.params->viewport_width - (32.0F * scale));
+    ImGui::SetNextWindowPos(
+        ImVec2((context.params->viewport_width - width) * 0.5F, 18.0F * scale),
+        ImGuiCond_Always);
+    ImGui::SetNextWindowSize(
+        ImVec2(width, (cadence_warning || duplicates_suppressed ? 90.0F : 70.0F) * scale),
+        ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.94F);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0F * scale, 10.0F * scale));
+    if (ImGui::Begin(
+            "##deadlockmvm_recording_progress",
+            nullptr,
+            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+                ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoInputs)) {
+        ImGui::PushFont(smvm_theme::GetFonts().section);
+        ImGui::TextColored(smvm_theme::Vec4(smvm_theme::colors::kWarning), "%s", tick_text.data());
+        ImGui::PopFont();
+        ImGui::TextDisabled("%s", frame_text.data());
+        if (cadence_warning || duplicates_suppressed) {
+            if (cadence_warning) {
+                ImGui::TextColored(
+                    smvm_theme::Vec4(smvm_theme::colors::kWarning),
+                    "%s",
+                    cadence_text.data());
+            } else {
+                ImGui::TextDisabled("%s", cadence_text.data());
+            }
+        }
+    }
+    ImGui::End();
+    ImGui::PopStyleVar(2);
+}
+
 void DrawFrame(const SmvmUiFrameParams& params, SmvmUiState& state) noexcept {
     if (params.snapshot == nullptr)
         return;
@@ -2361,8 +3001,11 @@ void DrawFrame(const SmvmUiFrameParams& params, SmvmUiState& state) noexcept {
     state.free_camera_activation_pending = false;
     state.free_camera_activation_started_ms = 0;
     state.free_camera_activation_error_until_ms = 0;
+    DrawMovieRecordingProgress(context);
     if (show_editor_ui) {
+        DrawRuleOfThirdsGuide(context);
         DrawReplayPauseIndicator(context);
+        DrawMovieRecordingMenu(context);
         DrawCampathMiniMenu(context);
         DrawReplayTimeline(context);
         if ((params.snapshot->flags & smvm_snapshot_replay_seek_in_progress) != 0)

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(DeadlockMVMNative VERSION 1.0.0 LANGUAGES CXX)
+project(DeadlockMVMNative VERSION 1.0.0 LANGUAGES C CXX)
 
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "DeadlockMVM.Native requires 64-bit Windows")

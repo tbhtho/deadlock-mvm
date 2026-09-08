@@ -21,3 +21,14 @@ target_compile_definitions(imgui PUBLIC
 
 target_compile_options(imgui PRIVATE /W3 /EHsc)
 set_target_properties(imgui PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# libgmavi (vendored, MIT) writes compact uncompressed OpenDML AVI files.
+# Keep upstream C warnings isolated from the /W4 /WX product target.
+add_library(libgmavi STATIC
+    libgmavi/src/libgmavi.c
+)
+target_include_directories(libgmavi PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/libgmavi/include
+)
+target_compile_options(libgmavi PRIVATE /W3)
+set_target_properties(libgmavi PROPERTIES POSITION_INDEPENDENT_CODE ON)

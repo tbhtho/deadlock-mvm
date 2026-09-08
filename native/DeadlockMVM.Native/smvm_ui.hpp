@@ -54,7 +54,7 @@ enum class SmvmConfirmAction : std::uint32_t {
 };
 
 struct SmvmUiState final {
-    SmvmPage page{SmvmPage::campath};
+    SmvmPage page{SmvmPage::capture};
     SmvmSettingsSection settings_section{SmvmSettingsSection::camera};
     // Remembered window geometry (logical, unscaled pixels).
     bool window_positioned{};
@@ -99,6 +99,12 @@ struct SmvmUiState final {
     bool free_camera_activation_pending{};
     std::uint64_t free_camera_activation_started_ms{};
     std::uint64_t free_camera_activation_error_until_ms{};
+    std::int32_t movie_capture_fps{60};
+    std::uint32_t movie_capture_fps_snapshot{60};
+    bool movie_capture_fps_initialized{};
+    bool movie_progress_active{};
+    std::int64_t movie_progress_start_tick{};
+    std::int64_t movie_progress_end_tick{};
 };
 
 struct SmvmUiFrameParams final {
@@ -113,6 +119,24 @@ struct SmvmUiFrameParams final {
     float viewport_height{};
     std::uint32_t frame_microseconds{};
     std::uint32_t overlay_flags{};
+    std::uint64_t movie_frames_observed{};
+    std::uint64_t movie_frames_written{};
+    std::uint64_t movie_beauty_tga_frames_written{};
+    std::uint64_t movie_beauty_frames_written{};
+    std::uint64_t movie_depth_pfm_frames_written{};
+    std::uint64_t movie_depth_avi_frames_written{};
+    std::uint64_t movie_depth_key_frames_written{};
+    std::uint64_t movie_depth_frames_unavailable{};
+    std::uint64_t movie_repeated_camera_sequences_captured{};
+    std::uint64_t movie_repeated_visual_samples_captured{};
+    std::uint64_t movie_queue_backpressure_events{};
+    std::uint64_t movie_maximum_queue_wait_microseconds{};
+    std::uint32_t movie_queue_capacity{};
+    std::uint32_t movie_maximum_queue_depth{};
+    bool movie_audio_active{};
+    bool movie_audio_failed{};
+    bool movie_depth_observer_active{};
+    bool movie_depth_observer_failed{};
     std::uint32_t renderer_error{};
     std::uint64_t raw_mouse_timestamp_ms{};
     std::uint64_t fallback_mouse_timestamp_ms{};

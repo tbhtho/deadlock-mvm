@@ -26,7 +26,6 @@ public sealed class VConsoleTransport : IGameCommandTransport
     private readonly object _sendLock = new();
     private readonly MemoryStream _raw = new();
     private string _textBuffer = string.Empty;
-    private readonly Queue<string> _pendingLines = new();
 
     private TcpClient? _client;
     private Thread? _readerThread;
@@ -61,7 +60,6 @@ public sealed class VConsoleTransport : IGameCommandTransport
             _raw.SetLength(0);
             _rawScan = 0;
             _textBuffer = string.Empty;
-            _pendingLines.Clear();
         }
 
         _connected = true;
@@ -212,8 +210,9 @@ public sealed class VConsoleTransport : IGameCommandTransport
 
         _rawScan = pos;
 
-        // Compact the accumulation buffer occasionally so long sessions do not grow it forever.
-        if (_rawScan > 4 * 1024 * 1024)
+        // Keep only the incomplete tail. Retaining decoded console history made
+        // every read copy and allocate up to 4 MiB during replay loading.
+        if (_rawScan > 0)
         {
             var rest = data[_rawScan..];
             _raw.SetLength(0);

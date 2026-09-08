@@ -65,11 +65,20 @@ public partial class App : System.Windows.Application
                 Path.Combine(AppContext.BaseDirectory, "DeadlockMVM.Native.dll"),
                 () => viewModel.DeadlockPath);
 
-            // Internal SMVM editor: campath model, in-game menu pointer
-            // forwarding, and the VConsole auto-connect loop.
+            // Internal SMVM editor: campath model, startup-only pointer
+            // fallback, and the VConsole auto-connect loop. Once the healthy
+            // native overlay owns the game window, ordinary Win32 messages
+            // must pass through so held ImGui gestures retain their exact
+            // down/move/up lifecycle.
             var pointerForwarder = new SmvmPointerForwarder(
                 Dispatcher,
-                () => nativeSession.Status?.OverlayFlags.HasFlag(SmvmOverlayFlags.MenuOpen) == true,
+                () =>
+                {
+                    var status = nativeSession.Status;
+                    return status?.OverlayFlags.HasFlag(SmvmOverlayFlags.MenuOpen) == true &&
+                           (!status.OverlayFlags.HasFlag(SmvmOverlayFlags.Ready) ||
+                            status.RendererError == SmvmRendererError.WindowHookFailed);
+                },
                 PointerTraceEnabled() ? message => log.Info(message) : null);
             if (!pointerForwarder.IsAvailable)
                 log.Warn($"SMVM: menu pointer observer unavailable (error {pointerForwarder.LastError}).");
@@ -82,7 +91,8 @@ public partial class App : System.Windows.Application
                 campath,
                 settings,
                 log,
-                Dispatcher);
+                Dispatcher,
+                () => viewModel.DeadlockPath);
             connection.Start();
 
             var window = new MainWindow { DataContext = viewModel };

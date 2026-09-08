@@ -1,10 +1,14 @@
 #include "smvm_overlay.hpp"
 
+#include "custom_fog_policy.hpp"
 #include "free_camera_input.hpp"
+#include "d3d11_context_hook_policy.hpp"
 #include "manual_camera_input_policy.hpp"
 #include "manual_mouse_fallback.hpp"
+#include "menu_pointer_feed_policy.hpp"
 #include "npc_healthbar_hook.hpp"
 #include "npc_healthbar_policy.hpp"
+#include "playback_speed_policy.hpp"
 #include "tower_fade_override.hpp"
 #include "tower_outline_hook.hpp"
 #include "tower_outline_policy.hpp"
@@ -13,6 +17,7 @@
 #include "replay_launch_policy.hpp"
 #include "replay_timeline_policy.hpp"
 #include "smvm_input_route.hpp"
+#include "world_depth_capture.hpp"
 
 #include "campath_math.hpp"
 #include "pattern_scan.hpp"
@@ -29,8 +34,10 @@
 #include <shellapi.h>
 #include <windowsx.h>
 #include <d3d11.h>
+#include <d3d11_3.h>
 #include <d3dcompiler.h>
 #include <dxgi.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <array>
@@ -124,6 +131,9 @@ enum class SmvmPointerAction : std::uint16_t {
     x2_click = 5,
     wheel = 6,
     validate = 7,
+    left_down = 8,
+    left_up = 9,
+    move = 10,
 };
 
 enum class ManualInputFailure : std::uint32_t {
@@ -154,6 +164,7 @@ enum SmvmUiEventKind : std::uint32_t {
     smvm_ui_event_char = 2,  // a = codepoint
     smvm_ui_event_wheel = 3, // a = wheel delta
     smvm_ui_event_click = 4, // a = button index (down+up pair)
+    smvm_ui_event_mouse_button = 5, // a = button index, b = down
 };
 
 struct SmvmUiInputEvent final {
@@ -209,6 +220,11 @@ static_assert(!MenuMayClaimKeyDown(false, false));
 
 using PresentFunction = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
 using ResizeBuffersFunction = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
+using OmSetRenderTargetsFunction = void(STDMETHODCALLTYPE*)(
+    ID3D11DeviceContext*,
+    UINT,
+    ID3D11RenderTargetView* const*,
+    ID3D11DepthStencilView*);
 using CreateSwapchainFunction = HRESULT(STDMETHODCALLTYPE*)(
     IDXGIFactory*,
     IUnknown*,
@@ -315,10 +331,14 @@ struct OverlayState final {
     std::atomic<bool> emergency_restore_attempted{false};
     std::atomic<std::uint64_t> emergency_restore_last_attempt_ms{0};
     std::atomic<std::uint32_t> active_hooks{0};
+    std::atomic<std::uint32_t> active_depth_context_hooks{0};
     std::atomic<std::uint32_t> active_window_procedures{0};
     std::atomic<bool> factory_hook_reachable{false};
     std::atomic<bool> present_hook_reachable{false};
     std::atomic<bool> resize_hook_reachable{false};
+    std::atomic<bool> depth_context_hook_reachable{false};
+    std::atomic<bool> depth_context_hook_failed{false};
+    std::atomic<std::uint64_t> depth_context_hook_last_attempt_ms{0};
     std::atomic<std::int32_t> mouse_x{0};
     std::atomic<std::int32_t> mouse_y{0};
     std::atomic<std::int64_t> manual_look_right_delta{0};
@@ -352,9 +372,11 @@ struct OverlayState final {
     std::array<std::atomic<std::uint8_t>, 256> manual_key_routes{};
     std::array<std::atomic<bool>, 256> manual_poll_armed{};
     std::array<std::atomic<bool>, 256> manual_shortcut_queued{};
+    std::atomic<bool> recording_escape_queued{false};
     std::array<std::atomic<std::uint8_t>, 256> menu_key_routes{};
     std::array<std::atomic<std::uint8_t>, 256> menu_preheld_keys{};
     std::array<SmvmInputRoute, 5> menu_mouse_routes{};
+    std::atomic<std::uint32_t> forwarded_menu_mouse_buttons{0};
     std::atomic<std::uint64_t> last_wheel_action_ms{0};
     std::atomic<std::uint64_t> raw_wheel_consumed_ms{0};
     std::atomic<std::uint32_t> frame_microseconds{0};
@@ -383,6 +405,11 @@ struct OverlayState final {
     void** swapchain_hook_vtable{};
     PresentFunction original_present{};
     ResizeBuffersFunction original_resize{};
+    ID3D11DeviceContext* hooked_depth_context{};
+    void** depth_context_original_vtable{};
+    void** depth_context_hook_vtable{};
+    OmSetRenderTargetsFunction original_om_set_render_targets{};
+    std::size_t depth_context_vtable_entry_count{};
     IDXGISwapChain* target_swapchain{};
     HWND output_window{};
     WNDPROC original_window_proc{};
@@ -419,10 +446,17 @@ struct OverlayState final {
     ID3D11BlendState* blend_state{};
     ID3D11RasterizerState* rasterizer_state{};
     ID3D11DepthStencilState* depth_state{};
+    ID3D11DepthStencilState* fog_depth_state{};
     float viewport_width{};
     float viewport_height{};
     std::array<Vertex, kMaxVertices> vertices{};
     std::size_t vertex_count{};
+    std::uint64_t uploaded_vertex_hash{};
+    std::size_t uploaded_vertex_count{};
+    bool vertex_upload_valid{};
+    float uploaded_viewport_width{};
+    float uploaded_viewport_height{};
+    bool constant_upload_valid{};
 
     // Dear ImGui overlay UI (context owned by the render thread).
     ImGuiContext* imgui{};
@@ -435,6 +469,7 @@ struct OverlayState final {
     std::atomic<std::uint32_t> ui_events_read{0};
     std::array<bool, 5> imgui_button_state{};
     bool imgui_mouse_outside{true};
+    bool imgui_draw_data_valid{};
     std::chrono::steady_clock::time_point last_frame_time{};
     std::array<WorldLabel, kMaxCampathKeyframes> world_labels{};
     std::size_t world_label_count{};
@@ -460,6 +495,15 @@ private:
     std::atomic<std::uint32_t>& counter_;
 };
 
+[[nodiscard]] bool SyncDepthContextObservation(
+    ID3D11DeviceContext* context,
+    bool enabled,
+    std::uint32_t expected_width,
+    std::uint32_t expected_height) noexcept;
+[[nodiscard]] bool RemoveDepthContextObservation() noexcept;
+[[nodiscard]] bool AddRefObject(IUnknown* object) noexcept;
+void ReleaseObject(IUnknown*& object) noexcept;
+
 constexpr std::uint32_t Color(
     const std::uint8_t red,
     const std::uint8_t green,
@@ -476,6 +520,21 @@ constexpr std::uint32_t Color(
 constexpr auto kPathLine = Color(0xD2, 0xA4, 0x53, 150);
 constexpr auto kSelectedMarker = Color(0xD2, 0xA4, 0x53, 255);
 constexpr auto kMarker = Color(0x9A, 0x93, 0x8A, 200);
+
+[[nodiscard]] std::uint64_t HashVertexUpload(
+    const Vertex* vertices,
+    const std::size_t count) noexcept {
+    constexpr auto kOffsetBasis = 14695981039346656037ULL;
+    constexpr auto kPrime = 1099511628211ULL;
+    auto hash = kOffsetBasis;
+    const auto* bytes = reinterpret_cast<const unsigned char*>(vertices);
+    const auto byte_count = count * sizeof(Vertex);
+    for (std::size_t index = 0; index < byte_count; ++index) {
+        hash ^= bytes[index];
+        hash *= kPrime;
+    }
+    return hash;
+}
 
 [[nodiscard]] std::uint32_t ManualInputOverlayFlags() noexcept {
     const auto& state = g_overlay;
@@ -526,6 +585,24 @@ constexpr auto kMarker = Color(0x9A, 0x93, 0x8A, 200);
     return flags;
 }
 
+[[nodiscard]] std::uint32_t MovieCaptureOverlayFlags() noexcept {
+    const auto capture = GetWorldDepthCaptureStatus();
+    std::uint32_t flags = 0;
+    if (capture.active)
+        flags |= smvm_overlay_movie_recording_active;
+    if (capture.depth_available)
+        flags |= smvm_overlay_world_depth_available;
+    if (capture.avi_available)
+        flags |= smvm_overlay_movie_avi_available;
+    if (capture.failed)
+        flags |= smvm_overlay_world_depth_failed;
+    if (capture.incomplete)
+        flags |= smvm_overlay_world_depth_incomplete;
+    if (capture.frame_composition_ready)
+        flags |= smvm_overlay_movie_frame_ready;
+    return flags;
+}
+
 void PublishStatus(
     const SmvmRendererBackend backend,
     const SmvmRendererError error,
@@ -543,6 +620,7 @@ void PublishStatus(
         flags |= smvm_overlay_manual_mouse_observed;
     flags |= ManualInputOverlayFlags();
     flags |= PresentationHookOverlayFlags();
+    flags |= MovieCaptureOverlayFlags();
     if (frame_microseconds > 0)
         state.frame_microseconds.store(frame_microseconds, std::memory_order_release);
     state.last_renderer_error.store(static_cast<std::uint32_t>(error), std::memory_order_release);
@@ -740,6 +818,7 @@ void MarkRecordingProfileRecoveryActionQueued(std::uint64_t generation) noexcept
 [[nodiscard]] bool RequestOwnerPresentationMode(
     DeadlockUiMode target_mode,
     const SmvmSnapshotPayload& snapshot) noexcept;
+[[nodiscard]] bool ToggleMovieSetupMenu(const SmvmSnapshotPayload& snapshot) noexcept;
 void ReconcileRecordingProfileRecovery(const SmvmSnapshotPayload& snapshot) noexcept;
 
 [[nodiscard]] DeadlockUiMode PreviousVisibleMode() noexcept {
@@ -787,7 +866,12 @@ void SetLocalPresentationMode(const DeadlockUiMode mode) noexcept {
         }
         SetMenuOpen(false);
     }
-    const auto target = clean ? PreviousVisibleMode() : DeadlockUiMode::clean_footage;
+    const auto target = ShouldEnterCleanFootage(
+            clean,
+            state.presentation_mode.load(std::memory_order_acquire) ==
+                static_cast<std::uint32_t>(DeadlockUiMode::smvm_replay_ui))
+        ? DeadlockUiMode::clean_footage
+        : DeadlockUiMode::smvm_replay_ui;
     if (!RequestOwnerPresentationMode(target, snapshot)) {
         return false;
     }
@@ -1041,6 +1125,29 @@ void MarkRecordingProfileRecoveryActionQueued(const std::uint64_t generation) no
     // Present, window-procedure, and pipe threads only arm durable debt.
     // A queue-full or inverse-in-progress result is deferred, not dropped: the
     // generation/target above remains the durable owner intent for Reconcile.
+    return true;
+}
+
+[[nodiscard]] bool ToggleMovieSetupMenu(const SmvmSnapshotPayload& snapshot) noexcept {
+    auto& state = g_overlay;
+    const auto menu_open = state.menu_open.load(std::memory_order_acquire);
+    if (menu_open) {
+        SetMenuOpen(false);
+        return true;
+    }
+    if ((snapshot.flags & smvm_snapshot_replay_active) == 0)
+        return false;
+
+    // Tab is an unconditional route back to the first-party movie UI. This is
+    // intentionally based on the locally resolved presentation mode, rather
+    // than the potentially stale managed snapshot: F8, Clean Footage, a full
+    // action queue, or a reconnect can otherwise leave the timeline absent and
+    // make the old timeline-visible guard impossible to satisfy.
+    const auto current = static_cast<DeadlockUiMode>(
+        state.presentation_mode.load(std::memory_order_acquire));
+    if (current != DeadlockUiMode::smvm_replay_ui)
+        static_cast<void>(RequestOwnerPresentationMode(DeadlockUiMode::smvm_replay_ui, snapshot));
+    SetMenuOpen(true);
     return true;
 }
 
@@ -1608,6 +1715,7 @@ void AddLine(
         flags |= smvm_overlay_manual_mouse_observed;
     flags |= ManualInputOverlayFlags();
     flags |= PresentationHookOverlayFlags();
+    flags |= MovieCaptureOverlayFlags();
     return flags;
 }
 
@@ -2715,15 +2823,14 @@ void SuspendManualPointerForFocusLoss(const HWND window) noexcept {
     }
 
     if (!should_open) {
-        // A requested Free Camera without either a validated keyboard route or
-        // mouse route is not usable. Reopen the editor with a typed error and
-        // let Retry run the same deliberate transition again; camera
-        // composition remains owned and untouched throughout.
-        state.menu_open.store(true, std::memory_order_release);
+        // Closing Movie Setup is final. A failed Free Camera pointer reacquire
+        // remains visible through the typed HUD status and can be retried with
+        // F2, but it must never force this modal back over a finished take.
+        state.menu_open.store(false, std::memory_order_release);
         ClearManualInputReadiness();
         ResetManualMouseAcquisitionState(nullptr);
-        static_cast<void>(ApplyCursorStateOnWindowThread(true));
-        static_cast<void>(SetModalInputMaintenanceOnWindowThread(window, true));
+        static_cast<void>(SetModalInputMaintenanceOnWindowThread(window, false));
+        static_cast<void>(ApplyCursorStateOnWindowThread(false));
         if (state.manual_input_failure.load(std::memory_order_acquire) ==
             static_cast<std::uint32_t>(ManualInputFailure::none)) {
             state.manual_input_failure.store(
@@ -2794,6 +2901,8 @@ void ClearWindowProcedurePublication() noexcept {
     state.font_scale = 0.0F;
     state.imgui_button_state = {};
     state.imgui_mouse_outside = true;
+    state.imgui_draw_data_valid = false;
+    state.last_frame_time = {};
     state.ui_ready.store(true, std::memory_order_release);
     return true;
 }
@@ -2811,6 +2920,8 @@ void ShutdownImGui() noexcept {
     state.font_scale = 0.0F;
     state.imgui_button_state = {};
     state.imgui_mouse_outside = true;
+    state.imgui_draw_data_valid = false;
+    state.last_frame_time = {};
 }
 
 // Rasters the atlas at size * dpiScale * uiScale whenever either factor
@@ -2922,6 +3033,13 @@ void DrainUiEvents(const bool feed) noexcept {
                     if (event.a >= 0 && event.a < 5) {
                         io.AddMouseButtonEvent(event.a, true);
                         io.AddMouseButtonEvent(event.a, false);
+                        state.imgui_button_state[static_cast<std::size_t>(event.a)] = false;
+                    }
+                    break;
+                case smvm_ui_event_mouse_button:
+                    if (event.a >= 0 && event.a < 5) {
+                        io.AddMouseButtonEvent(event.a, event.b != 0);
+                        state.imgui_button_state[static_cast<std::size_t>(event.a)] = event.b != 0;
                     }
                     break;
                 default:
@@ -2960,6 +3078,17 @@ void FeedImguiMouse(const bool menu_open) noexcept {
         return;
     }
     state.imgui_mouse_outside = false;
+    // Sample the live system cursor on every rendered menu frame. Window
+    // messages and the launcher hook remain useful for short clicks, but a
+    // held drag must not depend on either asynchronous route surviving.
+    if (state.output_window != nullptr) {
+        POINT screen_point{};
+        if (GetCursorPos(&screen_point) &&
+            ScreenToClient(state.output_window, &screen_point)) {
+            state.mouse_x.store(screen_point.x, std::memory_order_relaxed);
+            state.mouse_y.store(screen_point.y, std::memory_order_relaxed);
+        }
+    }
     auto scale_x = 1.0F;
     auto scale_y = 1.0F;
     if (state.output_window != nullptr) {
@@ -2973,8 +3102,20 @@ void FeedImguiMouse(const bool menu_open) noexcept {
         static_cast<float>(state.mouse_x.load(std::memory_order_relaxed)) * scale_x,
         static_cast<float>(state.mouse_y.load(std::memory_order_relaxed)) * scale_y);
     for (auto button = 0; button < 5; ++button) {
-        const auto down =
+        constexpr std::array<int, 5> virtual_keys{
+            VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2};
+        const auto routed_down =
             state.menu_mouse_routes[static_cast<std::size_t>(button)].HasAny();
+        const auto forwarded_down =
+            (state.forwarded_menu_mouse_buttons.load(std::memory_order_acquire) &
+             (1u << static_cast<std::uint32_t>(button))) != 0;
+        const auto physical_down =
+            (GetAsyncKeyState(virtual_keys[static_cast<std::size_t>(button)]) & 0x8000) != 0;
+        // Direct physical state is sufficient for a held gesture. This keeps
+        // drag widgets alive even when the external fallback hook is delayed,
+        // removed by Windows, or collapses down/up into one render frame.
+        const auto down = ResolveMenuPointerButtonDown(
+            menu_open, routed_down, forwarded_down, physical_down);
         if (down != state.imgui_button_state[static_cast<std::size_t>(button)]) {
             io.AddMouseButtonEvent(button, down);
             state.imgui_button_state[static_cast<std::size_t>(button)] = down;
@@ -3001,8 +3142,10 @@ void DrawWorldLabels() noexcept {
     }
 }
 
-void ReleaseGraphicsResources() noexcept {
+[[nodiscard]] bool ReleaseGraphicsResources() noexcept {
     auto& state = g_overlay;
+    if (!RemoveDepthContextObservation())
+        return false;
     ShutdownImGui();
     ReleaseRenderTarget();
     SafeRelease(state.vertex_buffer);
@@ -3015,12 +3158,20 @@ void ReleaseGraphicsResources() noexcept {
     SafeRelease(state.blend_state);
     SafeRelease(state.rasterizer_state);
     SafeRelease(state.depth_state);
+    SafeRelease(state.fog_depth_state);
     SafeRelease(state.context);
     SafeRelease(state.device);
     state.target_swapchain = nullptr;
     state.viewport_width = 0.0F;
     state.viewport_height = 0.0F;
+    state.uploaded_vertex_hash = 0;
+    state.uploaded_vertex_count = 0;
+    state.vertex_upload_valid = false;
+    state.uploaded_viewport_width = 0.0F;
+    state.uploaded_viewport_height = 0.0F;
+    state.constant_upload_valid = false;
     state.ready.store(false, std::memory_order_release);
+    return true;
 }
 
 [[nodiscard]] bool ReleaseDeviceResources() noexcept {
@@ -3028,8 +3179,8 @@ void ReleaseGraphicsResources() noexcept {
         !WaitForCallbacksToDrain(g_overlay.active_window_procedures))
         return false;
     ClearWindowProcedurePublication();
-    ReleaseGraphicsResources();
-    return true;
+    NotifyWorldDepthDeviceLost();
+    return ReleaseGraphicsResources();
 }
 
 // The world-geometry pipeline only needs a solid white texel; all UI text is
@@ -3057,8 +3208,10 @@ struct VSInput { float2 position : POSITION; float2 uv : TEXCOORD0; float4 color
 struct PSInput { float4 position : SV_POSITION; float2 uv : TEXCOORD0; float4 color : COLOR0; };
 PSInput VSMain(VSInput input) {
     PSInput output;
+    float clipDepth = Padding.y > 0.5 ? input.uv.x : Padding.x;
     output.position = float4((input.position.x / Viewport.x) * 2.0 - 1.0,
-                             1.0 - (input.position.y / Viewport.y) * 2.0, 0.0, 1.0);
+                             1.0 - (input.position.y / Viewport.y) * 2.0,
+                             clipDepth, 1.0);
     output.uv = input.uv;
     output.color = input.color;
     return output;
@@ -3108,16 +3261,16 @@ float4 PSMain(PSInput input) : SV_TARGET { return input.color * Atlas.Sample(Atl
 
     D3D11_BUFFER_DESC vertex_description{};
     vertex_description.ByteWidth = static_cast<UINT>(sizeof(Vertex) * kMaxVertices);
-    vertex_description.Usage = D3D11_USAGE_DYNAMIC;
+    vertex_description.Usage = D3D11_USAGE_DEFAULT;
     vertex_description.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-    vertex_description.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    vertex_description.CPUAccessFlags = 0;
     if (FAILED(device->CreateBuffer(&vertex_description, nullptr, &g_overlay.vertex_buffer)))
         return false;
     D3D11_BUFFER_DESC constant_description{};
     constant_description.ByteWidth = 16;
-    constant_description.Usage = D3D11_USAGE_DYNAMIC;
+    constant_description.Usage = D3D11_USAGE_DEFAULT;
     constant_description.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-    constant_description.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    constant_description.CPUAccessFlags = 0;
     if (FAILED(device->CreateBuffer(&constant_description, nullptr, &g_overlay.constant_buffer)))
         return false;
 
@@ -3146,6 +3299,19 @@ float4 PSMain(PSInput input) : SV_TARGET { return input.color * Atlas.Sample(Atl
     depth_description.StencilEnable = FALSE;
     if (FAILED(device->CreateDepthStencilState(&depth_description, &g_overlay.depth_state)))
         return false;
+
+    D3D11_DEPTH_STENCIL_DESC fog_depth_description{};
+    fog_depth_description.DepthEnable = TRUE;
+    fog_depth_description.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+    // Deadlock's captured world surface is reversed-Z: greater source depth
+    // means a nearer threshold, so GREATER_EQUAL selects pixels beyond it.
+    fog_depth_description.DepthFunc = D3D11_COMPARISON_GREATER_EQUAL;
+    fog_depth_description.StencilEnable = FALSE;
+    if (FAILED(device->CreateDepthStencilState(
+            &fog_depth_description,
+            &g_overlay.fog_depth_state))) {
+        return false;
+    }
 
     D3D11_SAMPLER_DESC sampler_description{};
     sampler_description.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
@@ -3198,6 +3364,7 @@ void SetMenuOpen(const bool open) noexcept {
     // input or accumulated mouse/wheel impulse across the ownership boundary.
     ClearManualKeyboardReadiness();
     ResetSmvmManualInput();
+    state.forwarded_menu_mouse_buttons.store(0, std::memory_order_release);
     if (!open) {
         ResetBindingCaptureState();
         DiscardUiEvents();
@@ -3306,7 +3473,6 @@ void RequestManualPointerState(const bool enabled) noexcept {
                 static_cast<std::uint32_t>(ManualInputFailure::invalid_window_thread),
                 std::memory_order_release);
             state.manual_input_error.store(true, std::memory_order_release);
-            SetMenuOpen(true);
         }
         PublishStatus(SmvmRendererBackend::d3d11, SmvmRendererError::window_hook_failed);
     }
@@ -3653,6 +3819,9 @@ void UpdateCinematicStartGate(
         const auto space_is_up =
             state.key_down[VK_SPACE].load(std::memory_order_acquire) == 0;
         state.cinematic_space_released.store(space_is_up, std::memory_order_release);
+        // Keep the ready gate focused on starting the shot. Movie Setup opens
+        // only when the user asks for it with Tab; reaching Campath 1 must not
+        // interrupt the cinematic workflow with a modal.
     } else if (!ready) {
         state.cinematic_space_released.store(false, std::memory_order_release);
     }
@@ -3788,10 +3957,12 @@ void ResetConsumedReleaseRoutes() noexcept {
         routes.store(0, std::memory_order_release);
     for (auto& routes : g_overlay.menu_mouse_routes)
         routes.Reset();
+    g_overlay.forwarded_menu_mouse_buttons.store(0, std::memory_order_release);
     for (auto& routes : g_overlay.menu_preheld_keys)
         routes.store(0, std::memory_order_release);
     for (auto& queued : g_overlay.manual_shortcut_queued)
         queued.store(false, std::memory_order_release);
+    g_overlay.recording_escape_queued.store(false, std::memory_order_release);
 }
 
 [[nodiscard]] bool RouteManualKeyboardEvent(
@@ -3830,7 +4001,7 @@ void ResetConsumedReleaseRoutes() noexcept {
     }
     const auto action = ResolveManualCameraShortcut(
         InputMatchesKeyboard(snapshot.toggle_free_camera_key, key),
-        key == VK_ESCAPE,
+        key == VK_ESCAPE && CurrentModifiers(key) == 0,
         menu_open,
         (snapshot.flags & smvm_snapshot_replay_active) != 0,
         (snapshot.flags & smvm_snapshot_campath_playing) != 0,
@@ -3867,6 +4038,12 @@ void ResetConsumedReleaseRoutes() noexcept {
     UINT message,
     WPARAM wparam,
     const SmvmSnapshotPayload& snapshot) noexcept;
+
+[[nodiscard]] bool HandleRecordingEscape(
+    const SmvmSnapshotPayload& snapshot,
+    std::uint32_t key,
+    bool down,
+    std::uint8_t route) noexcept;
 
 void RefreshMenuCursorPosition(const HWND window) noexcept {
     POINT cursor{};
@@ -4017,6 +4194,9 @@ void RefreshMenuCursorPosition(const HWND window) noexcept {
         UpdateKeyState(key, down);
         if (HandleCinematicStartSpace(key, down, false, kMenuRawKeyRoute))
             return true;
+        if (has_snapshot &&
+            HandleRecordingEscape(snapshot, key, down, kMenuRawKeyRoute))
+            return true;
         const auto reserved_menu_binding = has_snapshot && ShouldReserveEditorMenuBinding(
             true,
             (snapshot.flags & smvm_snapshot_replay_active) != 0,
@@ -4044,6 +4224,26 @@ void RefreshMenuCursorPosition(const HWND window) noexcept {
                 TrackConsumedKeyDown(key, kMenuRawKeyRoute);
             else
                 static_cast<void>(ConsumeTrackedKeyUp(key, kMenuRawKeyRoute));
+            return true;
+        }
+        const auto playback_arrow_key = key == VK_LEFT || key == VK_RIGHT;
+        const auto playback_arrow_action = down
+            ? ResolvePlaybackSpeedShortcut(
+                key == VK_LEFT,
+                key == VK_RIGHT,
+                has_snapshot && (snapshot.flags & smvm_snapshot_replay_active) != 0,
+                menu_open,
+                false,
+                CurrentModifiers(key) == 0)
+            : PlaybackSpeedShortcutAction::none;
+        if (playback_arrow_action != PlaybackSpeedShortcutAction::none) {
+            // Reserve the raw route so Deadlock cannot act on the arrow. The
+            // corresponding legacy key-down performs the single queued step.
+            TrackConsumedKeyDown(key, kMenuRawKeyRoute);
+            return true;
+        }
+        if (!down && playback_arrow_key &&
+            ConsumeTrackedKeyUp(key, kMenuRawKeyRoute)) {
             return true;
         }
         const auto preheld_release = !down &&
@@ -4210,10 +4410,38 @@ void RefreshMenuCursorPosition(const HWND window) noexcept {
     return false;
 }
 
+[[nodiscard]] bool InputMatchesPlacementMouse(
+    const std::uint32_t binding,
+    const UINT message,
+    const WPARAM wparam) noexcept {
+    const auto required_modifiers =
+        (binding & kSmvmInputModifierMask) >> 16;
+    if (!EditorPlacementModifiersMatch(required_modifiers, CurrentModifiers()))
+        return false;
+    const auto base = binding & kSmvmInputBaseMask;
+    if (base == static_cast<std::uint32_t>(SmvmInputCode::mouse_middle))
+        return message == WM_MBUTTONDOWN;
+    if (base == static_cast<std::uint32_t>(SmvmInputCode::mouse_x1))
+        return message == WM_XBUTTONDOWN && GET_XBUTTON_WPARAM(wparam) == XBUTTON1;
+    if (base == static_cast<std::uint32_t>(SmvmInputCode::mouse_x2))
+        return message == WM_XBUTTONDOWN && GET_XBUTTON_WPARAM(wparam) == XBUTTON2;
+    if (base == static_cast<std::uint32_t>(SmvmInputCode::wheel_up))
+        return message == WM_MOUSEWHEEL && GET_WHEEL_DELTA_WPARAM(wparam) > 0;
+    if (base == static_cast<std::uint32_t>(SmvmInputCode::wheel_down))
+        return message == WM_MOUSEWHEEL && GET_WHEEL_DELTA_WPARAM(wparam) < 0;
+    return false;
+}
+
 [[nodiscard]] bool HandleMovieMakerKeyboardShortcut(
     const std::uint32_t key,
+    const bool menu_open,
     const SmvmSnapshotPayload& snapshot) noexcept {
-    const auto fixed_pause_key = key == 'N' && CurrentModifiers(key) == 0;
+    // The Tab surface owns ordinary typing and editing. Global movie-maker
+    // shortcuts resume only after it closes.
+    if (menu_open)
+        return false;
+    const auto fixed_pause_key = key == 'N' &&
+        PlainReplayPauseModifiersMatch(CurrentModifiers(key));
     const auto decrease = key == VK_OEM_MINUS || key == VK_SUBTRACT;
     const auto increase = key == VK_OEM_PLUS || key == VK_ADD;
     const auto action = ResolveMovieMakerShortcut(
@@ -4240,6 +4468,75 @@ void RefreshMenuCursorPosition(const HWND window) noexcept {
             action == MovieMakerShortcutAction::increase_camera_speed));
 }
 
+[[nodiscard]] bool HandlePlaybackSpeedKeyboardShortcut(
+    const std::uint32_t key,
+    const bool repeated,
+    const bool menu_open,
+    const bool text_input_owns_keyboard,
+    const SmvmSnapshotPayload& snapshot) noexcept {
+    const auto action = ResolvePlaybackSpeedShortcut(
+        key == VK_LEFT,
+        key == VK_RIGHT,
+        (snapshot.flags & smvm_snapshot_replay_active) != 0,
+        menu_open,
+        text_input_owns_keyboard,
+        CurrentModifiers(key) == 0);
+    if (action == PlaybackSpeedShortcutAction::none)
+        return false;
+
+    // A held arrow owns every repeat packet but advances only once per press.
+    // This prevents either the raw or legacy route from leaking into Deadlock.
+    if (!repeated) {
+        const auto target = StepPlaybackSpeedPreset(snapshot.timescale, action);
+        if (target.has_value()) {
+            static_cast<void>(QueueActionForSnapshot(
+                snapshot,
+                SmvmActionType::set_timescale,
+                -1,
+                -1,
+                *target));
+        }
+    }
+    return true;
+}
+
+[[nodiscard]] bool HandleRecordingEscape(
+    const SmvmSnapshotPayload& snapshot,
+    const std::uint32_t key,
+    const bool down,
+    const std::uint8_t route) noexcept {
+    if (key != VK_ESCAPE)
+        return false;
+
+    auto& queued = g_overlay.recording_escape_queued;
+    if (!down) {
+        const auto was_queued = queued.exchange(false, std::memory_order_acq_rel);
+        const auto was_consumed = ConsumeTrackedKeyUp(key, route);
+        return was_queued || was_consumed;
+    }
+
+    const auto action = ResolveRecordingEscapeShortcut(
+        true,
+        CurrentModifiers(key) == 0,
+        (snapshot.movie_recording_flags & movie_recording_armed) != 0,
+        (snapshot.movie_recording_flags & movie_recording_active) != 0);
+    if (action == RecordingEscapeAction::none)
+        return false;
+
+    TrackConsumedKeyDown(key, route);
+    if (queued.load(std::memory_order_acquire))
+        return true;
+
+    const auto action_type = action == RecordingEscapeAction::stop_active_take
+        ? SmvmActionType::stop_campath
+        : SmvmActionType::stop_movie_recording;
+    if (QueueActionForSnapshot(snapshot, action_type)) {
+        queued.store(true, std::memory_order_release);
+        SetMenuOpen(false);
+    }
+    return true;
+}
+
 [[nodiscard]] bool HandleSmvmMouseBinding(
     const UINT message,
     const WPARAM wparam,
@@ -4247,15 +4544,12 @@ void RefreshMenuCursorPosition(const HWND window) noexcept {
     const auto menu_open = g_overlay.menu_open.load(std::memory_order_acquire);
     if (InputMatchesMouse(snapshot.menu_key, message, wparam) &&
         ((snapshot.flags & smvm_snapshot_replay_active) != 0 || menu_open)) {
-        if (g_overlay.clean_view.load(std::memory_order_acquire))
-            static_cast<void>(ToggleCleanFootage(true, snapshot));
-        else
-            SetMenuOpen(!menu_open);
+        static_cast<void>(ToggleMovieSetupMenu(snapshot));
         return true;
     }
     if (menu_open)
         return false;
-    if (InputMatchesMouse(snapshot.add_key, message, wparam)) {
+    if (InputMatchesPlacementMouse(snapshot.add_key, message, wparam)) {
         QueueCaptureDiagnostic(snapshot, SmvmCaptureStage::input_observed);
         QueueCaptureDiagnostic(snapshot, SmvmCaptureStage::binding_matched);
         const auto rejection = CaptureRejectionFromSnapshot(snapshot);
@@ -4324,7 +4618,6 @@ LRESULT CALLBACK SmvmWindowProcedure(
         const auto transition_ok = ApplyManualPointerStateOnWindowThread(window, enabled);
         if (enabled && !transition_ok) {
             state.manual_input_error.store(true, std::memory_order_release);
-            SetMenuOpen(true);
         }
         PublishStatus(
             SmvmRendererBackend::d3d11,
@@ -4355,17 +4648,34 @@ LRESULT CALLBACK SmvmWindowProcedure(
             !state.menu_open.load(std::memory_order_acquire))
             return FALSE;
 
+        const auto action = static_cast<SmvmPointerAction>(LOWORD(wparam));
         POINT client_point{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
         RECT client_rect{};
-        if (!ScreenToClient(window, &client_point) || !GetClientRect(window, &client_rect) ||
-            client_point.x < client_rect.left || client_point.x >= client_rect.right ||
-            client_point.y < client_rect.top || client_point.y >= client_rect.bottom)
+        if (!ScreenToClient(window, &client_point) || !GetClientRect(window, &client_rect))
+            return FALSE;
+        const auto point_in_client =
+            client_point.x >= client_rect.left && client_point.x < client_rect.right &&
+            client_point.y >= client_rect.top && client_point.y < client_rect.bottom;
+        if (!point_in_client && action != SmvmPointerAction::left_up &&
+            action != SmvmPointerAction::move)
             return FALSE;
 
         state.mouse_x.store(client_point.x, std::memory_order_relaxed);
         state.mouse_y.store(client_point.y, std::memory_order_relaxed);
-        const auto action = static_cast<SmvmPointerAction>(LOWORD(wparam));
         if (action == SmvmPointerAction::validate)
+            return TRUE;
+
+        if (action == SmvmPointerAction::left_down) {
+            state.forwarded_menu_mouse_buttons.fetch_or(1u, std::memory_order_acq_rel);
+            PushUiEvent(smvm_ui_event_mouse_button, 0, 1);
+            return TRUE;
+        }
+        if (action == SmvmPointerAction::left_up) {
+            state.forwarded_menu_mouse_buttons.fetch_and(~1u, std::memory_order_acq_rel);
+            PushUiEvent(smvm_ui_event_mouse_button, 0, 0);
+            return TRUE;
+        }
+        if (action == SmvmPointerAction::move)
             return TRUE;
 
         SmvmSnapshotPayload pointer_snapshot{};
@@ -4552,6 +4862,15 @@ LRESULT CALLBACK SmvmWindowProcedure(
             kMenuWindowKeyRoute)) {
         return 0;
     }
+    if ((key_down_message || message == WM_KEYUP || message == WM_SYSKEYUP) &&
+        has_snapshot &&
+        HandleRecordingEscape(
+            snapshot,
+            normalized_key,
+            key_down_message,
+            kMenuWindowKeyRoute)) {
+        return 0;
+    }
 
     const auto window_key_down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
     const auto window_key_up = message == WM_KEYUP || message == WM_SYSKEYUP;
@@ -4634,6 +4953,16 @@ LRESULT CALLBACK SmvmWindowProcedure(
     if ((window_mouse_down || window_mouse_up) && menu_open) {
         state.mouse_x.store(GET_X_LPARAM(lparam), std::memory_order_relaxed);
         state.mouse_y.store(GET_Y_LPARAM(lparam), std::memory_order_relaxed);
+        // Feed the same real window-message lifecycle used by conventional
+        // in-process ImGui menus. The render-thread ring keeps ImGui calls off
+        // the window thread, while preserving a held button across frames.
+        const auto button = WindowMouseButtonIndex(message, wparam);
+        if (button >= 0 && UiFeedingAllowed(menu_open)) {
+            PushUiEvent(
+                smvm_ui_event_mouse_button,
+                button,
+                window_mouse_down ? 1 : 0);
+        }
     }
 
     if (has_snapshot && menu_open &&
@@ -4652,8 +4981,16 @@ LRESULT CALLBACK SmvmWindowProcedure(
         return message == WM_XBUTTONDOWN ? TRUE : 0;
     }
 
-    if (message == WM_LBUTTONDOWN && menu_open)
+    if (message == WM_LBUTTONDOWN && menu_open) {
+        SetCapture(window);
         return 0;
+    }
+    if (message == WM_LBUTTONUP && menu_open) {
+        static_cast<void>(ConsumeTrackedMouseUp(message, wparam, kMenuWindowKeyRoute));
+        if (GetCapture() == window)
+            ReleaseCapture();
+        return 0;
+    }
     if (message == WM_RBUTTONDOWN && menu_open)
         return 0;
     if ((message == WM_MBUTTONDOWN || message == WM_XBUTTONDOWN) && menu_open)
@@ -4734,15 +5071,12 @@ LRESULT CALLBACK SmvmWindowProcedure(
             return 0;
         }
         if (!repeated && InputMatchesKeyboard(snapshot.menu_key, normalized_key) &&
-            (timeline_visible || menu_open)) {
+            ((snapshot.flags & smvm_snapshot_replay_active) != 0 || menu_open)) {
             TrackConsumedKeyDown(normalized_key, kMenuWindowKeyRoute);
-            if (state.clean_view.load(std::memory_order_acquire))
-                static_cast<void>(ToggleCleanFootage(true, snapshot));
-            else
-                SetMenuOpen(!menu_open);
+            static_cast<void>(ToggleMovieSetupMenu(snapshot));
             return 0;
         }
-        if (!repeated && HandleMovieMakerKeyboardShortcut(normalized_key, snapshot)) {
+        if (!repeated && HandleMovieMakerKeyboardShortcut(normalized_key, menu_open, snapshot)) {
             TrackConsumedKeyDown(normalized_key, kMenuWindowKeyRoute);
             return 0;
         }
@@ -4751,6 +5085,15 @@ LRESULT CALLBACK SmvmWindowProcedure(
             // unless a binding capture owns the keyboard right now.
             if (UiFeedingAllowed(menu_open))
                 PushUiEvent(smvm_ui_event_key, static_cast<std::int32_t>(normalized_key), 1);
+            return 0;
+        }
+        if (HandlePlaybackSpeedKeyboardShortcut(
+                normalized_key,
+                repeated,
+                menu_open,
+                replay_tick_editor_owns_keyboard,
+                snapshot)) {
+            TrackConsumedKeyDown(normalized_key, kMenuWindowKeyRoute);
             return 0;
         }
         if (HandleManualCameraShortcut(
@@ -5026,20 +5369,236 @@ LRESULT CALLBACK SmvmWindowProcedure(
     return true;
 }
 
+[[nodiscard]] bool DrawCustomFog(const SmvmSnapshotPayload& snapshot) noexcept {
+    auto& state = g_overlay;
+    if ((snapshot.movie_tool_flags & movie_tool_custom_fog) == 0 ||
+        state.context == nullptr || state.render_target == nullptr ||
+        state.vertex_buffer == nullptr || state.constant_buffer == nullptr ||
+        state.fog_depth_state == nullptr || state.viewport_width <= 0.0F ||
+        state.viewport_height <= 0.0F) {
+        return true;
+    }
+
+    const auto width = static_cast<std::uint32_t>(state.viewport_width);
+    const auto height = static_cast<std::uint32_t>(state.viewport_height);
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> depth_view{};
+    depth_view.Attach(AcquireObservedWorldDepthView(width, height));
+    if (depth_view == nullptr)
+        return true;
+
+    const auto layers = BuildCustomFogLayers(
+        static_cast<float>(snapshot.custom_fog_start),
+        static_cast<float>(snapshot.custom_fog_end),
+        static_cast<float>(snapshot.custom_fog_max_density),
+        static_cast<float>(snapshot.custom_fog_exponent));
+    std::array<Vertex, kCustomFogLayerCount * 6> vertices{};
+    auto vertex_count = std::size_t{0};
+    const auto red = static_cast<std::uint8_t>(
+        (snapshot.custom_fog_color_rgb >> 16) & 0xFFu);
+    const auto green = static_cast<std::uint8_t>(
+        (snapshot.custom_fog_color_rgb >> 8) & 0xFFu);
+    const auto blue = static_cast<std::uint8_t>(snapshot.custom_fog_color_rgb & 0xFFu);
+    for (const auto& layer : layers) {
+        const auto alpha = static_cast<std::uint8_t>(std::clamp(
+            std::lround(layer.incremental_alpha * 255.0F),
+            0L,
+            255L));
+        if (alpha == 0)
+            continue;
+        const auto color = Color(red, green, blue, alpha);
+        const auto depth = layer.device_depth;
+        const auto right = state.viewport_width;
+        const auto bottom = state.viewport_height;
+        vertices[vertex_count++] = Vertex{0.0F, 0.0F, depth, 0.5F, color};
+        vertices[vertex_count++] = Vertex{right, 0.0F, depth, 0.5F, color};
+        vertices[vertex_count++] = Vertex{right, bottom, depth, 0.5F, color};
+        vertices[vertex_count++] = Vertex{0.0F, 0.0F, depth, 0.5F, color};
+        vertices[vertex_count++] = Vertex{right, bottom, depth, 0.5F, color};
+        vertices[vertex_count++] = Vertex{0.0F, bottom, depth, 0.5F, color};
+    }
+    if (vertex_count == 0)
+        return true;
+
+    const auto vertex_bytes = static_cast<UINT>(vertex_count * sizeof(Vertex));
+    const D3D11_BOX vertex_box{0, 0, 0, vertex_bytes, 1, 1};
+    state.context->UpdateSubresource(
+        state.vertex_buffer,
+        0,
+        &vertex_box,
+        vertices.data(),
+        0,
+        0);
+    const std::array<float, 4> constants{
+        state.viewport_width,
+        state.viewport_height,
+        0.0F,
+        1.0F,
+    };
+    state.context->UpdateSubresource(
+        state.constant_buffer,
+        0,
+        nullptr,
+        constants.data(),
+        0,
+        0);
+
+    SavedD3D11State saved{};
+    SavePipelineState(state.context, saved);
+    const D3D11_VIEWPORT viewport{
+        0.0F,
+        0.0F,
+        state.viewport_width,
+        state.viewport_height,
+        0.0F,
+        1.0F,
+    };
+    state.context->RSSetViewports(1, &viewport);
+    auto* depth = depth_view.Get();
+    state.context->OMSetRenderTargets(1, &state.render_target, depth);
+    constexpr std::array<FLOAT, 4> blend_factor{};
+    state.context->OMSetBlendState(state.blend_state, blend_factor.data(), 0xFFFFFFFFu);
+    state.context->OMSetDepthStencilState(state.fog_depth_state, 0);
+    state.context->RSSetState(state.rasterizer_state);
+    const UINT stride = sizeof(Vertex);
+    constexpr UINT offset = 0;
+    state.context->IASetInputLayout(state.input_layout);
+    state.context->IASetVertexBuffers(0, 1, &state.vertex_buffer, &stride, &offset);
+    state.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    state.context->VSSetShader(state.vertex_shader, nullptr, 0);
+    state.context->VSSetConstantBuffers(0, 1, &state.constant_buffer);
+    state.context->PSSetShader(state.pixel_shader, nullptr, 0);
+    state.context->PSSetShaderResources(0, 1, &state.atlas_view);
+    state.context->PSSetSamplers(0, 1, &state.sampler);
+    state.context->Draw(static_cast<UINT>(vertex_count), 0);
+    RestorePipelineState(state.context, saved);
+
+    // The fog draw shares the small SMVM upload buffers. Force the later path
+    // and UI geometry to restore their own data instead of trusting its cache.
+    state.vertex_upload_valid = false;
+    state.constant_upload_valid = false;
+    return true;
+}
+
+[[nodiscard]] bool DrawGreenscreenBackground(const SmvmSnapshotPayload& snapshot) noexcept {
+    auto& state = g_overlay;
+    if (snapshot.greenscreen_mode != GreenscreenMode::free_camera)
+        return true;
+    if (state.context == nullptr || state.render_target == nullptr ||
+        state.vertex_buffer == nullptr || state.constant_buffer == nullptr ||
+        state.fog_depth_state == nullptr || state.viewport_width <= 0.0F ||
+        state.viewport_height <= 0.0F) {
+        return false;
+    }
+
+    const auto width = static_cast<std::uint32_t>(state.viewport_width);
+    const auto height = static_cast<std::uint32_t>(state.viewport_height);
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> depth_view{};
+    depth_view.Attach(AcquireObservedWorldDepthView(width, height));
+    if (depth_view == nullptr)
+        return false;
+
+    const auto red = static_cast<std::uint8_t>((snapshot.greenscreen_color_rgb >> 16) & 0xFFu);
+    const auto green = static_cast<std::uint8_t>((snapshot.greenscreen_color_rgb >> 8) & 0xFFu);
+    const auto blue = static_cast<std::uint8_t>(snapshot.greenscreen_color_rgb & 0xFFu);
+    const auto color = Color(red, green, blue, 255);
+    // Use the same bounded tolerance as the writer-side depth key. Exact zero
+    // failed to rasterize on the owner's retained Deadlock DSV and left the
+    // live plate black even though the draw call itself succeeded.
+    constexpr auto clear_depth = kGreenscreenFarDepthTolerance;
+    const auto right = state.viewport_width;
+    const auto bottom = state.viewport_height;
+    const std::array<Vertex, 6> vertices{
+        Vertex{0.0F, 0.0F, clear_depth, 0.5F, color},
+        Vertex{right, 0.0F, clear_depth, 0.5F, color},
+        Vertex{right, bottom, clear_depth, 0.5F, color},
+        Vertex{0.0F, 0.0F, clear_depth, 0.5F, color},
+        Vertex{right, bottom, clear_depth, 0.5F, color},
+        Vertex{0.0F, bottom, clear_depth, 0.5F, color},
+    };
+    const auto vertex_bytes = static_cast<UINT>(vertices.size() * sizeof(Vertex));
+    const D3D11_BOX vertex_box{0, 0, 0, vertex_bytes, 1, 1};
+    state.context->UpdateSubresource(
+        state.vertex_buffer, 0, &vertex_box, vertices.data(), 0, 0);
+    const std::array<float, 4> constants{
+        state.viewport_width,
+        state.viewport_height,
+        0.0F,
+        1.0F,
+    };
+    state.context->UpdateSubresource(
+        state.constant_buffer, 0, nullptr, constants.data(), 0, 0);
+
+    SavedD3D11State saved{};
+    SavePipelineState(state.context, saved);
+    const D3D11_VIEWPORT viewport{
+        0.0F, 0.0F, state.viewport_width, state.viewport_height, 0.0F, 1.0F};
+    state.context->RSSetViewports(1, &viewport);
+    auto* depth = depth_view.Get();
+    state.context->OMSetRenderTargets(1, &state.render_target, depth);
+    constexpr std::array<FLOAT, 4> blend_factor{};
+    state.context->OMSetBlendState(state.blend_state, blend_factor.data(), 0xFFFFFFFFu);
+    // Deadlock uses reversed-Z. A source depth of zero with GREATER_EQUAL
+    // paints only the untouched far plane, preserving actors and props that
+    // wrote nearer depth after r_drawworld/r_drawskybox were disabled.
+    state.context->OMSetDepthStencilState(state.fog_depth_state, 0);
+    state.context->RSSetState(state.rasterizer_state);
+    const UINT stride = sizeof(Vertex);
+    constexpr UINT offset = 0;
+    state.context->IASetInputLayout(state.input_layout);
+    state.context->IASetVertexBuffers(0, 1, &state.vertex_buffer, &stride, &offset);
+    state.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    state.context->VSSetShader(state.vertex_shader, nullptr, 0);
+    state.context->VSSetConstantBuffers(0, 1, &state.constant_buffer);
+    state.context->PSSetShader(state.pixel_shader, nullptr, 0);
+    state.context->PSSetShaderResources(0, 1, &state.atlas_view);
+    state.context->PSSetSamplers(0, 1, &state.sampler);
+    state.context->Draw(static_cast<UINT>(vertices.size()), 0);
+    RestorePipelineState(state.context, saved);
+    state.vertex_upload_valid = false;
+    state.constant_upload_valid = false;
+    return true;
+}
+
 [[nodiscard]] bool DrawVertices() noexcept {
     auto& state = g_overlay;
     if (state.vertex_count == 0 || state.context == nullptr || state.render_target == nullptr)
         return true;
-    D3D11_MAPPED_SUBRESOURCE mapped{};
-    if (FAILED(state.context->Map(state.vertex_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
-        return false;
-    std::memcpy(mapped.pData, state.vertices.data(), state.vertex_count * sizeof(Vertex));
-    state.context->Unmap(state.vertex_buffer, 0);
-    if (FAILED(state.context->Map(state.constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
-        return false;
-    const std::array<float, 4> constants{state.viewport_width, state.viewport_height, 0.0F, 0.0F};
-    std::memcpy(mapped.pData, constants.data(), sizeof(constants));
-    state.context->Unmap(state.constant_buffer, 0);
+    const auto vertex_hash = HashVertexUpload(state.vertices.data(), state.vertex_count);
+    if (!state.vertex_upload_valid ||
+        state.uploaded_vertex_count != state.vertex_count ||
+        state.uploaded_vertex_hash != vertex_hash) {
+        const auto vertex_bytes = static_cast<UINT>(state.vertex_count * sizeof(Vertex));
+        const D3D11_BOX vertex_box{0, 0, 0, vertex_bytes, 1, 1};
+        state.context->UpdateSubresource(
+            state.vertex_buffer,
+            0,
+            &vertex_box,
+            state.vertices.data(),
+            0,
+            0);
+        state.uploaded_vertex_hash = vertex_hash;
+        state.uploaded_vertex_count = state.vertex_count;
+        state.vertex_upload_valid = true;
+    }
+    if (!state.constant_upload_valid ||
+        state.uploaded_viewport_width != state.viewport_width ||
+        state.uploaded_viewport_height != state.viewport_height) {
+        const std::array<float, 4> constants{
+            state.viewport_width,
+            state.viewport_height,
+            0.0F,
+            0.0F};
+        state.context->UpdateSubresource(
+            state.constant_buffer,
+            0,
+            nullptr,
+            constants.data(),
+            0,
+            0);
+        state.uploaded_viewport_width = state.viewport_width;
+        state.uploaded_viewport_height = state.viewport_height;
+        state.constant_upload_valid = true;
+    }
 
     SavedD3D11State saved{};
     SavePipelineState(state.context, saved);
@@ -5077,6 +5636,91 @@ LRESULT CALLBACK SmvmWindowProcedure(
     }
     SmvmSnapshotPayload snapshot{};
     const auto snapshot_read = ReadSnapshot(snapshot);
+    const auto recording_active = snapshot_read &&
+        (snapshot.flags & smvm_snapshot_internal_enabled) != 0 &&
+        (snapshot.flags & smvm_snapshot_replay_active) != 0 &&
+        (snapshot.movie_recording_flags & movie_recording_active) != 0;
+    const auto recording_armed = snapshot_read &&
+        (snapshot.flags & smvm_snapshot_internal_enabled) != 0 &&
+        (snapshot.flags & smvm_snapshot_replay_active) != 0 &&
+        (snapshot.movie_recording_flags & movie_recording_armed) != 0;
+    const auto custom_fog_active = snapshot_read &&
+        (snapshot.flags & smvm_snapshot_internal_enabled) != 0 &&
+        (snapshot.flags & smvm_snapshot_replay_active) != 0 &&
+        (snapshot.movie_tool_flags & movie_tool_custom_fog) != 0;
+    const auto greenscreen_active = snapshot_read &&
+        (snapshot.flags & smvm_snapshot_internal_enabled) != 0 &&
+        (snapshot.flags & smvm_snapshot_replay_active) != 0 &&
+        snapshot.greenscreen_mode == GreenscreenMode::free_camera;
+    constexpr auto kDepthPassMask =
+        movie_capture_pass_world_depth_pfm |
+        movie_capture_pass_world_depth_avi |
+        movie_capture_pass_greenscreen_free_camera;
+    const auto observe_depth = custom_fog_active || greenscreen_active ||
+        (snapshot_read && NeedsDepthContextObservation(
+            recording_armed,
+            recording_active,
+            snapshot.movie_compositing_stage != MovieCompositingStage::none,
+            snapshot.movie_capture_pass_flags,
+            snapshot.movie_active_pass_flags,
+            kDepthPassMask));
+    static_cast<void>(SyncDepthContextObservation(
+        state.context,
+        observe_depth,
+        static_cast<std::uint32_t>(std::max(0.0F, state.viewport_width)),
+        static_cast<std::uint32_t>(std::max(0.0F, state.viewport_height))));
+    const auto movie_recording_name_length = recording_active
+        ? std::strlen(snapshot.movie_recording_name.data())
+        : std::size_t{0};
+    CameraSample rendered_camera{};
+    std::int64_t rendered_replay_tick{-1};
+    std::uint64_t rendered_frame_sequence{};
+    const auto has_rendered_camera = state.callbacks.read_rendered_camera != nullptr &&
+        state.callbacks.read_rendered_camera(
+            state.callbacks.context,
+            rendered_camera,
+            rendered_replay_tick,
+            rendered_frame_sequence);
+    const auto movie_output_dimensions = ResolveMovieOutputDimensions(
+        snapshot.movie_output_resolution,
+        static_cast<std::uint32_t>(std::max(0.0F, state.viewport_width)),
+        static_cast<std::uint32_t>(std::max(0.0F, state.viewport_height)));
+    SyncMovieCapture({
+        recording_active,
+        std::string_view(snapshot.movie_recording_name.data(), movie_recording_name_length),
+        std::string_view(
+            snapshot.movie_capture_path.data(),
+            std::strlen(snapshot.movie_capture_path.data())),
+        snapshot.movie_recording_fps,
+        static_cast<std::uint32_t>(snapshot.movie_output_mode),
+        snapshot.movie_active_pass_flags,
+        movie_output_dimensions.width,
+        movie_output_dimensions.height,
+        snapshot.timescale > 0.0 && std::isfinite(snapshot.timescale)
+            ? snapshot.timescale
+            : 1.0,
+        greenscreen_active,
+        snapshot.movie_capture_audio != 0,
+        snapshot.greenscreen_color_rgb,
+        snapshot.movie_expected_frame_count,
+    });
+    // Green and fog are mutually exclusive compositions. Both run before the
+    // pass writer so the live preview is exactly what its AVI contains.
+    auto movie_frame_ready = true;
+    if (greenscreen_active)
+        movie_frame_ready = DrawGreenscreenBackground(snapshot);
+    else if (custom_fog_active)
+        static_cast<void>(DrawCustomFog(snapshot));
+    SetMovieFrameCompositionReady(movie_frame_ready);
+    if (movie_frame_ready) {
+        CaptureMovieFrame(
+            state.device,
+            state.context,
+            swapchain,
+            has_rendered_camera ? rendered_replay_tick : -1,
+            has_rendered_camera ? &rendered_camera : nullptr,
+            has_rendered_camera ? rendered_frame_sequence : 0);
+    }
     smvm_ui::ObserveReplaySession(snapshot_read ? &snapshot : nullptr, state.ui);
     if (!snapshot_read && ShouldNotifyRecordingVisualHostDisconnectOnSnapshotAbsence(
             state.recording_profile_snapshot_observed.load(std::memory_order_acquire)))
@@ -5115,9 +5759,6 @@ LRESULT CALLBACK SmvmWindowProcedure(
         manual_camera_usable &&
         !state.replay_tick_input_active.load(std::memory_order_acquire));
 
-    CameraSample rendered_camera{};
-    const auto has_rendered_camera = state.callbacks.read_rendered_camera != nullptr &&
-        state.callbacks.read_rendered_camera(state.callbacks.context, rendered_camera);
     const auto view_camera = SelectRenderCamera(
         snapshot.camera, rendered_camera, has_rendered_camera);
 
@@ -5127,13 +5768,15 @@ LRESULT CALLBACK SmvmWindowProcedure(
     UpdateCinematicStartGate(snapshot, has_path, path_header, keys.data());
     const auto menu_open = state.menu_open.load(std::memory_order_acquire);
     const auto clean_view = state.clean_view.load(std::memory_order_acquire);
+    const auto replay_seek_in_progress =
+        (snapshot.flags & smvm_snapshot_replay_seek_in_progress) != 0;
     state.vertex_count = 0;
     state.world_label_count = 0;
 
     // Camera markers and their connecting path are part of the simplified
     // placement workflow. Hide them during playback so Play Cinematic shows
     // the composed shot rather than editor guides.
-    if (ShouldDrawCampathPlacementGuides(
+    if (!replay_seek_in_progress && ShouldDrawCampathPlacementGuides(
             snapshot.deadlock_ui_mode == DeadlockUiMode::smvm_replay_ui,
             clean_view,
             has_path,
@@ -5143,67 +5786,107 @@ LRESULT CALLBACK SmvmWindowProcedure(
     }
 
     const auto timeline_visible = !clean_view && IsReplayTimelineVisible(snapshot);
-    const auto want_ui = timeline_visible;
+    // Keep the menu renderable as an independent recovery surface even when
+    // the normal timeline presentation is currently hidden.
+    const auto want_ui = timeline_visible || menu_open || recording_active;
     auto imgui_rendered = false;
-    if (!clean_view && want_ui && state.imgui != nullptr &&
+    if ((!clean_view || menu_open || recording_active) && want_ui && state.imgui != nullptr &&
         state.ui_ready.load(std::memory_order_acquire)) {
         ImGui::SetCurrentContext(state.imgui);
-        EnsureUiScale(snapshot);
-        auto& io = ImGui::GetIO();
-        io.DisplaySize = ImVec2(state.viewport_width, state.viewport_height);
         const auto now = std::chrono::steady_clock::now();
-        if (state.last_frame_time.time_since_epoch().count() == 0) {
-            io.DeltaTime = 1.0F / 60.0F;
-        } else {
-            const auto delta = std::chrono::duration<float>(now - state.last_frame_time).count();
-            io.DeltaTime = std::clamp(delta, 1.0F / 240.0F, 0.25F);
-        }
-        state.last_frame_time = now;
-        DrainUiEvents(menu_open);
-        FeedImguiMouse(menu_open && timeline_visible);
-        ImGui_ImplDX11_NewFrame();
-        ImGui::NewFrame();
+        const auto ui_interval = replay_seek_in_progress || recording_active
+            ? std::chrono::milliseconds(33)
+            : std::chrono::milliseconds(16);
+        const auto ui_frame_due = !state.imgui_draw_data_valid ||
+            state.last_frame_time.time_since_epoch().count() == 0 ||
+            now - state.last_frame_time >= ui_interval;
+        if (ui_frame_due) {
+            EnsureUiScale(snapshot);
+            auto& io = ImGui::GetIO();
+            io.DisplaySize = ImVec2(state.viewport_width, state.viewport_height);
+            if (state.last_frame_time.time_since_epoch().count() == 0) {
+                io.DeltaTime = 1.0F / 60.0F;
+            } else {
+                const auto delta = std::chrono::duration<float>(
+                    now - state.last_frame_time).count();
+                io.DeltaTime = std::clamp(delta, 1.0F / 240.0F, 0.25F);
+            }
+            state.last_frame_time = now;
+            DrainUiEvents(menu_open);
+            FeedImguiMouse(menu_open);
+            ImGui_ImplDX11_NewFrame();
+            ImGui::NewFrame();
 
-        SmvmUiFrameParams params{};
-        params.snapshot = &snapshot;
-        params.rendered_camera = &view_camera;
-        params.path_header = has_path ? &path_header : nullptr;
-        params.keyframes = keys.data();
-        params.has_path = has_path;
-        params.documents = nullptr;
-        params.menu_open = menu_open;
-        params.viewport_width = state.viewport_width;
-        params.viewport_height = state.viewport_height;
-        params.frame_microseconds = state.frame_microseconds.load(std::memory_order_acquire);
-        params.overlay_flags = OverlayFlags();
-        params.renderer_error = state.last_renderer_error.load(std::memory_order_acquire);
-        params.raw_mouse_timestamp_ms =
-            state.manual_raw_mouse_observed_ms.load(std::memory_order_acquire);
-        params.fallback_mouse_timestamp_ms =
-            state.manual_fallback_mouse_observed_ms.load(std::memory_order_acquire);
-        params.free_camera_input_error =
-            state.manual_input_error.load(std::memory_order_acquire);
-        params.cinematic_start_ready =
-            state.cinematic_start_ready.load(std::memory_order_acquire);
-        params.free_camera_input_failure =
-            state.manual_input_failure.load(std::memory_order_acquire);
-        params.raw_registration_disposition =
-            state.manual_raw_registration_disposition.load(std::memory_order_acquire);
-        params.queue_action = [context = state.callbacks.context,
-                               queue = state.callbacks.queue_action](const SmvmActionPayload& action) {
-            return queue != nullptr && queue(context, action);
-        };
-        params.request_capture = [context = state.callbacks.context,
-                                  capture = state.callbacks.request_camera_capture](
-                                     const std::uint64_t replay_session_generation) {
-            if (capture != nullptr)
-                capture(context, replay_session_generation);
-        };
-        smvm_ui::DrawFrame(params, state.ui);
-        ImGui::Render();
-        imgui_rendered = true;
+            SmvmUiFrameParams params{};
+            params.snapshot = &snapshot;
+            params.rendered_camera = &view_camera;
+            params.path_header = has_path ? &path_header : nullptr;
+            params.keyframes = keys.data();
+            params.has_path = has_path;
+            params.documents = nullptr;
+            params.menu_open = menu_open;
+            params.viewport_width = state.viewport_width;
+            params.viewport_height = state.viewport_height;
+            params.frame_microseconds = state.frame_microseconds.load(std::memory_order_acquire);
+            params.overlay_flags = OverlayFlags();
+            const auto movie_capture = GetWorldDepthCaptureStatus();
+            params.movie_frames_observed = movie_capture.observed_frames;
+            params.movie_frames_written = movie_capture.written_frames;
+            params.movie_beauty_tga_frames_written =
+                movie_capture.beauty_tga_frames_written;
+            params.movie_beauty_frames_written = movie_capture.beauty_frames_written;
+            params.movie_depth_pfm_frames_written = movie_capture.depth_pfm_frames_written;
+            params.movie_depth_avi_frames_written = movie_capture.depth_avi_frames_written;
+            params.movie_depth_key_frames_written = movie_capture.depth_key_frames_written;
+            params.movie_depth_frames_unavailable = movie_capture.depth_frames_unavailable;
+            params.movie_repeated_camera_sequences_captured =
+                movie_capture.repeated_camera_sequences_captured;
+            params.movie_repeated_visual_samples_captured =
+                movie_capture.repeated_visual_samples_captured;
+            params.movie_queue_backpressure_events = movie_capture.queue_backpressure_events;
+            params.movie_maximum_queue_wait_microseconds =
+                movie_capture.maximum_queue_wait_microseconds;
+            params.movie_queue_capacity = movie_capture.queue_capacity;
+            params.movie_maximum_queue_depth = movie_capture.maximum_queue_depth;
+            params.movie_audio_active = movie_capture.audio_active;
+            params.movie_audio_failed = movie_capture.audio_failed;
+            params.movie_depth_observer_active =
+                state.depth_context_hook_reachable.load(std::memory_order_acquire) &&
+                movie_capture.depth_observer_active;
+            params.movie_depth_observer_failed =
+                state.depth_context_hook_failed.load(std::memory_order_acquire);
+            params.renderer_error = state.last_renderer_error.load(std::memory_order_acquire);
+            params.raw_mouse_timestamp_ms =
+                state.manual_raw_mouse_observed_ms.load(std::memory_order_acquire);
+            params.fallback_mouse_timestamp_ms =
+                state.manual_fallback_mouse_observed_ms.load(std::memory_order_acquire);
+            params.free_camera_input_error =
+                state.manual_input_error.load(std::memory_order_acquire);
+            params.cinematic_start_ready =
+                state.cinematic_start_ready.load(std::memory_order_acquire);
+            params.free_camera_input_failure =
+                state.manual_input_failure.load(std::memory_order_acquire);
+            params.raw_registration_disposition =
+                state.manual_raw_registration_disposition.load(std::memory_order_acquire);
+            params.queue_action = [context = state.callbacks.context,
+                                   queue = state.callbacks.queue_action](
+                                      const SmvmActionPayload& action) {
+                return queue != nullptr && queue(context, action);
+            };
+            params.request_capture = [context = state.callbacks.context,
+                                      capture = state.callbacks.request_camera_capture](
+                                         const std::uint64_t replay_session_generation) {
+                if (capture != nullptr)
+                    capture(context, replay_session_generation);
+            };
+            smvm_ui::DrawFrame(params, state.ui);
+            ImGui::Render();
+            state.imgui_draw_data_valid = true;
+        }
+        imgui_rendered = state.imgui_draw_data_valid;
     } else {
         DiscardUiEvents();
+        state.imgui_draw_data_valid = false;
     }
 
     const auto drawn = DrawVertices();
@@ -5236,6 +5919,11 @@ HRESULT STDMETHODCALLTYPE FactoryCreateSwapchainHook(
     IUnknown* device,
     DXGI_SWAP_CHAIN_DESC* description,
     IDXGISwapChain** swapchain) noexcept;
+void STDMETHODCALLTYPE OmSetRenderTargetsHook(
+    ID3D11DeviceContext* context,
+    UINT render_target_count,
+    ID3D11RenderTargetView* const* render_targets,
+    ID3D11DepthStencilView* depth_stencil_view) noexcept;
 
 [[nodiscard]] bool IsReadableRange(const void* address, const std::size_t size) noexcept {
     if (address == nullptr || size == 0)
@@ -5534,6 +6222,165 @@ struct ModuleTextView final {
         reinterpret_cast<void* volatile*>(object), original, replacement);
     FlushProcessWriteBuffers();
     return prior == replacement || prior == original;
+}
+
+template <typename T>
+[[nodiscard]] bool ContextSupportsSamePointer(
+    ID3D11DeviceContext* context) noexcept {
+    T* derived = nullptr;
+    const auto result = context->QueryInterface(
+        __uuidof(T), reinterpret_cast<void**>(&derived));
+    if (FAILED(result) || derived == nullptr)
+        return false;
+    const auto same_pointer = static_cast<ID3D11DeviceContext*>(derived) == context;
+    derived->Release();
+    return same_pointer;
+}
+
+[[nodiscard]] D3D11ContextInterfaceVersion ResolveContextInterfaceVersion(
+    ID3D11DeviceContext* context) noexcept {
+    if (context == nullptr)
+        return D3D11ContextInterfaceVersion::base;
+    if (ContextSupportsSamePointer<ID3D11DeviceContext4>(context))
+        return D3D11ContextInterfaceVersion::context4;
+    if (ContextSupportsSamePointer<ID3D11DeviceContext3>(context))
+        return D3D11ContextInterfaceVersion::context3;
+    if (ContextSupportsSamePointer<ID3D11DeviceContext2>(context))
+        return D3D11ContextInterfaceVersion::context2;
+    if (ContextSupportsSamePointer<ID3D11DeviceContext1>(context))
+        return D3D11ContextInterfaceVersion::context1;
+    return D3D11ContextInterfaceVersion::base;
+}
+
+[[nodiscard]] bool RemoveDepthContextObservation() noexcept {
+    auto& state = g_overlay;
+    ConfigureWorldDepthObservation(false, 0, 0);
+
+    AcquireSRWLockExclusive(&state.hook_lifecycle_lock);
+    auto restored = !state.depth_context_hook_reachable.load(std::memory_order_acquire);
+    if (!restored) {
+        restored = RestoreObjectVtable(
+            state.hooked_depth_context,
+            state.depth_context_original_vtable,
+            state.depth_context_hook_vtable);
+        if (restored)
+            state.depth_context_hook_reachable.store(false, std::memory_order_release);
+    }
+    ReleaseSRWLockExclusive(&state.hook_lifecycle_lock);
+    if (!restored || !WaitForCallbacksToDrain(state.active_depth_context_hooks))
+        return false;
+
+    AcquireSRWLockExclusive(&state.hook_lifecycle_lock);
+    IUnknown* held_context = state.hooked_depth_context;
+    auto** clone = state.depth_context_hook_vtable;
+    state.hooked_depth_context = nullptr;
+    state.depth_context_original_vtable = nullptr;
+    state.depth_context_hook_vtable = nullptr;
+    // Keep the original callable until every hook callback has drained. The
+    // previous experimental implementation cleared this pointer first, which
+    // could silently drop a live OMSetRenderTargets call during restoration.
+    state.original_om_set_render_targets = nullptr;
+    state.depth_context_vtable_entry_count = 0;
+    ReleaseSRWLockExclusive(&state.hook_lifecycle_lock);
+
+    ReleaseObject(held_context);
+    if (clone != nullptr)
+        VirtualFree(clone, 0, MEM_RELEASE);
+    return true;
+}
+
+[[nodiscard]] bool SyncDepthContextObservation(
+    ID3D11DeviceContext* context,
+    const bool enabled,
+    const std::uint32_t expected_width,
+    const std::uint32_t expected_height) noexcept {
+    auto& state = g_overlay;
+    if (!enabled || context == nullptr || expected_width == 0 || expected_height == 0) {
+        if (state.hooked_depth_context == nullptr &&
+            !state.depth_context_hook_reachable.load(std::memory_order_acquire)) {
+            if (GetWorldDepthCaptureStatus().depth_observer_active)
+                ConfigureWorldDepthObservation(false, 0, 0);
+            state.depth_context_hook_failed.store(false, std::memory_order_release);
+            state.depth_context_hook_last_attempt_ms.store(0, std::memory_order_release);
+            return true;
+        }
+        const auto removed = RemoveDepthContextObservation();
+        state.depth_context_hook_failed.store(!removed, std::memory_order_release);
+        if (removed)
+            state.depth_context_hook_last_attempt_ms.store(0, std::memory_order_release);
+        return removed;
+    }
+
+    if (state.depth_context_hook_reachable.load(std::memory_order_acquire) &&
+        state.hooked_depth_context == context) {
+        ConfigureWorldDepthObservation(true, expected_width, expected_height);
+        state.depth_context_hook_failed.store(false, std::memory_order_release);
+        return true;
+    }
+    if (state.hooked_depth_context != nullptr && !RemoveDepthContextObservation()) {
+        state.depth_context_hook_failed.store(true, std::memory_order_release);
+        return false;
+    }
+
+    const auto now = GetTickCount64();
+    const auto previous_attempt = state.depth_context_hook_last_attempt_ms.load(
+        std::memory_order_acquire);
+    if (previous_attempt != 0 && now - previous_attempt < 500)
+        return false;
+    state.depth_context_hook_last_attempt_ms.store(now, std::memory_order_release);
+
+    const auto version = ResolveContextInterfaceVersion(context);
+    const auto entry_count = D3D11ContextVtableEntryCount(version);
+    auto** original_vtable = ReadObjectVtable(context, entry_count);
+    if (original_vtable == nullptr) {
+        state.depth_context_hook_failed.store(true, std::memory_order_release);
+        return false;
+    }
+    const auto original = reinterpret_cast<OmSetRenderTargetsFunction>(
+        original_vtable[kD3D11OmSetRenderTargetsVtableIndex]);
+    if (!IsExecutableFunction(reinterpret_cast<void*>(original)) ||
+        original == &OmSetRenderTargetsHook) {
+        state.depth_context_hook_failed.store(true, std::memory_order_release);
+        return false;
+    }
+    auto** clone = CloneVtable(
+        original_vtable,
+        entry_count,
+        kD3D11OmSetRenderTargetsVtableIndex,
+        reinterpret_cast<void*>(&OmSetRenderTargetsHook));
+    if (clone == nullptr || !AddRefObject(context)) {
+        if (clone != nullptr)
+            VirtualFree(clone, 0, MEM_RELEASE);
+        state.depth_context_hook_failed.store(true, std::memory_order_release);
+        return false;
+    }
+
+    AcquireSRWLockExclusive(&state.hook_lifecycle_lock);
+    state.hooked_depth_context = context;
+    state.depth_context_original_vtable = original_vtable;
+    state.depth_context_hook_vtable = clone;
+    state.original_om_set_render_targets = original;
+    state.depth_context_vtable_entry_count = entry_count;
+    ConfigureWorldDepthObservation(true, expected_width, expected_height);
+    const auto published = PublishObjectVtable(context, original_vtable, clone);
+    if (published)
+        state.depth_context_hook_reachable.store(true, std::memory_order_release);
+    ReleaseSRWLockExclusive(&state.hook_lifecycle_lock);
+    if (!published) {
+        ConfigureWorldDepthObservation(false, 0, 0);
+        IUnknown* held_context = context;
+        state.hooked_depth_context = nullptr;
+        state.depth_context_original_vtable = nullptr;
+        state.depth_context_hook_vtable = nullptr;
+        state.original_om_set_render_targets = nullptr;
+        state.depth_context_vtable_entry_count = 0;
+        ReleaseObject(held_context);
+        VirtualFree(clone, 0, MEM_RELEASE);
+    }
+    state.depth_context_hook_failed.store(!published, std::memory_order_release);
+    if (published)
+        state.depth_context_hook_last_attempt_ms.store(0, std::memory_order_release);
+    return published;
 }
 
 [[nodiscard]] bool AddRefObject(IUnknown* object) noexcept {
@@ -5838,6 +6685,44 @@ HRESULT STDMETHODCALLTYPE FactoryCreateSwapchainHook(
     return result;
 }
 
+[[nodiscard]] bool CallOriginalOmSetRenderTargets(
+    const OmSetRenderTargetsFunction original,
+    ID3D11DeviceContext* context,
+    const UINT render_target_count,
+    ID3D11RenderTargetView* const* render_targets,
+    ID3D11DepthStencilView* depth_stencil_view) noexcept {
+    if (original == nullptr)
+        return false;
+    __try {
+        original(context, render_target_count, render_targets, depth_stencil_view);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void STDMETHODCALLTYPE OmSetRenderTargetsHook(
+    ID3D11DeviceContext* context,
+    const UINT render_target_count,
+    ID3D11RenderTargetView* const* render_targets,
+    ID3D11DepthStencilView* depth_stencil_view) noexcept {
+    auto& state = g_overlay;
+    ActiveCallbackGuard callback_guard(state.active_depth_context_hooks);
+    const auto original = state.original_om_set_render_targets;
+    if (!CallOriginalOmSetRenderTargets(
+            original,
+            context,
+            render_target_count,
+            render_targets,
+            depth_stencil_view)) {
+        return;
+    }
+    if (state.depth_context_hook_reachable.load(std::memory_order_acquire) &&
+        depth_stencil_view != nullptr) {
+        ObserveWorldDepthView(depth_stencil_view);
+    }
+}
+
 [[nodiscard]] SmvmRendererError RenderFrameProtected(IDXGISwapChain* swapchain) noexcept {
     __try {
         return RenderFrame(swapchain)
@@ -6101,7 +6986,6 @@ void SmvmReacquireFreeCameraInput() noexcept {
             static_cast<std::uint32_t>(ManualInputFailure::invalid_window_thread),
             std::memory_order_release);
         state.manual_input_error.store(true, std::memory_order_release);
-        SetMenuOpen(true);
     }
 }
 
@@ -6358,6 +7242,7 @@ bool StopSmvmOverlay() noexcept {
     }
     state.stop_requested.store(true, std::memory_order_release);
     state.menu_open.store(false, std::memory_order_release);
+    ShutdownWorldDepthCapture();
     ResetCinematicStartGate(true);
     RequestManualPointerState(false);
     if (state.installer_thread != nullptr) {
@@ -6474,7 +7359,10 @@ bool StopSmvmOverlay() noexcept {
         return false;
 
     ClearWindowProcedurePublication();
-    ReleaseGraphicsResources();
+    if (!ReleaseGraphicsResources()) {
+        state.render_lock.clear(std::memory_order_release);
+        return false;
+    }
     state.render_lock.clear(std::memory_order_release);
 
     IUnknown* held_swapchain = state.hooked_swapchain;

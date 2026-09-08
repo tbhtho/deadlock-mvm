@@ -15,7 +15,11 @@ struct SmvmOverlayCallbacks final {
     // Final camera sample observed at the end of the game-thread camera hook.
     // The overlay uses this instead of the slower managed snapshot so world
     // projection and movie telemetry share the frame Deadlock actually drew.
-    bool (*read_rendered_camera)(void* context, CameraSample& camera) noexcept{};
+    bool (*read_rendered_camera)(
+        void* context,
+        CameraSample& camera,
+        std::int64_t& replay_tick,
+        std::uint64_t& frame_sequence) noexcept{};
     bool (*read_editor_path)(
         void* context,
         CampathPayloadHeader& header,

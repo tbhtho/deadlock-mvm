@@ -9,6 +9,9 @@ native/build/
 ## Published launcher output
 /release/
 /release-visual-fix/
+/release-next/
+/release-showcase/
+/.local/
 
 ## Visual Studio
 .vs/
@@ -43,6 +46,9 @@ tools/out/
 
 ## Reverse-engineering research work area (IDA databases, binary copies, temp)
 tools/research/ida/
+
+# Local development probes and research
+/tools/
 /tests/DeadlockMVM.Core.Tests/
 
 # Local development records

@@ -1,5 +1,9 @@
 using System.Windows.Threading;
 using System.IO;
+using System.Diagnostics;
+using System.Text;
+using System.Globalization;
+using Microsoft.Win32;
 using DeadlockMVM.Core.Contracts;
 using DeadlockMVM.Core.Models;
 using DeadlockMVM.Core.Native.InProcess;
@@ -39,6 +43,8 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
     private readonly IAppSettings _settings;
     private readonly ILogService _log;
     private readonly DeadlockUiController _deadlockUi;
+    private readonly MovieRecordingController _movieRecording;
+    private readonly MovieVisualController _movieVisual;
     private readonly DemoStartupPolicy _demoStartup = new();
     private readonly DemoPlaybackSpeedPolicy _demoPlaybackSpeed = new();
     private readonly Dispatcher _dispatcher;
@@ -65,6 +71,8 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
     private int _processProfileReassertPending;
     private string _observedReplayIdentity = string.Empty;
     private bool? _observedReplayPaused;
+    private int _compositingTransitionInFlight;
+    private int _compositingCancelled;
 
     public SmvmHostCoordinator(
         ICameraService camera,
@@ -73,7 +81,8 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         CampathViewModel campath,
         IAppSettings settings,
         ILogService log,
-        Dispatcher dispatcher)
+        Dispatcher dispatcher,
+        Func<string?>? deadlockExecutablePath = null)
     {
         _camera = camera;
         _controller = controller;
@@ -82,6 +91,92 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         _settings = settings;
         _log = log;
         _deadlockUi = new DeadlockUiController(controller, log);
+        _movieRecording = new MovieRecordingController(
+            controller,
+            log,
+            () => _settings.SmvmMovieCaptureRoot,
+            deadlockExecutablePath ?? (() => _settings.DeadlockPath));
+        _ = _movieRecording.ApplyPreset(_settings.SmvmMovieRecordingPreset);
+        if (_movieRecording.State.CaptureFps != _settings.SmvmMovieCaptureFps)
+            _ = _movieRecording.SetCaptureFps(_settings.SmvmMovieCaptureFps);
+        if (_movieRecording.State.OutputMode != _settings.SmvmMovieOutputMode)
+            _ = _movieRecording.SetOutputMode(_settings.SmvmMovieOutputMode);
+        if (_movieRecording.State.OutputResolution != _settings.SmvmMovieOutputResolution)
+            _ = _movieRecording.SetOutputResolution(_settings.SmvmMovieOutputResolution);
+        var recordingPasses = new[]
+        {
+            MovieCapturePass.Beauty,
+            MovieCapturePass.WorldDepthPfm,
+            MovieCapturePass.WorldDepthAvi,
+            MovieCapturePass.GreenscreenFreeCamera,
+        };
+        var desiredRecordingPasses = _settings.SmvmMovieCapturePasses;
+        const MovieCapturePass legacyCompositingPasses =
+            MovieCapturePass.Beauty |
+            MovieCapturePass.WorldDepthPfm |
+            MovieCapturePass.WorldDepthAvi;
+        if (_settings.SmvmMovieRecordingPreset == MovieRecordingPreset.Compositing ||
+            desiredRecordingPasses == legacyCompositingPasses)
+        {
+            desiredRecordingPasses |= MovieCapturePass.GreenscreenFreeCamera;
+        }
+        // Enable desired passes first so a valid depth-only recipe can then
+        // remove the default Beauty pass without tripping the non-zero guard.
+        foreach (var pass in recordingPasses.Where(pass =>
+                     (desiredRecordingPasses & pass) != 0))
+        {
+            if ((_movieRecording.State.Passes & pass) == 0)
+                _ = _movieRecording.SetPass(pass, enabled: true);
+        }
+        foreach (var pass in recordingPasses.Where(pass =>
+                     (desiredRecordingPasses & pass) == 0))
+        {
+            if ((_movieRecording.State.Passes & pass) != 0)
+                _ = _movieRecording.SetPass(pass, enabled: false);
+        }
+        // Persist the repaired invariant as well as enforcing it in memory, so
+        // an older zero-pass settings file cannot keep presenting as Custom / 0.
+        _settings.SmvmMovieCapturePasses = _movieRecording.State.Passes;
+        _settings.SmvmMovieOutputMode = _movieRecording.State.OutputMode;
+        _settings.SmvmMovieRecordingPreset = _movieRecording.State.Preset;
+        _settings.Save();
+        var requestedPhysicalOptions =
+            (_settings.SmvmMovieDisablePostProcessing
+                ? MovieRecordingOptions.DisablePostProcessing
+                : MovieRecordingOptions.None) |
+            (_settings.SmvmMovieMuteDialogue
+                ? MovieRecordingOptions.MuteDialogue
+                : MovieRecordingOptions.None);
+        _ = _movieRecording.Apply(requestedPhysicalOptions);
+        _movieVisual = new MovieVisualController(controller, log);
+        var configuredFog = _settings.SmvmCustomFog;
+        if (_settings.SmvmCustomFogEnabled && !configuredFog.IsPractical)
+        {
+            configuredFog = FogConfiguration.Default;
+            _settings.SmvmCustomFog = configuredFog;
+            _settings.Save();
+            _log.Info("Custom fog values were reset to the visible fog preset.");
+        }
+        var configuredGreenscreen =
+            _movieRecording.State.Preset == MovieRecordingPreset.Greenscreen
+                ? GreenscreenMode.FreeCamera
+                : GreenscreenMode.Off;
+        if (configuredGreenscreen != _settings.SmvmGreenscreenMode)
+        {
+            _settings.SmvmGreenscreenMode = configuredGreenscreen;
+            _settings.Save();
+        }
+        _movieVisual.LoadConfiguration(
+            _settings.SmvmRuleOfThirds,
+            _settings.SmvmCustomFogEnabled,
+            configuredFog,
+            configuredGreenscreen);
+        _controller.OutputSilenceExpected = () =>
+        {
+            var recording = _movieRecording.State;
+            return recording.IsRecording || recording.IsFinalizing ||
+                   recording.CompositingStage != MovieCompositingStage.None;
+        };
         _dispatcher = dispatcher;
         var captureTrace = Environment.GetEnvironmentVariable("DEADLOCKMVM_CAPTURE_TRACE");
         _captureDiagnosticsEnabled = string.Equals(captureTrace, "1", StringComparison.OrdinalIgnoreCase) ||
@@ -186,8 +281,12 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                 _native.CancelManualCameraIntent();
             if (action.Type == SmvmActionType.RestoreDeadlockUi)
             {
+                _movieRecording.Stop();
+                _movieVisual.RestorePhysicalVisuals();
                 _deadlockUi.Restore(force: true, RecoveryGeneration(action));
                 _settings.SmvmDeadlockUiMode = DeadlockUiMode.DeadlockUi;
+                _settings.SmvmCustomFogEnabled = false;
+                _settings.SmvmGreenscreenMode = GreenscreenMode.Off;
                 _settings.Save();
             }
         }
@@ -267,6 +366,8 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                 Interlocked.Increment(ref _processBoundaryEpoch);
                 Volatile.Write(ref _minimumProcessTelemetryGeneration, long.MaxValue);
                 Interlocked.Exchange(ref _processProfileReassertPending, 1);
+                _movieRecording.AbandonForProcessBoundary();
+                _movieVisual.AbandonForProcessBoundary();
                 var requiredGeneration = _controller.BeginProcessBoundaryTelemetryFence();
                 _demoPlaybackSpeed.ResetForNewProcess();
                 _demoStartup.ResetForNewProcess();
@@ -314,7 +415,122 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
     }
 
     private void OnCampathStateChanged(object? sender, CampathPlaybackStatus status) =>
-        BeginInvokeIsolated(RefreshEditorSnapshot);
+        BeginInvokeIsolated(() => _ = HandleCampathStateChangedAsync(status));
+
+    private async Task HandleCampathStateChangedAsync(CampathPlaybackStatus status)
+    {
+        if (!status.IsTerminal)
+        {
+            RefreshEditorSnapshot();
+            return;
+        }
+
+        var recording = _movieRecording.State;
+        var stage = recording.CompositingStage;
+        var groupDirectory = recording.CaptureGroupDirectory;
+        var selectedPasses = recording.Passes;
+        // A completed status from the first replay can still be queued while
+        // the second replay is already live. Never let that stale terminal
+        // notification stop the newly-owned Chroma campath.
+        if (CampathTelemetryLeasePolicy.ShouldIgnoreTerminalDuringCompositing(
+                status,
+                stage,
+                _native.CampathPlaying))
+        {
+            RefreshEditorSnapshot();
+            return;
+        }
+        _movieRecording.StopCinematicRecording();
+        RefreshEditorSnapshot();
+        if (stage == MovieCompositingStage.None)
+            return;
+        if (Interlocked.Exchange(ref _compositingTransitionInFlight, 1) != 0)
+            return;
+
+        try
+        {
+            await _movieRecording.WaitForFinalizationAsync().ConfigureAwait(true);
+            var finalization = _movieRecording.State;
+            var completedNormally = status.State == CampathPlaybackState.Completed &&
+                                    Volatile.Read(ref _compositingCancelled) == 0;
+            var visualWorldPassesSurvived = stage == MovieCompositingStage.World &&
+                                            WorldVisualPassesComplete(
+                                                groupDirectory,
+                                                selectedPasses);
+            if (!completedNormally ||
+                (finalization.Error != MovieRecordingError.None && !visualWorldPassesSurvived))
+            {
+                RestoreGreenscreenAfterCompositing();
+                var reason = finalization.Error != MovieRecordingError.None
+                    ? finalization.Detail
+                    : $"Synchronized take stopped during {stage}: {status.Detail}";
+                _movieRecording.CompleteCompositingBatch(reason, succeeded: false);
+                return;
+            }
+
+            if (stage == MovieCompositingStage.World)
+            {
+                var worldManifestPath = Path.Combine(
+                    groupDirectory,
+                    "world",
+                    "deadlockmvm_capture.txt");
+                var worldFrameCount = File.Exists(worldManifestPath)
+                    ? ReadCaptureMetric(File.ReadAllLines(worldManifestPath), "Frames observed:")
+                    : null;
+                if (worldFrameCount is not > 0 ||
+                    !_movieRecording.ArmCompositingChroma(worldFrameCount.Value) ||
+                    !_movieVisual.SetGreenscreenMode(GreenscreenMode.FreeCamera))
+                {
+                    RestoreGreenscreenAfterCompositing();
+                    _movieRecording.CompleteCompositingBatch(
+                        "World was preserved, but the Chroma replay could not be armed.",
+                        succeeded: false);
+                    return;
+                }
+                await EnterSmvmFreeCameraAsync().ConfigureAwait(true);
+                await _campath.PlayAsync(
+                        CampathPlayMode.FromStart,
+                        StartArmedCinematicWithMovieVisuals)
+                    .ConfigureAwait(true);
+                if (!_native.CampathPlaying)
+                {
+                    _movieRecording.StopCinematicRecording();
+                    await _movieRecording.WaitForFinalizationAsync().ConfigureAwait(true);
+                    RestoreGreenscreenAfterCompositing();
+                    var reportComplete = WriteCompositingTakeReport(
+                        groupDirectory,
+                        selectedPasses,
+                        out var reportDetail);
+                    _movieRecording.CompleteCompositingBatch(
+                        reportDetail,
+                        reportComplete);
+                }
+                return;
+            }
+
+            RestoreGreenscreenAfterCompositing();
+            var aligned = WriteCompositingTakeReport(
+                groupDirectory,
+                selectedPasses,
+                out var detail);
+            _movieRecording.CompleteCompositingBatch(detail, aligned);
+        }
+        catch (Exception ex)
+        {
+            _movieRecording.Stop();
+            await _movieRecording.WaitForFinalizationAsync().ConfigureAwait(true);
+            RestoreGreenscreenAfterCompositing();
+            _movieRecording.CompleteCompositingBatch(
+                $"Synchronized take transition failed: {ex.Message}",
+                succeeded: false);
+            _log.Warn($"Synchronized compositing take failed: {ex.Message}");
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _compositingTransitionInFlight, 0);
+            RefreshEditorSnapshot();
+        }
+    }
 
     private void OnReplayStateChanged(object? sender, ReplayState state)
     {
@@ -333,6 +549,11 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         BeginInvokeIsolated(() =>
         {
             var current = _controller.State;
+            if (replayEpochChanged)
+            {
+                _movieRecording.Stop();
+                _movieVisual.AbandonForProcessBoundary();
+            }
             if (normalizeTransientClean &&
                 IsProcessBoundaryCurrent(processBoundaryEpoch) &&
                 CurrentPresentationReplayEpoch == presentationReplayEpoch &&
@@ -536,6 +757,8 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                 if (!IsProcessBoundaryCurrent(processBoundaryEpoch))
                     return;
                 _demoPlaybackSpeed.ClearForNoReplay();
+                _movieRecording.Stop();
+                _movieVisual.SuspendPhysicalVisuals();
                 var profile = _deadlockUi.ProfileStatus;
                 if (profile.RequiresRestore || profile.DesiredMode != DeadlockUiMode.DeadlockUi)
                     _deadlockUi.Restore();
@@ -544,6 +767,12 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         }
 
         if (!playbackSceneReady)
+            return;
+
+        // Fog and greenscreen are persistent movie-tool choices. Reassert
+        // them exactly once after a fresh process/replay scene becomes usable;
+        // configuration itself remains side-effect-free while no replay exists.
+        if (!_movieVisual.ReassertConfiguredVisuals())
             return;
 
         // Establish the owner's 100% demo-playback baseline once for every
@@ -755,7 +984,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
 
     private EditorSnapshot ReadEditorSnapshot()
     {
-        var keys = _campath.GetKeyframeSnapshot().ToArray();
+        var keys = _campath.GetKeyframeSnapshot();
         return new EditorSnapshot(
             _campath.PathName,
             _campath.Status,
@@ -799,13 +1028,19 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         // and transaction-in-progress must describe the same point in time so native
         // recovery cannot mistake a healthy four-command apply for a failure.
         var presentation = _deadlockUi.ProfileStatus;
+        var movieRecording = _movieRecording.State;
+        var movieVisual = _movieVisual.State;
         var deadlockUi = presentation.Ui;
-        var ownership = ResolveCameraOwnership(replayActive, native);
+        var cameraTransactionActive = CampathTelemetryLeasePolicy.KeepsCameraTransactionActive(
+            replayActive,
+            _native.CampathPlaying,
+            native?.Flags.HasFlag(InProcessStatusFlags.CampathActive) == true);
+        var ownership = ResolveCameraOwnership(cameraTransactionActive, native);
         var availability = ResolveCameraAvailability(
             internalEnabled, replayActive, replay, native, playback, ownership);
         var capabilities = ResolveCapabilities(internalEnabled, native);
-        var cameraOwnershipIntent = replayActive && _native.CameraOwned;
-        var cameraReadable = replayActive && _native.Connected &&
+        var cameraOwnershipIntent = cameraTransactionActive && _native.CameraOwned;
+        var cameraReadable = cameraTransactionActive && _native.Connected &&
             (native?.CameraObserved == true ||
              (native?.Camera.IsValid == true &&
               ownership is CameraOwnership.SmvmManualCamera or
@@ -815,7 +1050,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                            _native.ManualCameraEstablished;
 
         var flags = SmvmSnapshotFlags.None;
-        if (replayActive) flags |= SmvmSnapshotFlags.ReplayActive;
+        if (cameraTransactionActive) flags |= SmvmSnapshotFlags.ReplayActive;
         if (replay.IsPaused is not null) flags |= SmvmSnapshotFlags.PauseKnown;
         if (replay.IsPaused == true) flags |= SmvmSnapshotFlags.Paused;
         if (cameraReadable) flags |= SmvmSnapshotFlags.CameraReadable;
@@ -916,6 +1151,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
             _native.SelfTestStatus.IsRunning ||
             _native.SelfTestStatus.Stage is SmvmSelfTestStage.Completed or SmvmSelfTestStage.Failed or SmvmSelfTestStage.Cancelled
                 ? _native.SelfTestStatus.Detail
+                : !string.IsNullOrWhiteSpace(movieRecording.Detail) ? movieRecording.Detail
                 : !string.IsNullOrWhiteSpace(editor.Status) ? editor.Status : _native.Message,
             DescribeCameraAvailability(availability),
             editor.Session,
@@ -937,7 +1173,33 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
             _settings.SmvmStatusHudScale,
             _settings.SmvmStatusHudOpacity,
             presentation.AcknowledgementGeneration,
-            replay.ReplaySessionGeneration);
+            replay.ReplaySessionGeneration,
+            (MovieRecordingFlags)(uint)movieRecording.EnabledOptions |
+                (movieRecording.WorldDepthPassEnabled ? MovieRecordingFlags.WorldDepth : MovieRecordingFlags.None) |
+                (movieRecording.IsRecording ? MovieRecordingFlags.Active : MovieRecordingFlags.None) |
+                (movieRecording.IsArmed ? MovieRecordingFlags.Armed : MovieRecordingFlags.None) |
+                (movieRecording.IsFinalizing ? MovieRecordingFlags.Finalizing : MovieRecordingFlags.None),
+            movieRecording.IsRecording || movieRecording.IsArmed || movieRecording.IsFinalizing
+                ? movieRecording.NativeCaptureName
+                : string.Empty,
+            movieRecording.CaptureFps,
+            movieRecording.Preset,
+            movieRecording.OutputMode,
+            movieRecording.Passes,
+            (movieVisual.RuleOfThirds ? MovieToolFlags.RuleOfThirds : MovieToolFlags.None) |
+                (movieVisual.FogEnabled ? MovieToolFlags.CustomFog : MovieToolFlags.None),
+            movieVisual.Greenscreen,
+            movieVisual.Fog,
+            _settings.SmvmGreenscreenColorRgb,
+            (movieRecording.IsRecording || movieRecording.IsArmed || movieRecording.IsFinalizing) &&
+                !string.IsNullOrWhiteSpace(movieRecording.CaptureDirectory)
+                ? movieRecording.CaptureDirectory
+                : _movieRecording.CaptureRoot,
+            movieRecording.OutputResolution,
+            movieRecording.ActivePasses,
+            movieRecording.CompositingStage,
+            movieRecording.CaptureAudio,
+            checked((ulong)Math.Max(0, movieRecording.ExpectedFrameCount)));
     }
 
     private CameraOwnership ResolveCameraOwnership(bool replayActive, InProcessCameraStatus? native)
@@ -1293,6 +1555,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                 break;
             }
             case SmvmActionType.SetDeadlockUiMode:
+                _log.Info($"SMVM presentation request: target={(DeadlockUiMode)action.Index}, generation={RecoveryGeneration(action)}.");
                 if (action.Tick == 0)
                 {
                     // Tab/menu reassertion carries no owner generation. Reapply
@@ -1375,6 +1638,161 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
             case SmvmActionType.SetStatusHudOpacity:
                 _settings.SmvmStatusHudOpacity = action.Value;
                 _settings.Save();
+                break;
+            case SmvmActionType.SetMovieRecordingOption:
+                if (Enum.IsDefined((MovieRecordingOption)action.Index) &&
+                    action.Value is 0.0 or 1.0)
+                {
+                    var option = (MovieRecordingOptions)(1u << action.Index);
+                    var enableOption = action.Value == 1.0;
+                    if (_movieRecording.SetOption(option, enableOption))
+                        SaveMovieRecordingSettings();
+                }
+                break;
+            case SmvmActionType.SetMovieRecordingFps:
+                if (action.Value == Math.Truncate(action.Value) &&
+                    _movieRecording.SetCaptureFps(checked((int)action.Value)))
+                    SaveMovieRecordingSettings();
+                break;
+            case SmvmActionType.SetMovieRecordingPreset:
+                if (Enum.IsDefined((MovieRecordingPreset)action.Index) &&
+                    _movieRecording.ApplyPreset((MovieRecordingPreset)action.Index))
+                {
+                    var wantsGreenscreen =
+                        (_movieRecording.State.Passes & MovieCapturePass.GreenscreenFreeCamera) != 0 &&
+                        (_movieRecording.State.Passes & MovieCapturePass.Beauty) == 0;
+                    var greenscreenMode = wantsGreenscreen
+                        ? GreenscreenMode.FreeCamera
+                        : GreenscreenMode.Off;
+                    if (_movieVisual.State.Greenscreen != greenscreenMode &&
+                        _movieVisual.SetGreenscreenMode(greenscreenMode))
+                    {
+                        _settings.SmvmGreenscreenMode = greenscreenMode;
+                    }
+                    SaveMovieRecordingSettings();
+                }
+                break;
+            case SmvmActionType.SetMovieOutputMode:
+                if (Enum.IsDefined((MovieOutputMode)action.Index) &&
+                    _movieRecording.SetOutputMode((MovieOutputMode)action.Index))
+                    SaveMovieRecordingSettings();
+                break;
+            case SmvmActionType.SetMovieOutputResolution:
+                if (Enum.IsDefined((MovieOutputResolution)action.Index) &&
+                    _movieRecording.SetOutputResolution((MovieOutputResolution)action.Index))
+                    SaveMovieRecordingSettings();
+                break;
+            case SmvmActionType.SetMovieCapturePass:
+                if (action.Index is >= 0 and <= 3 && (action.Value is 0.0 or 1.0) &&
+                    _movieRecording.SetPass(
+                        (MovieCapturePass)(1u << action.Index),
+                        action.Value == 1.0))
+                {
+                    var changedPass = (MovieCapturePass)(1u << action.Index);
+                    if (changedPass is MovieCapturePass.Beauty or
+                        MovieCapturePass.GreenscreenFreeCamera)
+                    {
+                        var greenscreenMode =
+                            (_movieRecording.State.Passes &
+                             MovieCapturePass.GreenscreenFreeCamera) != 0 &&
+                            (_movieRecording.State.Passes & MovieCapturePass.Beauty) == 0
+                                ? GreenscreenMode.FreeCamera
+                                : GreenscreenMode.Off;
+                        if (_movieVisual.State.Greenscreen == greenscreenMode ||
+                            _movieVisual.SetGreenscreenMode(greenscreenMode))
+                        {
+                            _settings.SmvmGreenscreenMode = greenscreenMode;
+                        }
+                    }
+                    SaveMovieRecordingSettings();
+                }
+                break;
+            case SmvmActionType.OpenMovieCaptureFolder:
+                OpenMovieCaptureFolder();
+                break;
+            case SmvmActionType.ChooseMovieCaptureFolder:
+                ChooseMovieCaptureFolder();
+                break;
+            case SmvmActionType.SetRuleOfThirds:
+                if (action.Value is 0.0 or 1.0 &&
+                    _movieVisual.SetRuleOfThirds(action.Value == 1.0))
+                {
+                    _settings.SmvmRuleOfThirds = action.Value == 1.0;
+                    _settings.Save();
+                }
+                break;
+            case SmvmActionType.SetCustomFogEnabled:
+                if (action.Value is 0.0 or 1.0)
+                {
+                    var enableFog = action.Value == 1.0;
+                    if (_movieVisual.SetFogEnabled(enableFog))
+                    {
+                        _settings.SmvmCustomFogEnabled = enableFog;
+                        _settings.Save();
+                    }
+                }
+                break;
+            case SmvmActionType.SetCustomFogValue:
+                var currentFog = _movieVisual.State.Fog;
+                var updatedFog = action.Index switch
+                {
+                    0 => currentFog with
+                    {
+                        Start = action.Value,
+                        End = Math.Max(currentFog.End, action.Value + 100),
+                    },
+                    1 => currentFog with
+                    {
+                        Start = Math.Min(currentFog.Start, action.Value - 100),
+                        End = action.Value,
+                    },
+                    2 => currentFog with { MaximumDensity = action.Value },
+                    3 => currentFog with { Exponent = action.Value },
+                    _ => currentFog,
+                };
+                if (_movieVisual.SetFog(updatedFog))
+                {
+                    _settings.SmvmCustomFog = updatedFog;
+                    _settings.Save();
+                }
+                break;
+            case SmvmActionType.SetCustomFogColor:
+                var color = checked((uint)action.Index);
+                var fogBeforeColor = _movieVisual.State.Fog;
+                var coloredFog = fogBeforeColor with
+                {
+                    Red = (byte)((color >> 16) & 0xFF),
+                    Green = (byte)((color >> 8) & 0xFF),
+                    Blue = (byte)(color & 0xFF),
+                };
+                if (_movieVisual.SetFog(coloredFog))
+                {
+                    _settings.SmvmCustomFog = coloredFog;
+                    _settings.Save();
+                }
+                break;
+            case SmvmActionType.ResetCustomFog:
+                if (_movieVisual.ApplyFogPreset(FogConfiguration.Default))
+                {
+                    _settings.SmvmCustomFog = FogConfiguration.Default;
+                    _settings.Save();
+                }
+                break;
+            case SmvmActionType.SetGreenscreenMode:
+                if (Enum.IsDefined((GreenscreenMode)action.Index) &&
+                    _movieVisual.SetGreenscreenMode((GreenscreenMode)action.Index))
+                {
+                    _settings.SmvmGreenscreenMode = (GreenscreenMode)action.Index;
+                    _settings.Save();
+                }
+                break;
+            case SmvmActionType.StartMovieRecording:
+                _ = RunReplayEffect(() => _ = ArmCinematicRecording());
+                break;
+            case SmvmActionType.StopMovieRecording:
+                Interlocked.Exchange(ref _compositingCancelled, 1);
+                _movieRecording.Stop();
+                RestoreGreenscreenAfterCompositing();
                 break;
             case SmvmActionType.ToggleReplayPause:
                 if (replayCommandLease is not { } pauseLease)
@@ -1502,16 +1920,62 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                 await EnterSmvmFreeCameraAsync().ConfigureAwait(true);
                 if (!actionStillCurrent())
                     return;
-                await _campath.PlayAsync(CampathPlayMode.FromStart).ConfigureAwait(true);
+                var recordingArmedFromStart = _movieRecording.State.IsArmed;
+                try
+                {
+                    await _campath.PlayAsync(
+                        CampathPlayMode.FromStart,
+                        recordingArmedFromStart ? StartArmedCinematicWithMovieVisuals : null)
+                        .ConfigureAwait(true);
+                }
+                finally
+                {
+                    // Readiness failures happen after the native writers start
+                    // but before CampathPlaying becomes true. Always unwind the
+                    // take in that gap so timing and visual settings are restored.
+                    if (recordingArmedFromStart && !_native.CampathPlaying)
+                        _movieRecording.StopCinematicRecording();
+                }
                 break;
             case SmvmActionType.PlayFromCurrent:
                 await EnterSmvmFreeCameraAsync().ConfigureAwait(true);
                 if (!actionStillCurrent())
                     return;
-                await _campath.PlayAsync(CampathPlayMode.FromCurrent).ConfigureAwait(true);
+                var recordingArmedFromCurrent = _movieRecording.State.IsArmed;
+                try
+                {
+                    await _campath.PlayAsync(
+                        CampathPlayMode.FromCurrent,
+                        recordingArmedFromCurrent ? StartArmedCinematicWithMovieVisuals : null)
+                        .ConfigureAwait(true);
+                }
+                finally
+                {
+                    if (recordingArmedFromCurrent && !_native.CampathPlaying)
+                        _movieRecording.StopCinematicRecording();
+                }
                 break;
             case SmvmActionType.StopCampath:
-                await _campath.StopAsync().ConfigureAwait(true);
+                var interruptingMovieTake = _movieRecording.State.IsRecording ||
+                                            _movieRecording.State.IsArmed;
+                Interlocked.Exchange(ref _compositingCancelled, 1);
+                if (interruptingMovieTake)
+                {
+                    // Escape reaches this typed path while a take is live. Freeze
+                    // transport before releasing Campath ownership so no
+                    // uncontrolled replay frames can enter the writer during
+                    // cleanup, then end/finalize the current take. The ordinary
+                    // Stop Campath command keeps its historical transport
+                    // behavior when no recording exists.
+                    if (replayCommandLease is { } moviePauseLease)
+                        _ = _controller.PauseIfCurrent(moviePauseLease);
+                    _movieRecording.Stop();
+                }
+                if (_native.CampathCameraOwned)
+                    await _campath.StopAsync().ConfigureAwait(true);
+                else if (!interruptingMovieTake)
+                    await _campath.StopAsync().ConfigureAwait(true);
+                _movieRecording.StopCinematicRecording();
                 break;
             case SmvmActionType.SetEndBehavior:
                 _ = RunReplayEffect(() =>
@@ -2449,6 +2913,369 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         _ => $"Slot {index}",
     };
 
+    private bool StartArmedCinematicWithMovieVisuals()
+    {
+        // Native fog is composited from the retained world-depth surface on
+        // every Present, before the pass writer reads Beauty. It needs no
+        // seek-time or recording-time console reassertion. A dedicated green
+        // pass does own physical world/sky/viewmodel commands, so fail the
+        // cinematic start if that plate cannot be established.
+        var targetGreenscreen =
+            (_movieRecording.State.ActivePasses & MovieCapturePass.GreenscreenFreeCamera) != 0
+                ? GreenscreenMode.FreeCamera
+                : GreenscreenMode.Off;
+        if (_movieVisual.State.Greenscreen != targetGreenscreen &&
+            !_movieVisual.SetGreenscreenMode(targetGreenscreen))
+        {
+            return false;
+        }
+        return _movieRecording.StartArmedCinematic();
+    }
+
+    private bool ArmCinematicRecording()
+    {
+        Interlocked.Exchange(ref _compositingCancelled, 0);
+        return _movieRecording.ArmForCinematic(BuildCinematicCaptureName());
+    }
+
+    private void RestoreGreenscreenAfterCompositing()
+    {
+        if (_movieVisual.State.Greenscreen != GreenscreenMode.Off)
+            _ = _movieVisual.SetGreenscreenMode(GreenscreenMode.Off);
+        if (_settings.SmvmGreenscreenMode != GreenscreenMode.Off)
+        {
+            _settings.SmvmGreenscreenMode = GreenscreenMode.Off;
+            _settings.Save();
+        }
+    }
+
+    private static long? ReadCaptureMetric(
+        IReadOnlyList<string> lines,
+        string prefix)
+    {
+        var line = lines.FirstOrDefault(value =>
+            value.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
+        if (line is null)
+            return null;
+        return long.TryParse(
+            line[prefix.Length..].Trim(),
+            NumberStyles.Integer,
+            CultureInfo.InvariantCulture,
+            out var value)
+            ? value
+            : null;
+    }
+
+    private static bool ManifestPassComplete(
+        IReadOnlyList<string> lines,
+        string prefix) =>
+        lines.Any(value =>
+            value.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) &&
+            value.Contains("complete (", StringComparison.OrdinalIgnoreCase));
+
+    private static ulong? ReadCaptureHexMetric(
+        IReadOnlyList<string> lines,
+        string prefix)
+    {
+        var line = lines.FirstOrDefault(value =>
+            value.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
+        if (line is null)
+            return null;
+        var text = line[prefix.Length..].Trim();
+        if (text.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+            text = text[2..];
+        return ulong.TryParse(
+            text,
+            NumberStyles.HexNumber,
+            CultureInfo.InvariantCulture,
+            out var value)
+            ? value
+            : null;
+    }
+
+    private static bool WorldVisualPassesComplete(
+        string groupDirectory,
+        MovieCapturePass selectedPasses)
+    {
+        try
+        {
+            var worldDirectory = Path.Combine(groupDirectory, "world");
+            var manifestPath = Path.Combine(worldDirectory, "deadlockmvm_capture.txt");
+            if (!File.Exists(manifestPath))
+                return false;
+            var lines = File.ReadAllLines(manifestPath);
+            var complete = File.Exists(Path.Combine(worldDirectory, "avi", "world.avi")) &&
+                           ManifestPassComplete(lines, "World AVI:");
+            if ((selectedPasses & MovieCapturePass.WorldDepthAvi) != 0)
+                complete &= File.Exists(Path.Combine(worldDirectory, "avi", "zdepth.avi")) &&
+                            ManifestPassComplete(lines, "Z-Depth preview AVI:");
+            if ((selectedPasses & MovieCapturePass.WorldDepthPfm) != 0)
+                complete &= ManifestPassComplete(lines, "Z-Depth PFM:");
+            return complete;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private bool WriteCompositingTakeReport(
+        string groupDirectory,
+        MovieCapturePass selectedPasses,
+        out string detail)
+    {
+        detail = "The synchronized take needs manual review.";
+        try
+        {
+            if (string.IsNullOrWhiteSpace(groupDirectory) || !Directory.Exists(groupDirectory))
+                return false;
+            var worldDirectory = Path.Combine(groupDirectory, "world");
+            var chromaDirectory = Path.Combine(groupDirectory, "chroma");
+            var worldManifestPath = Path.Combine(worldDirectory, "deadlockmvm_capture.txt");
+            var chromaManifestPath = Path.Combine(chromaDirectory, "deadlockmvm_capture.txt");
+            if (!File.Exists(worldManifestPath) || !File.Exists(chromaManifestPath))
+                return false;
+            var worldManifest = File.ReadAllLines(worldManifestPath);
+            var chromaManifest = File.ReadAllLines(chromaManifestPath);
+            var worldFrames = ReadCaptureMetric(worldManifest, "Frames observed:");
+            var chromaFrames = ReadCaptureMetric(chromaManifest, "Frames observed:");
+            var worldFirstTick = ReadCaptureMetric(worldManifest, "First replay tick:");
+            var chromaFirstTick = ReadCaptureMetric(chromaManifest, "First replay tick:");
+            var worldLastTick = ReadCaptureMetric(worldManifest, "Last replay tick:");
+            var chromaLastTick = ReadCaptureMetric(chromaManifest, "Last replay tick:");
+            var worldTimingDigest = ReadCaptureHexMetric(
+                worldManifest,
+                "Replay timing digest:");
+            var chromaTimingDigest = ReadCaptureHexMetric(
+                chromaManifest,
+                "Replay timing digest:");
+            var worldCameraSamples = ReadCaptureMetric(
+                worldManifest,
+                "Rendered camera samples:");
+            var chromaCameraSamples = ReadCaptureMetric(
+                chromaManifest,
+                "Rendered camera samples:");
+            var worldCameraDigest = ReadCaptureHexMetric(
+                worldManifest,
+                "Rendered camera digest:");
+            var chromaCameraDigest = ReadCaptureHexMetric(
+                chromaManifest,
+                "Rendered camera digest:");
+            var chromaBackgroundPixels = ReadCaptureMetric(
+                chromaManifest,
+                "Green Screen background pixels:");
+            var chromaSubjectPixels = ReadCaptureMetric(
+                chromaManifest,
+                "Green Screen subject pixels:");
+            var chromaFramesWithBackground = ReadCaptureMetric(
+                chromaManifest,
+                "Green Screen frames with key background:");
+            var chromaFramesWithSubject = ReadCaptureMetric(
+                chromaManifest,
+                "Green Screen frames with isolated subject:");
+
+            var worldAvi = Path.Combine(worldDirectory, "avi", "world.avi");
+            var depthAvi = Path.Combine(worldDirectory, "avi", "zdepth.avi");
+            var chromaAvi = Path.Combine(chromaDirectory, "avi", "chroma.avi");
+            var wave = Path.Combine(worldDirectory, "audio", "world.wav");
+            var greenPlateUsable = MovieCompositingAlignmentPolicy.IsGreenscreenPlateUsable(
+                new MovieGreenscreenPlateMetrics(
+                    chromaFrames,
+                    chromaBackgroundPixels,
+                    chromaSubjectPixels,
+                    chromaFramesWithBackground,
+                    chromaFramesWithSubject));
+            var aligned = MovieCompositingAlignmentPolicy.IsFrameTickAndTimingAligned(
+                new MoviePassAlignmentMetrics(
+                    worldFrames,
+                    worldFirstTick,
+                    worldLastTick,
+                    worldTimingDigest,
+                    worldCameraSamples,
+                    worldCameraDigest),
+                new MoviePassAlignmentMetrics(
+                    chromaFrames,
+                    chromaFirstTick,
+                    chromaLastTick,
+                    chromaTimingDigest,
+                    chromaCameraSamples,
+                    chromaCameraDigest));
+            var waveHasAudio = File.Exists(wave) && new FileInfo(wave).Length > 44;
+            var visualLayersComplete = aligned &&
+                                       greenPlateUsable &&
+                                       File.Exists(worldAvi) &&
+                                       File.Exists(chromaAvi) &&
+                                       ManifestPassComplete(worldManifest, "World AVI:") &&
+                                       ManifestPassComplete(chromaManifest, "Chroma AVI:");
+            if ((selectedPasses & MovieCapturePass.WorldDepthAvi) != 0)
+                visualLayersComplete &= File.Exists(depthAvi) &&
+                                        ManifestPassComplete(
+                                            worldManifest,
+                                            "Z-Depth preview AVI:");
+            if ((selectedPasses & MovieCapturePass.WorldDepthPfm) != 0)
+                visualLayersComplete &= ManifestPassComplete(
+                    worldManifest,
+                    "Z-Depth PFM:");
+            var complete = visualLayersComplete && waveHasAudio;
+
+            var chromaMissing = chromaFrames is null or <= 0 || !File.Exists(chromaAvi);
+            var status = complete
+                ? "READY - FRAME SCHEDULE ALIGNED"
+                : chromaMissing
+                    ? "FAILED - GREEN SCREEN DID NOT RECORD"
+                    : !greenPlateUsable
+                        ? "FAILED - GREEN SCREEN PLATE IS NOT USABLE"
+                    : visualLayersComplete && !waveHasAudio
+                        ? "VISUAL LAYERS READY - AUDIO MISSING"
+                    : "REVIEW REQUIRED - SEE ALIGNMENT VALUES BELOW";
+            File.WriteAllLines(
+                Path.Combine(groupDirectory, "COMPOSITING_TAKE.txt"),
+                [
+                    "DeadLockMVM synchronized compositing take",
+                    $"Status: {status}",
+                    $"Visual layers: {(visualLayersComplete ? "ready" : "review required")}",
+                    $"Audio: {(waveHasAudio ? "ready" : "missing or empty")}",
+                    $"World frames: {worldFrames?.ToString(CultureInfo.InvariantCulture) ?? "missing"}",
+                    $"Chroma frames: {chromaFrames?.ToString(CultureInfo.InvariantCulture) ?? "missing"}",
+                    $"World ticks: {worldFirstTick?.ToString(CultureInfo.InvariantCulture) ?? "missing"} to {worldLastTick?.ToString(CultureInfo.InvariantCulture) ?? "missing"}",
+                    $"Chroma ticks: {chromaFirstTick?.ToString(CultureInfo.InvariantCulture) ?? "missing"} to {chromaLastTick?.ToString(CultureInfo.InvariantCulture) ?? "missing"}",
+                    $"World timing digest: {(worldTimingDigest is { } worldDigest ? $"0x{worldDigest:x16}" : "missing")}",
+                    $"Chroma timing digest: {(chromaTimingDigest is { } chromaDigest ? $"0x{chromaDigest:x16}" : "missing")}",
+                    $"World camera samples/digest: {worldCameraSamples?.ToString(CultureInfo.InvariantCulture) ?? "missing"} / {(worldCameraDigest is { } worldCameraHash ? $"0x{worldCameraHash:x16}" : "missing")}",
+                    $"Chroma camera samples/digest: {chromaCameraSamples?.ToString(CultureInfo.InvariantCulture) ?? "missing"} / {(chromaCameraDigest is { } chromaCameraHash ? $"0x{chromaCameraHash:x16}" : "missing")}",
+                    $"Green background pixels/frames: {chromaBackgroundPixels?.ToString(CultureInfo.InvariantCulture) ?? "missing"} / {chromaFramesWithBackground?.ToString(CultureInfo.InvariantCulture) ?? "missing"}",
+                    $"Green subject pixels/frames: {chromaSubjectPixels?.ToString(CultureInfo.InvariantCulture) ?? "missing"} / {chromaFramesWithSubject?.ToString(CultureInfo.InvariantCulture) ?? "missing"}",
+                    $"Audio payload: {(waveHasAudio ? $"{new FileInfo(wave).Length:N0} bytes" : "missing or empty")}",
+                    string.Empty,
+                    "EDITOR FILES",
+                    "World: world\\avi\\world.avi",
+                    "Z-Depth preview: world\\avi\\zdepth.avi",
+                    "Z-Depth float sequence: world\\depth\\zdepth_########.pfm",
+                    "Chroma: chroma\\avi\\chroma.avi",
+                    "Audio: world\\audio\\world.wav",
+                    string.Empty,
+                    "LAYER ORDER",
+                    "1. Put World on the bottom.",
+                    "2. Put Chroma directly above World and key out green.",
+                    "3. Keep Z-Depth hidden and use it only as a depth/blur control layer.",
+                    "4. Apply world depth-of-field before compositing the keyed subject when the subject must stay sharp.",
+                    string.Empty,
+                    "All videos start at frame 0. Do not slip one pass independently.",
+                ]);
+            detail = complete
+                ? $"Synchronized World, Z-Depth, Chroma, and WAV are aligned at {worldFrames:N0} frames."
+                : chromaMissing
+                    ? "World and Z-Depth were preserved, but Green Screen recorded no usable AVI."
+                    : !greenPlateUsable
+                        ? "Green Screen AVI exists, but it contains no validated key background or isolated subject."
+                    : visualLayersComplete && !waveHasAudio
+                        ? "World, Z-Depth, and Green Screen are aligned; WAV is missing or empty."
+                    : "The passes were preserved, but their alignment report requires review.";
+            return complete;
+        }
+        catch (Exception ex)
+        {
+            detail = $"Could not validate synchronized passes: {ex.Message}";
+            _log.Warn(detail);
+            return false;
+        }
+    }
+
+    private void SaveMovieRecordingSettings()
+    {
+        var state = _movieRecording.State;
+        _settings.SmvmMovieCaptureFps = state.CaptureFps;
+        _settings.SmvmMovieRecordingPreset = state.Preset;
+        _settings.SmvmMovieOutputMode = state.OutputMode;
+        _settings.SmvmMovieOutputResolution = state.OutputResolution;
+        _settings.SmvmMovieCapturePasses = state.Passes;
+        _settings.SmvmMovieDisablePostProcessing =
+            state.IsEnabled(MovieRecordingOptions.DisablePostProcessing);
+        _settings.SmvmMovieMuteDialogue =
+            state.IsEnabled(MovieRecordingOptions.MuteDialogue);
+        _settings.Save();
+    }
+
+    private string BuildCinematicCaptureName()
+    {
+        var keyframes = _campath.GetKeyframeSnapshot();
+        var startTick = keyframes.Length > 0
+            ? keyframes.Min(static keyframe => keyframe.DemoTick)
+            : Math.Max(0, _controller.State.CurrentTick ?? 0);
+        var endTick = keyframes.Length > 0
+            ? keyframes.Max(static keyframe => keyframe.DemoTick)
+            : startTick;
+        return MovieRecordingController.BuildCinematicCaptureName(
+            _controller.State.ReplayName,
+            startTick,
+            endTick,
+            _movieRecording.State.CaptureFps);
+    }
+
+    private void ChooseMovieCaptureFolder()
+    {
+        if (_movieRecording.State.IsRecording || _movieRecording.State.IsArmed)
+        {
+            _log.Warn("Stop or cancel the current recording before changing its save location.");
+            return;
+        }
+        try
+        {
+            var dialog = new OpenFolderDialog
+            {
+                Title = "Choose where Deadlock MVM saves cinematic captures",
+                InitialDirectory = _movieRecording.CaptureRoot,
+                Multiselect = false,
+            };
+            if (dialog.ShowDialog() != true)
+                return;
+
+            var selected = Path.GetFullPath(dialog.FolderName);
+            var longestTake = Path.Combine(selected, new string('x', 63));
+            if (selected.IndexOfAny(['"', '\r', '\n', ';']) >= 0 ||
+                Encoding.UTF8.GetByteCount(longestTake) >= 192)
+            {
+                System.Windows.MessageBox.Show(
+                    "Choose a shorter folder path without semicolons so Deadlock can receive the complete capture name safely.",
+                    "Deadlock MVM",
+                    System.Windows.MessageBoxButton.OK,
+                    System.Windows.MessageBoxImage.Warning);
+                return;
+            }
+            Directory.CreateDirectory(selected);
+            _settings.SmvmMovieCaptureRoot = selected;
+            _settings.Save();
+            _log.Info($"Movie capture folder changed to: {selected}");
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Could not change the movie capture folder: {ex.Message}");
+        }
+    }
+
+    private void OpenMovieCaptureFolder()
+    {
+        try
+        {
+            var state = _movieRecording.State;
+            var path = !string.IsNullOrWhiteSpace(state.CaptureDirectory) &&
+                       Directory.Exists(state.CaptureDirectory)
+                ? state.CaptureDirectory
+                : _movieRecording.CaptureRoot;
+            Directory.CreateDirectory(path);
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = path,
+                UseShellExecute = true,
+            });
+            _log.Info($"Opened movie capture folder: {path}");
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Could not open the movie capture folder: {ex.Message}");
+        }
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _stopping, 1) != 0)
@@ -2460,6 +3287,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         _campath.EditorStateChanged -= OnEditorStateChanged;
         _native.CampathStateChanged -= OnCampathStateChanged;
         _controller.StateChanged -= OnReplayStateChanged;
+        _controller.OutputSilenceExpected = null;
         // Invalidate every captured forward lease before cancellation/drain.
         // The final inverse must be the last presentation transaction, not the
         // middle of a forward operation that was already waiting on the gate.
@@ -2469,6 +3297,9 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         _actionGate.Release();
         await _pathPublishGate.WaitAsync().ConfigureAwait(false);
         _pathPublishGate.Release();
+        _movieRecording.Stop();
+        await _movieRecording.WaitForFinalizationAsync().ConfigureAwait(false);
+        _movieVisual.RestorePhysicalVisuals();
         _deadlockUi.Restore(force: true);
         _actionGate.Dispose();
         _pathPublishGate.Dispose();

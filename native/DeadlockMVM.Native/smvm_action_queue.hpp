@@ -30,6 +30,22 @@ public:
             return false;
         }
         DiscardStale(current_generation);
+        // Sliders can produce a value every rendered frame while the host
+        // consumes one action per IPC heartbeat. Replace the still-pending tail
+        // value instead of filling the bounded queue with obsolete drag samples.
+        // Only adjacent continuous edits coalesce, so buttons and reset actions
+        // remain ordering barriers.
+        if (read_ != write_ && IsContinuousEdit(action.type)) {
+            const auto previous = (write_ + actions_.size() - 1) % actions_.size();
+            auto& pending = actions_[previous];
+            if (pending.generation == current_generation &&
+                pending.payload.type == action.type &&
+                ContinuousEditKeyMatches(pending.payload, action)) {
+                pending.payload = action;
+                lock_.clear(std::memory_order_release);
+                return true;
+            }
+        }
         const auto next = (write_ + 1) % actions_.size();
         if (next == read_) {
             lock_.clear(std::memory_order_release);
@@ -67,6 +83,40 @@ private:
         SmvmActionPayload payload{};
         std::uint64_t generation{};
     };
+
+    [[nodiscard]] static constexpr bool IsContinuousEdit(
+        const SmvmActionType type) noexcept {
+        switch (type) {
+            case SmvmActionType::set_fov:
+            case SmvmActionType::set_roll:
+            case SmvmActionType::set_ui_scale:
+            case SmvmActionType::set_menu_opacity:
+            case SmvmActionType::set_movement_speed:
+            case SmvmActionType::set_mouse_sensitivity:
+            case SmvmActionType::set_smoothing:
+            case SmvmActionType::set_path_label_scale:
+            case SmvmActionType::set_replay_bar_scale:
+            case SmvmActionType::set_replay_bar_opacity:
+            case SmvmActionType::set_status_hud_scale:
+            case SmvmActionType::set_status_hud_opacity:
+            case SmvmActionType::set_custom_fog_value:
+            case SmvmActionType::set_custom_fog_color:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    [[nodiscard]] static constexpr bool ContinuousEditKeyMatches(
+        const SmvmActionPayload& left,
+        const SmvmActionPayload& right) noexcept {
+        switch (left.type) {
+            case SmvmActionType::set_custom_fog_value:
+                return left.index == right.index;
+            default:
+                return true;
+        }
+    }
 
     void DiscardStale(const std::uint64_t current_generation) noexcept {
         while (read_ != write_ && actions_[read_].generation != current_generation)

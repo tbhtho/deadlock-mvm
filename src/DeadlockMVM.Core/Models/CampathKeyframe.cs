@@ -25,6 +25,10 @@ public sealed class CampathPath
 {
     public const int MaxKeyframes = 128;
     private readonly IReadOnlyList<CampathKeyframe> _keyframes;
+    private readonly SplineChannel[] _smoothChannels = [];
+    private readonly Quaterniond[] _rotations = [];
+    private readonly double _minimumFov;
+    private readonly double _maximumFov;
 
     public CampathPath(
         IEnumerable<CampathKeyframe> keyframes,
@@ -32,16 +36,39 @@ public sealed class CampathPath
         CampathEasingMode easing = CampathEasingMode.Linear)
     {
         ArgumentNullException.ThrowIfNull(keyframes);
-        _keyframes = keyframes.OrderBy(keyframe => keyframe.DemoTick).ToArray();
+        _keyframes = Array.AsReadOnly(keyframes.OrderBy(keyframe => keyframe.DemoTick).ToArray());
         Interpolation = interpolation;
         Easing = easing;
+        IsValid = ValidateKeyframes();
+        if (IsValid && interpolation == CampathInterpolationMode.Smooth)
+        {
+            // The path owns an immutable snapshot. Solve its curves once,
+            // rather than rebuilding four splines and rotations per sample.
+            _smoothChannels = [
+                BuildChannel(key => key.Camera.X),
+                BuildChannel(key => key.Camera.Y),
+                BuildChannel(key => key.Camera.Z),
+                BuildChannel(key => key.Camera.Fov),
+            ];
+            _minimumFov = _smoothChannels[3].Values.Min();
+            _maximumFov = _smoothChannels[3].Values.Max();
+            _rotations = new Quaterniond[_keyframes.Count];
+            for (var index = 0; index < _rotations.Length; index++)
+            {
+                _rotations[index] = Quaterniond.FromCamera(_keyframes[index].Camera);
+                if (index > 0 && Quaterniond.Dot(_rotations[index - 1], _rotations[index]) < 0)
+                    _rotations[index] = _rotations[index] * -1;
+            }
+        }
     }
 
     public IReadOnlyList<CampathKeyframe> Keyframes => _keyframes;
     public CampathInterpolationMode Interpolation { get; }
     public CampathEasingMode Easing { get; }
 
-    public bool IsValid =>
+    public bool IsValid { get; }
+
+    private bool ValidateKeyframes() =>
         _keyframes.Count is >= 2 and <= MaxKeyframes &&
         Enum.IsDefined(Interpolation) && Enum.IsDefined(Easing) &&
         _keyframes.All(keyframe => keyframe.IsValid) &&
@@ -96,24 +123,29 @@ public sealed class CampathPath
 
     private CameraSample EvaluateSmooth(int left, double amount)
     {
-        var x = _keyframes.Select(key => key.Camera.X).ToArray();
-        var y = _keyframes.Select(key => key.Camera.Y).ToArray();
-        var z = _keyframes.Select(key => key.Camera.Z).ToArray();
-        var fov = _keyframes.Select(key => key.Camera.Fov).ToArray();
         var sample = new CameraSample(
-            EvaluateSpline(left, amount, x),
-            EvaluateSpline(left, amount, y),
-            EvaluateSpline(left, amount, z),
+            EvaluateSpline(left, amount, _smoothChannels[0]),
+            EvaluateSpline(left, amount, _smoothChannels[1]),
+            EvaluateSpline(left, amount, _smoothChannels[2]),
             0,
             0,
             0,
-            Math.Clamp(EvaluateSpline(left, amount, fov), fov.Min(), fov.Max()));
+            Math.Clamp(EvaluateSpline(left, amount, _smoothChannels[3]), _minimumFov, _maximumFov));
         return WithQuaternionAngles(sample, EvaluateRotationSpline(left, amount));
     }
 
-    private double EvaluateSpline(int segment, double amount, IReadOnlyList<double> values)
+    private readonly record struct SplineChannel(double[] Values, double[] SecondDerivatives);
+
+    private SplineChannel BuildChannel(Func<CampathKeyframe, double> select)
     {
-        var second = SplineSecondDerivatives(values);
+        var values = _keyframes.Select(select).ToArray();
+        return new SplineChannel(values, SplineSecondDerivatives(values));
+    }
+
+    private double EvaluateSpline(int segment, double amount, SplineChannel channel)
+    {
+        var values = channel.Values;
+        var second = channel.SecondDerivatives;
         var span = Math.Max(_keyframes[segment + 1].DemoTick - _keyframes[segment].DemoTick, 1);
         var right = Math.Clamp(amount, 0, 1);
         var left = 1 - right;
@@ -177,14 +209,6 @@ public sealed class CampathPath
         };
     }
 
-    private static double ShortestAngleDelta(double from, double to)
-    {
-        var delta = (to - from) % 360d;
-        if (delta > 180d) delta -= 360d;
-        if (delta < -180d) delta += 360d;
-        return delta;
-    }
-
     private static double NormalizeAngle(double value)
     {
         value %= 360d;
@@ -197,13 +221,7 @@ public sealed class CampathPath
 
     private Quaterniond EvaluateRotationSpline(int segment, double rawAmount)
     {
-        var rotations = new Quaterniond[_keyframes.Count];
-        for (var index = 0; index < rotations.Length; index++)
-        {
-            rotations[index] = Quaterniond.FromCamera(_keyframes[index].Camera);
-            if (index > 0 && Quaterniond.Dot(rotations[index - 1], rotations[index]) < 0)
-                rotations[index] = rotations[index] * -1;
-        }
+        var rotations = _rotations;
         var span = Math.Max(_keyframes[segment + 1].DemoTick - _keyframes[segment].DemoTick, 1);
         var fromTangent = RotationTangent(rotations, segment);
         var toTangent = RotationTangent(rotations, segment + 1);
