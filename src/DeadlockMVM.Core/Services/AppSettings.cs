@@ -22,6 +22,15 @@ public sealed class AppSettings : IAppSettings
 
         public int VConsolePort { get; set; } = DeadlockConstants.DefaultVConsolePort;
 
+        public bool LaunchViaSteam { get; set; }
+
+        public string SmvmEffectsHotkey { get; set; } = "CapsLock";
+        public string SmvmCinematicStartHotkey { get; set; } = "Space";
+        public string SmvmPlaybackSlowerHotkey { get; set; } = "Left";
+        public string SmvmPlaybackFasterHotkey { get; set; } = "Right";
+        public string SmvmCancelHotkey { get; set; } = "Escape";
+        public string SmvmCameraSlowerHotkey { get; set; } = "OemMinus";
+        public string SmvmCameraFasterHotkey { get; set; } = "OemPlus";
         public string SmvmMenuHotkey { get; set; } = "Tab";
         public string SmvmAddHotkey { get; set; } = "Mouse3";
         public string SmvmDeleteHotkey { get; set; } = "L";
@@ -89,6 +98,7 @@ public sealed class AppSettings : IAppSettings
         public bool SmvmMovieDisablePostProcessing { get; set; }
         public bool SmvmMovieMuteDialogue { get; set; } = true;
         public bool SmvmRuleOfThirds { get; set; }
+        public LookSettings SmvmLook { get; set; } = new();
         public bool SmvmCustomFogEnabled { get; set; }
         public FogConfiguration SmvmCustomFog { get; set; } = FogConfiguration.Default;
         public GreenscreenMode SmvmGreenscreenMode { get; set; } = GreenscreenMode.Off;
@@ -143,6 +153,19 @@ public sealed class AppSettings : IAppSettings
         set => _document.VConsolePort = value > 0 ? value : DeadlockConstants.DefaultVConsolePort;
     }
 
+    public bool LaunchViaSteam
+    {
+        get => _document.LaunchViaSteam;
+        set => _document.LaunchViaSteam = value;
+    }
+
+    public string SmvmEffectsHotkey { get => _document.SmvmEffectsHotkey; set => _document.SmvmEffectsHotkey = value?.Trim() ?? string.Empty; }
+    public string SmvmCinematicStartHotkey { get => _document.SmvmCinematicStartHotkey; set => _document.SmvmCinematicStartHotkey = value?.Trim() ?? string.Empty; }
+    public string SmvmPlaybackSlowerHotkey { get => _document.SmvmPlaybackSlowerHotkey; set => _document.SmvmPlaybackSlowerHotkey = value?.Trim() ?? string.Empty; }
+    public string SmvmPlaybackFasterHotkey { get => _document.SmvmPlaybackFasterHotkey; set => _document.SmvmPlaybackFasterHotkey = value?.Trim() ?? string.Empty; }
+    public string SmvmCancelHotkey { get => _document.SmvmCancelHotkey; set => _document.SmvmCancelHotkey = value?.Trim() ?? string.Empty; }
+    public string SmvmCameraSlowerHotkey { get => _document.SmvmCameraSlowerHotkey; set => _document.SmvmCameraSlowerHotkey = value?.Trim() ?? string.Empty; }
+    public string SmvmCameraFasterHotkey { get => _document.SmvmCameraFasterHotkey; set => _document.SmvmCameraFasterHotkey = value?.Trim() ?? string.Empty; }
     public string SmvmMenuHotkey
     {
         get => _document.SmvmMenuHotkey;
@@ -605,6 +628,12 @@ public sealed class AppSettings : IAppSettings
     {
         get => _document.SmvmRuleOfThirds;
         set => _document.SmvmRuleOfThirds = value;
+    }
+
+    public LookSettings SmvmLook
+    {
+        get => _document.SmvmLook is { IsValid: true } value ? value : new();
+        set => _document.SmvmLook = value.IsValid ? value : throw new ArgumentOutOfRangeException(nameof(value));
     }
 
     public bool SmvmCustomFogEnabled

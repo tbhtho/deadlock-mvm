@@ -10,6 +10,8 @@
 struct ID3D11Device;
 struct ID3D11DeviceContext;
 struct ID3D11DepthStencilView;
+struct ID3D11Texture2D;
+struct ID3D11ShaderResourceView;
 struct IDXGISwapChain;
 
 namespace deadlock_mvm {
@@ -20,16 +22,30 @@ namespace deadlock_mvm {
     return current_sequence != 0 && current_sequence == previous_sequence;
 }
 
-[[nodiscard]] constexpr bool ShouldSuppressRepeatedMoviePresent(
-    const bool camera_sequence_repeated,
-    const bool sampled_visual_repeated) noexcept {
-    return camera_sequence_repeated && sampled_visual_repeated;
-}
-
 [[nodiscard]] constexpr bool ShouldCaptureMovieFrame(
     const std::uint64_t observed_frames,
     const std::uint64_t expected_frame_count) noexcept {
     return expected_frame_count == 0 || observed_frames < expected_frame_count;
+}
+
+// host_framerate fixes how many frames sample each game-time second. The AVI
+// must declare the cinematic playback rate instead of that sampling rate, or a
+// slowed-down preview is saved as a real-time clip that ends almost as soon as
+// it starts. The artifact rate is the sampling rate scaled by the cinematic
+// speed; an unusable speed fails back to real time.
+[[nodiscard]] constexpr std::uint32_t OutputFrameRate(
+    const std::uint32_t capture_fps,
+    const double playback_speed) noexcept {
+    if (capture_fps == 0)
+        return 1;
+    if (!(playback_speed > 0.0) || playback_speed > 16.0)
+        return capture_fps;
+    const auto scaled = static_cast<double>(capture_fps) * playback_speed + 0.5;
+    if (scaled < 1.0)
+        return 1;
+    if (scaled > 1000.0)
+        return 1000;
+    return static_cast<std::uint32_t>(scaled);
 }
 
 // A tiny positive threshold is more reliable than an exact depth-equality draw
@@ -93,6 +109,8 @@ struct MovieCaptureConfiguration final {
     bool capture_audio{true};
     std::uint32_t greenscreen_color_rgb{0x00FF00u};
     std::uint64_t expected_frame_count{};
+    LookSettings look{};
+    std::uint64_t lut_content_hash{};
 };
 
 struct WorldDepthCaptureStatus final {
@@ -143,10 +161,24 @@ void ObserveWorldDepthView(ID3D11DepthStencilView* depth_view) noexcept;
     std::uint32_t expected_width,
     std::uint32_t expected_height) noexcept;
 
+// Returns an AddRef'd shader-resource view of the retained world depth for the
+// live depth-of-field effect, or nullptr when the depth surface is not
+// sampleable. The caller owns the returned reference.
+[[nodiscard]] ID3D11ShaderResourceView* AcquireObservedWorldDepthShaderResourceView(
+    ID3D11Device* device,
+    ID3D11DeviceContext* context,
+    std::uint32_t expected_width,
+    std::uint32_t expected_height) noexcept;
+
 // Synchronizes the native pass writer with the managed cinematic recording
 // transaction. A configuration change finalizes the previous session before a
 // replacement starts; no pass can leak across take names.
 void SyncMovieCapture(const MovieCaptureConfiguration& configuration) noexcept;
+
+// Read-only continuation check for readiness gates. An unrelated active take
+// must not lend its initialized-writer status to a replacement capture.
+[[nodiscard]] bool HasActiveMovieCaptureIdentity(
+    std::string_view capture_name, std::string_view take_directory) noexcept;
 
 // Captures the current backbuffer and world-depth view before DeadLockMVM draws
 // its own composition guides or menu. The bounded queue blocks offline timing
@@ -157,7 +189,8 @@ void CaptureMovieFrame(
     IDXGISwapChain* swapchain,
     std::int64_t replay_tick,
     const CameraSample* rendered_camera,
-    std::uint64_t camera_frame_sequence) noexcept;
+    std::uint64_t camera_frame_sequence,
+    ID3D11Texture2D* cadence_color_source = nullptr) noexcept;
 
 // The presentation compositor publishes readiness separately from writer
 // startup. Green Screen is not allowed to resume replay until a compatible
@@ -165,6 +198,9 @@ void CaptureMovieFrame(
 void SetMovieFrameCompositionReady(bool ready) noexcept;
 
 void NotifyWorldDepthDeviceLost() noexcept;
+// Terminal GPU failure: stop audio/writer and mark the take failed/partial.
+// Unlike ordinary resource invalidation this must not look like a clean stop.
+void AbortMovieCaptureForDeviceFailure() noexcept;
 void ShutdownWorldDepthCapture() noexcept;
 
 [[nodiscard]] WorldDepthCaptureStatus GetWorldDepthCaptureStatus() noexcept;

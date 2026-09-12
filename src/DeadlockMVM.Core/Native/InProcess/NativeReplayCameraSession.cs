@@ -1014,7 +1014,10 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                     int landed;
                     try
                     {
-                        landed = await SeekToPathStartAsync(startSeekTick, cancellationToken).ConfigureAwait(false);
+                        landed = await SeekToPathStartAsync(
+                            startSeekTick,
+                            cancellationToken,
+                            requirePausedLanding: true).ConfigureAwait(false);
                     }
                     catch (TimeoutException ex)
                     {
@@ -3015,18 +3018,33 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         }
     }
 
-    private async Task<int> SeekToPathStartAsync(int tick, CancellationToken cancellationToken)
+    private async Task<int> SeekToPathStartAsync(
+        int tick,
+        CancellationToken cancellationToken,
+        bool requirePausedLanding = false)
     {
         var lease = CaptureReplaySeekLease();
         var captured = _controller.CaptureReplayTelemetrySnapshot();
 
-        if (TryGetLandedReplayTick(captured.State, tick, out var landed))
+        bool IsAlreadyLanded(ReplayState state, out int landedTick) =>
+            requirePausedLanding
+                ? CanSkipStartSeekFromPausedState(state, tick, out landedTick)
+                : TryGetLandedReplayTick(state, tick, out landedTick);
+
+        if (IsAlreadyLanded(captured.State, out var landed))
         {
             ThrowIfReplaySeekLeaseExpired(lease);
             return landed;
         }
 
-        var landing = new ReplaySeekLandingAwaiter(tick, lease);
+        var landing = new ReplaySeekLandingAwaiter(
+            tick,
+            lease,
+            // A movie/Campath start must land on the explicit skip-finished
+            // acknowledgement: the pre-seek position and a late previous
+            // completion both sit inside the tolerance window and would let
+            // Free Roam recovery run mid-skip.
+            allowAuthoritativeLanding: !requirePausedLanding);
         void OnCompleted(object? sender, int completedTick)
         {
             var current = _controller.CaptureReplayTelemetrySnapshot();
@@ -3061,18 +3079,27 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
                 landing.Expire();
                 return await landing.Completion.ConfigureAwait(false);
             }
-            if (TryGetLandedReplayTick(current.State, tick, out landed))
+            if (IsAlreadyLanded(current.State, out landed))
                 return landed;
 
+            // An issued seek must not be considered landed on the position it
+            // started from. Without this baseline, a request within the tick
+            // tolerance of the current sample (e.g. a one-tick movie preroll)
+            // completes instantly on the pre-seek state or on a late completion
+            // line from the previous seek, so Free Roam recovery runs while
+            // Deadlock is still skipping and fails as ObserverNotRoaming.
+            landing.SetBaseline(current.State.CurrentTick);
             if (!_controller.SeekToTickIfCurrent(
                     tick,
                     lease.ConnectionGeneration,
                     lease.ReplaySessionGeneration,
-                    lease.ReplayName))
+                    lease.ReplayName,
+                    out var seekBaseline))
             {
                 landing.Expire();
                 return await landing.Completion.ConfigureAwait(false);
             }
+            landing.SetBaseline(seekBaseline);
             current = _controller.CaptureReplayTelemetrySnapshot();
             landing.ObserveAuthoritativeState(
                 current.State,
@@ -3095,6 +3122,25 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
     {
         landedTick = state.CurrentTick ?? -1;
         return IsConfirmedReplay(state) && IsTickWithinTolerance(landedTick, requestedTick);
+    }
+
+    /// <summary>
+    /// A Campath start may skip its preroll seek only when the authoritative
+    /// transport is already paused at the requested boundary. A playing replay
+    /// within the tolerance window would run past the boundary, and the
+    /// redundant post-landing pause prints no console line, so the pause
+    /// confirmation has nothing to observe. When the cached state is playing,
+    /// the seek must be issued so the engine produces real landing and pause
+    /// acknowledgements.
+    /// </summary>
+    internal static bool CanSkipStartSeekFromPausedState(
+        ReplayState state,
+        int requestedTick,
+        out int landedTick)
+    {
+        landedTick = state.CurrentTick ?? -1;
+        return state.IsPaused == true &&
+               TryGetLandedReplayTick(state, requestedTick, out landedTick);
     }
 
     internal static bool IsTickWithinTolerance(int candidateTick, int requestedTick) =>
@@ -4372,22 +4418,38 @@ internal sealed class ReplaySeekLandingAwaiter
 
     private readonly int _requestedTick;
     private readonly ReplaySeekLease _lease;
+    private readonly bool _allowAuthoritativeLanding;
     private readonly TaskCompletionSource<int> _completion =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private int? _baselineTick;
 
-    public ReplaySeekLandingAwaiter(int requestedTick, ReplaySeekLease lease)
+    public ReplaySeekLandingAwaiter(
+        int requestedTick,
+        ReplaySeekLease lease,
+        bool allowAuthoritativeLanding = true)
     {
         _requestedTick = requestedTick;
         _lease = lease;
+        _allowAuthoritativeLanding = allowAuthoritativeLanding;
     }
 
     public Task<int> Completion => _completion.Task;
+
+    /// <summary>
+    /// Records the authoritative position the issued seek started from. An
+    /// authoritative state that still shows that exact tick cannot prove
+    /// arrival, so a short seek cannot land on its own starting sample before
+    /// Deadlock has processed the skip.
+    /// </summary>
+    public void SetBaseline(int? baselineTick) => _baselineTick = baselineTick;
 
     public bool ObserveAuthoritativeState(
         ReplayState state,
         long currentConnectionGeneration,
         ReplayState currentState)
     {
+        if (!_allowAuthoritativeLanding)
+            return false;
         if (!EnsureLeaseCurrent(currentConnectionGeneration, currentState))
             return false;
 
@@ -4396,6 +4458,9 @@ internal sealed class ReplaySeekLandingAwaiter
         // race, the older event object is evidence only and cannot land this
         // seek even when it contains the requested tick.
         if (!ReferenceEquals(state, currentState))
+            return false;
+
+        if (_baselineTick is { } baseline && state.CurrentTick == baseline)
             return false;
 
         if (!NativeReplayCameraSession.TryGetLandedReplayTick(state, _requestedTick, out var landedTick))
@@ -4409,6 +4474,11 @@ internal sealed class ReplaySeekLandingAwaiter
         ReplayState currentState)
     {
         if (!EnsureLeaseCurrent(currentConnectionGeneration, currentState))
+            return false;
+        // A completion line can be delivered by VConsole several seconds late.
+        // A late "finished" for the position this seek started from must not
+        // complete the new seek even when it is inside the tolerance window.
+        if (_baselineTick is { } baseline && completedTick == baseline)
             return false;
         if (!NativeReplayCameraSession.IsTickWithinTolerance(completedTick, _requestedTick))
             return false;

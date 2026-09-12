@@ -23,6 +23,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -96,6 +97,8 @@ struct MovieCaptureState final {
     std::filesystem::path take_directory{};
     std::string capture_name{};
     bool writer_stop{};
+    LookSettings look{}; // Immutable between writer start and join.
+    std::uint64_t lut_content_hash{};
 
     std::atomic<bool> active{false};
     std::atomic<bool> frame_composition_ready{false};
@@ -154,12 +157,29 @@ struct MovieCaptureState final {
 
     ID3D11DepthStencilView* retained_depth_view{};
 
+    // Shader-readable view of the retained depth for the live depth-of-field
+    // effect. Recreated when the observed resource changes; null when the
+    // engine depth surface is not sampleable.
+    ID3D11ShaderResourceView* depth_srv{};
+    ID3D11Resource* depth_srv_resource{};
+    DXGI_FORMAT depth_srv_format{DXGI_FORMAT_UNKNOWN};
+
+    // Fallback: a typeless copy of the typed depth surface that can be bound as
+    // a shader resource when the engine depth itself is not sampleable.
+    ID3D11Texture2D* depth_copy{};
+    ID3D11ShaderResourceView* depth_copy_srv{};
+    ID3D11Resource* depth_copy_source{};
+    D3D11_TEXTURE2D_DESC depth_copy_description{};
+    DXGI_FORMAT depth_copy_format{DXGI_FORMAT_UNKNOWN};
+
     ID3D11Texture2D* depth_staging{};
     D3D11_TEXTURE2D_DESC depth_staging_description{};
     DXGI_FORMAT depth_view_format{DXGI_FORMAT_UNKNOWN};
     UINT depth_subresource{};
     ID3D11Texture2D* color_staging{};
     D3D11_TEXTURE2D_DESC color_staging_description{};
+    ID3D11Texture2D* cadence_staging{};
+    D3D11_TEXTURE2D_DESC cadence_source_description{};
 };
 
 void UpdateMaximum(
@@ -186,18 +206,19 @@ void UpdateMaximum(
         std::chrono::steady_clock::now() - start).count());
 }
 
-[[nodiscard]] std::uint64_t VisualFingerprint(const MovieFrame& frame) noexcept {
+[[nodiscard]] std::uint64_t VisualFingerprint(
+    const MovieFrame& frame, const std::uint64_t pre_effect_color = 0) noexcept {
     constexpr auto kOffsetBasis = 14695981039346656037ULL;
     constexpr auto kPrime = 1099511628211ULL;
-    auto hash = kOffsetBasis;
+    auto hash = pre_effect_color != 0 ? pre_effect_color : kOffsetBasis;
     const auto mix = [&hash](const std::uint8_t value) noexcept {
         hash ^= value;
         hash *= kPrime;
     };
     const auto step_x = std::max<std::uint32_t>(1, frame.width / 64u);
     const auto step_y = std::max<std::uint32_t>(1, frame.height / 36u);
-    auto has_payload = false;
-    if (!frame.color_bgr.empty()) {
+    auto has_payload = pre_effect_color != 0;
+    if (pre_effect_color == 0 && !frame.color_bgr.empty()) {
         has_payload = true;
         for (std::uint32_t y = 0; y < frame.height; y += step_y) {
             const auto* row = frame.color_bgr.data() +
@@ -304,6 +325,8 @@ void ReleaseStaging() noexcept {
     auto& state = State();
     SafeRelease(state.depth_staging);
     SafeRelease(state.color_staging);
+    SafeRelease(state.cadence_staging);
+    state.cadence_source_description = {};
     state.depth_staging_description = {};
     state.color_staging_description = {};
     state.depth_view_format = DXGI_FORMAT_UNKNOWN;
@@ -315,6 +338,14 @@ void ReleaseRetainedDepthView() noexcept {
     auto& state = State();
     std::lock_guard lock(state.depth_view_mutex);
     SafeRelease(state.retained_depth_view);
+    SafeRelease(state.depth_srv);
+    SafeRelease(state.depth_srv_resource);
+    state.depth_srv_format = DXGI_FORMAT_UNKNOWN;
+    SafeRelease(state.depth_copy);
+    SafeRelease(state.depth_copy_srv);
+    SafeRelease(state.depth_copy_source);
+    state.depth_copy_description = {};
+    state.depth_copy_format = DXGI_FORMAT_UNKNOWN;
 }
 
 [[nodiscard]] bool EnsureDepthStaging(
@@ -1070,7 +1101,9 @@ void WriterMain() noexcept {
         try {
             const auto passes = state.pass_flags.load(std::memory_order_acquire);
             const auto output_mode = state.output_mode.load(std::memory_order_acquire);
-            const auto fps = state.fps.load(std::memory_order_acquire);
+            const auto fps = OutputFrameRate(
+                state.fps.load(std::memory_order_acquire),
+                state.playback_speed.load(std::memory_order_acquire));
             if ((passes & movie_capture_pass_greenscreen_free_camera) != 0) {
                 const auto fill = FillGreenscreenFarPlane(
                     frame,
@@ -1272,6 +1305,23 @@ void WriteManifest(
         const auto passes = state.pass_flags.load(std::memory_order_acquire);
         const auto output_mode = state.output_mode.load(std::memory_order_acquire);
         const auto audio = GetEngineMovieAudioStatus();
+        const auto& look = state.look;
+        manifest << std::setprecision(std::numeric_limits<float>::max_digits10)
+            << "Reshade schema/revision: " << look.schema_version << '/' << look.revision << '\n'
+            << "Reshade enabled/strength: " << look.enabled << '/' << look.strength << '\n'
+            << "Reshade color domain: post-tonemap SDR; explicit sRGB decode/encode; no HDR recovery\n"
+            << "Reshade capture policy: frozen for take; pre-effect cadence; raw depth/chroma bypass\n"
+            << "Reshade exposure/contrast/saturation/vibrance: " << look.exposure << '/' << look.contrast << '/' << look.saturation << '/' << look.vibrance << '\n'
+            << "Reshade temperature/tint: " << look.temperature << '/' << look.tint << '\n'
+            << "Reshade lift RGB: " << look.lift_r << '/' << look.lift_g << '/' << look.lift_b << '\n'
+            << "Reshade gamma RGB: " << look.gamma_r << '/' << look.gamma_g << '/' << look.gamma_b << '\n'
+            << "Reshade gain RGB: " << look.gain_r << '/' << look.gain_g << '/' << look.gain_b << '\n'
+            << "Reshade shadows/highlights: " << look.shadows << '/' << look.highlights << '\n'
+            << "Reshade bloom threshold/knee/intensity/radius/quality: " << look.bloom_threshold << '/' << look.bloom_knee << '/' << look.bloom_intensity << '/' << look.bloom_radius << '/' << look.bloom_quality << '\n'
+            << "Reshade sharpen/vignette/grain/seed: " << look.sharpen << '/' << look.vignette << '/' << look.grain_strength << '/' << look.grain_seed << '\n'
+            << "Reshade grain clock: accepted cinematic frame index; preview replay tick\n"
+            << "Reshade LUT size/intensity/revision: " << look.lut_size << '/' << look.lut_intensity << '/' << look.lut_revision << '\n'
+            << "Reshade LUT RGB float32 LE FNV1a64: " << std::hex << state.lut_content_hash << std::dec << '\n';
         const auto write_pass = [&manifest, expected](
             const char* name,
             const bool requested,
@@ -1287,7 +1337,11 @@ void WriteManifest(
         };
         manifest <<
             "DeadLockMVM cinematic capture\n"
-            "Frame rate: " << state.fps.load(std::memory_order_acquire) << " FPS\n"
+            "Frame rate: " << OutputFrameRate(
+                state.fps.load(std::memory_order_acquire),
+                state.playback_speed.load(std::memory_order_acquire)) << " FPS\n"
+            "Capture sampling rate: " <<
+                state.fps.load(std::memory_order_acquire) << " FPS\n"
             "Cinematic playback speed: " <<
                 state.playback_speed.load(std::memory_order_acquire) << "x\n"
             "TGA output: DeadLockMVM native 24-bit BGR writer\n"
@@ -1315,7 +1369,7 @@ void WriteManifest(
             << "Chroma AVI frames: " <<
                 state.depth_key_frames_written.load(std::memory_order_acquire) << '\n'
             << "Present calls observed: " << state.present_calls.load(std::memory_order_acquire) << '\n'
-            << "Repeated camera-sequence Presents suppressed: " <<
+            << "Repeated camera-sequence Presents observed: " <<
                 state.repeated_camera_sequences_captured.load(std::memory_order_acquire) << '\n'
             << "Repeated sampled visual frames observed: " <<
                 state.repeated_visual_samples_captured.load(std::memory_order_acquire) << '\n'
@@ -1516,6 +1570,8 @@ void StopSession() noexcept {
             std::lock_guard lock(state.mutex);
             state.take_directory = take;
             state.capture_name.assign(configuration.capture_name);
+            state.look = configuration.look;
+            state.lut_content_hash = configuration.lut_content_hash;
             state.writer_stop = false;
             state.queue.clear();
             state.recycled_depth.clear();
@@ -1688,6 +1744,140 @@ ID3D11DepthStencilView* AcquireObservedWorldDepthView(
     return state.retained_depth_view;
 }
 
+ID3D11ShaderResourceView* AcquireObservedWorldDepthShaderResourceView(
+    ID3D11Device* device,
+    ID3D11DeviceContext* context,
+    const std::uint32_t expected_width,
+    const std::uint32_t expected_height) noexcept {
+    auto& state = State();
+    if (device == nullptr)
+        return nullptr;
+    std::lock_guard lock(state.depth_view_mutex);
+    if (state.retained_depth_view == nullptr ||
+        state.expected_depth_width.load(std::memory_order_acquire) != expected_width ||
+        state.expected_depth_height.load(std::memory_order_acquire) != expected_height)
+        return nullptr;
+
+    Microsoft::WRL::ComPtr<ID3D11Resource> resource{};
+    state.retained_depth_view->GetResource(resource.GetAddressOf());
+    if (resource == nullptr)
+        return nullptr;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> depth_texture{};
+    if (FAILED(resource.As(&depth_texture)) || depth_texture == nullptr)
+        return nullptr;
+
+    D3D11_DEPTH_STENCIL_VIEW_DESC view_desc{};
+    state.retained_depth_view->GetDesc(&view_desc);
+    DXGI_FORMAT srv_format = DXGI_FORMAT_UNKNOWN;
+    DXGI_FORMAT copy_format = DXGI_FORMAT_UNKNOWN;
+    switch (view_desc.Format) {
+        case DXGI_FORMAT_D32_FLOAT:
+            srv_format = DXGI_FORMAT_R32_FLOAT;
+            copy_format = DXGI_FORMAT_R32_TYPELESS;
+            break;
+        case DXGI_FORMAT_D16_UNORM:
+            srv_format = DXGI_FORMAT_R16_UNORM;
+            copy_format = DXGI_FORMAT_R16_TYPELESS;
+            break;
+        case DXGI_FORMAT_D24_UNORM_S8_UINT:
+            srv_format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+            copy_format = DXGI_FORMAT_R24G8_TYPELESS;
+            break;
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+            srv_format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+            copy_format = DXGI_FORMAT_R32G8X24_TYPELESS;
+            break;
+        default: return nullptr;
+    }
+
+    // Fast path: a typeless engine depth surface can be sampled directly.
+    if (state.depth_srv != nullptr && state.depth_srv_resource == resource.Get()) {
+        state.depth_srv->AddRef();
+        return state.depth_srv;
+    }
+    {
+        D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+        srv_desc.Format = srv_format;
+        srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srv_desc.Texture2D.MostDetailedMip = 0;
+        srv_desc.Texture2D.MipLevels = 1;
+        ID3D11ShaderResourceView* direct = nullptr;
+        if (SUCCEEDED(device->CreateShaderResourceView(resource.Get(), &srv_desc, &direct)) &&
+            direct != nullptr) {
+            SafeRelease(state.depth_srv);
+            SafeRelease(state.depth_srv_resource);
+            resource.CopyTo(&state.depth_srv_resource);
+            state.depth_srv = direct;
+            state.depth_srv_format = srv_format;
+            state.depth_srv->AddRef();
+            return state.depth_srv;
+        }
+    }
+
+    // Fallback: copy the typed depth into a typeless surface we can sample. The
+    // copy is refreshed every call because the depth changes per frame.
+    if (context == nullptr)
+        return nullptr;
+    D3D11_TEXTURE2D_DESC desc{};
+    depth_texture->GetDesc(&desc);
+    const auto copy_reusable =
+        state.depth_copy != nullptr && state.depth_copy_srv != nullptr &&
+        state.depth_copy_source == resource.Get() &&
+        state.depth_copy_format == copy_format &&
+        state.depth_copy_description.Width == desc.Width &&
+        state.depth_copy_description.Height == desc.Height &&
+        state.depth_copy_description.ArraySize == desc.ArraySize;
+    if (!copy_reusable) {
+        SafeRelease(state.depth_copy);
+        SafeRelease(state.depth_copy_srv);
+        SafeRelease(state.depth_copy_source);
+        state.depth_copy_description = {};
+        state.depth_copy_format = DXGI_FORMAT_UNKNOWN;
+        D3D11_TEXTURE2D_DESC copy = desc;
+        copy.Format = copy_format;
+        copy.Usage = D3D11_USAGE_DEFAULT;
+        copy.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        copy.CPUAccessFlags = 0;
+        copy.MipLevels = 1;
+        copy.MiscFlags = 0;
+        if (FAILED(device->CreateTexture2D(&copy, nullptr, &state.depth_copy)) ||
+            state.depth_copy == nullptr) {
+            SafeRelease(state.depth_copy);
+            return nullptr;
+        }
+        D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+        srv_desc.Format = srv_format;
+        srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srv_desc.Texture2D.MostDetailedMip = 0;
+        srv_desc.Texture2D.MipLevels = 1;
+        if (FAILED(device->CreateShaderResourceView(state.depth_copy, &srv_desc, &state.depth_copy_srv)) ||
+            state.depth_copy_srv == nullptr) {
+            SafeRelease(state.depth_copy);
+            return nullptr;
+        }
+        resource.CopyTo(&state.depth_copy_source);
+        state.depth_copy_description = copy;
+        state.depth_copy_format = copy_format;
+    }
+    context->CopyResource(state.depth_copy, resource.Get());
+    state.depth_copy_srv->AddRef();
+    return state.depth_copy_srv;
+}
+
+bool HasActiveMovieCaptureIdentity(const std::string_view capture_name,
+    const std::string_view take_directory) noexcept {
+    auto& state = State();
+    if (!state.active.load(std::memory_order_acquire)) return false;
+    try {
+        const auto directory = Utf8Path(take_directory).lexically_normal();
+        std::lock_guard lock(state.mutex);
+        return state.active.load(std::memory_order_acquire) &&
+            state.capture_name == capture_name && state.take_directory == directory;
+    } catch (...) {
+        return false;
+    }
+}
+
 void SyncMovieCapture(const MovieCaptureConfiguration& configuration) noexcept {
     if (!configuration.active) {
         StopSession();
@@ -1700,13 +1890,78 @@ void SyncMovieCapture(const MovieCaptureConfiguration& configuration) noexcept {
         MarkFatalFailure();
 }
 
+namespace {
+// Only active Beauty takes use this bounded strip readback. Queue it before
+// the existing Beauty readback so its Map does not add a separate GPU fence.
+// Noise/grades must never manufacture new cadence identities.
+bool QueueCadenceSample(ID3D11Device* device, ID3D11DeviceContext* context,
+    ID3D11Texture2D* source) noexcept {
+    auto& state = State();
+    D3D11_TEXTURE2D_DESC desc{};
+    source->GetDesc(&desc);
+    const auto supported = desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+        desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+        desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+        desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    if (!supported || desc.SampleDesc.Count != 1 || desc.Width == 0 || desc.Height == 0)
+        return false;
+    const auto rows = std::min(desc.Height, 36u);
+    if (state.cadence_staging == nullptr ||
+        state.cadence_source_description.Width != desc.Width ||
+        state.cadence_source_description.Height != desc.Height ||
+        state.cadence_source_description.Format != desc.Format) {
+        SafeRelease(state.cadence_staging);
+        D3D11_TEXTURE2D_DESC staging{};
+        staging.Width = desc.Width;
+        staging.Height = rows;
+        staging.MipLevels = staging.ArraySize = staging.SampleDesc.Count = 1;
+        staging.Format = desc.Format;
+        staging.Usage = D3D11_USAGE_STAGING;
+        staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(device->CreateTexture2D(&staging, nullptr, &state.cadence_staging)))
+            return false;
+        state.cadence_source_description = desc;
+    }
+    for (UINT row = 0; row < rows; ++row) {
+        const auto source_y = rows > 1 ? row * (desc.Height - 1) / (rows - 1) : 0;
+        const D3D11_BOX box{0, source_y, 0, desc.Width, source_y + 1, 1};
+        context->CopySubresourceRegion(state.cadence_staging, 0, 0, row, 0, source, 0, &box);
+    }
+    return true;
+}
+
+std::uint64_t ReadCadenceSample(ID3D11DeviceContext* context) noexcept {
+    auto& state = State();
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(context->Map(state.cadence_staging, 0, D3D11_MAP_READ, 0, &mapped)))
+        return 0;
+    MappedResource unmap(context, state.cadence_staging, 0);
+    auto hash = std::uint64_t{14695981039346656037ULL};
+    const auto width = state.cadence_source_description.Width;
+    const auto columns = std::min(width, 64u);
+    const auto rows = std::min(state.cadence_source_description.Height, 36u);
+    for (UINT y = 0; y < rows; ++y) {
+        const auto* row = static_cast<const std::uint8_t*>(mapped.pData) + y * mapped.RowPitch;
+        for (UINT x = 0; x < columns; ++x) {
+            const auto offset = (columns > 1 ? x * (width - 1) / (columns - 1) : 0) * 4u;
+            for (UINT channel = 0; channel < 3; ++channel) {
+                hash ^= row[offset + channel];
+                hash *= 1099511628211ULL;
+            }
+        }
+    }
+    return hash != 0 ? hash : 1;
+}
+} // namespace
+
 void CaptureMovieFrame(
     ID3D11Device* device,
     ID3D11DeviceContext* context,
     IDXGISwapChain* swapchain,
     const std::int64_t replay_tick,
     const CameraSample* rendered_camera,
-    const std::uint64_t camera_frame_sequence) noexcept {
+    const std::uint64_t camera_frame_sequence,
+    ID3D11Texture2D* cadence_color_source) noexcept {
     auto& state = State();
     if (!state.active.load(std::memory_order_acquire))
         return;
@@ -1745,8 +2000,23 @@ void CaptureMovieFrame(
 
     try {
         const auto capture_started = std::chrono::steady_clock::now();
+        struct CapturePredicateScope final {
+            ID3D11DeviceContext* context;
+            Microsoft::WRL::ComPtr<ID3D11Predicate> previous;
+            BOOL value{};
+            explicit CapturePredicateScope(ID3D11DeviceContext* c) : context(c) {
+                context->GetPredication(&previous, &value);
+                context->SetPredication(nullptr, FALSE);
+            }
+            ~CapturePredicateScope() { context->SetPredication(previous.Get(), value); }
+        } predicate_scope(context);
         MovieFrame frame{};
         frame.replay_tick = replay_tick;
+        if (need_color && cadence_color_source != nullptr &&
+            !QueueCadenceSample(device, context, cadence_color_source)) {
+            state.pass_incomplete.store(true, std::memory_order_release);
+            return;
+        }
         if (need_color && !CaptureColor(device, context, swapchain, frame)) {
             state.pass_incomplete.store(true, std::memory_order_release);
             return;
@@ -1764,26 +2034,28 @@ void CaptureMovieFrame(
             state.source_width.store(frame.width, std::memory_order_release);
             state.source_height.store(frame.height, std::memory_order_release);
         }
-        const auto visual_fingerprint = VisualFingerprint(frame);
+        const auto cadence_fingerprint = need_color && cadence_color_source != nullptr
+            ? ReadCadenceSample(context) : 0;
+        if (need_color && cadence_color_source != nullptr && cadence_fingerprint == 0) {
+            state.pass_incomplete.store(true, std::memory_order_release);
+            RecycleFrameBuffers(frame);
+            return;
+        }
+        const auto visual_fingerprint = VisualFingerprint(frame, cadence_fingerprint);
         const auto previous_visual_fingerprint = state.last_visual_fingerprint.exchange(
             visual_fingerprint,
             std::memory_order_acq_rel);
         const auto repeated_visual =
             visual_fingerprint != 0 && visual_fingerprint == previous_visual_fingerprint;
-        if (repeated_visual) {
-            state.repeated_visual_samples_captured.fetch_add(1, std::memory_order_acq_rel);
-        }
-        UpdateMaximum(state.maximum_capture_microseconds, ElapsedMicroseconds(capture_started));
-        if (ShouldSuppressRepeatedMoviePresent(
-                repeated_camera_sequence,
-                repeated_visual)) {
-            // A camera-sequence repeat alone is not enough: world animation can
-            // still advance beneath a stationary camera. Suppress only when
-            // both authoritative camera state and sampled output are unchanged.
+        if (repeated_camera_sequence)
             state.repeated_camera_sequences_captured.fetch_add(1, std::memory_order_acq_rel);
-            RecycleFrameBuffers(frame);
-            return;
-        }
+        if (repeated_visual)
+            state.repeated_visual_samples_captured.fetch_add(1, std::memory_order_acq_rel);
+        UpdateMaximum(state.maximum_capture_microseconds, ElapsedMicroseconds(capture_started));
+        // Never drop a Present while a take is active. Under host_framerate the
+        // replay clock advances on every Present, so suppressing repeated
+        // Presents removed real time from the AVI and shifted every later
+        // frame. Duplicate Presents are part of the capture timebase.
         const auto frame_index = state.observed_frames.fetch_add(1, std::memory_order_acq_rel);
         frame.index = frame_index;
         state.replay_timing_digest.store(
@@ -1859,6 +2131,12 @@ void SetMovieFrameCompositionReady(const bool ready) noexcept {
 void NotifyWorldDepthDeviceLost() noexcept {
     ConfigureWorldDepthObservation(false, 0, 0);
     ReleaseStaging();
+}
+
+void AbortMovieCaptureForDeviceFailure() noexcept {
+    if (State().active.load(std::memory_order_acquire)) MarkFatalFailure();
+    StopSession();
+    NotifyWorldDepthDeviceLost();
 }
 
 void ShutdownWorldDepthCapture() noexcept {

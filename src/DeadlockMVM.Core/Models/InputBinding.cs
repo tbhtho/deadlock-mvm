@@ -21,6 +21,7 @@ public readonly record struct InputBinding(InputBindingKind Kind, uint Code, Inp
 {
     private static readonly IReadOnlyDictionary<string, uint> NamedKeys = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase)
     {
+        ["CapsLock"] = 0x14, ["OemMinus"] = 0xBD, ["OemPlus"] = 0xBB,
         ["Backspace"] = 0x08, ["Tab"] = 0x09, ["Enter"] = 0x0D, ["Escape"] = 0x1B,
         ["Space"] = 0x20, ["PageUp"] = 0x21, ["PageDown"] = 0x22, ["End"] = 0x23,
         ["Home"] = 0x24, ["Left"] = 0x25, ["Up"] = 0x26, ["Right"] = 0x27,

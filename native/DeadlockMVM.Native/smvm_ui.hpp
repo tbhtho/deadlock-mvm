@@ -34,7 +34,7 @@ enum class SmvmSettingsSection : std::uint32_t {
 // Shared with the overlay-side capture state machine.
 inline constexpr std::int32_t kSmvmFirstManualBindingAction = 100;
 inline constexpr std::int32_t kSmvmFirstEditorBindingAction = 111;
-inline constexpr std::int32_t kSmvmLastBindingAction = 128;
+inline constexpr std::int32_t kSmvmLastBindingAction = 135;
 
 inline constexpr std::size_t kSmvmMaxToasts = 3;
 inline constexpr std::uint64_t kSmvmToastDurationMs = 2500;
@@ -55,6 +55,7 @@ enum class SmvmConfirmAction : std::uint32_t {
 
 struct SmvmUiState final {
     SmvmPage page{SmvmPage::capture};
+    SmvmPage effects_page{SmvmPage::visuals};
     SmvmSettingsSection settings_section{SmvmSettingsSection::camera};
     // Remembered window geometry (logical, unscaled pixels).
     bool window_positioned{};
@@ -102,6 +103,21 @@ struct SmvmUiState final {
     std::int32_t movie_capture_fps{60};
     std::uint32_t movie_capture_fps_snapshot{60};
     bool movie_capture_fps_initialized{};
+    std::array<char, 64> look_rename{};
+    bool look_compare{};
+    std::array<char, 96> look_search{};
+    bool look_active_first{};
+    bool look_collapse_all{};
+    int look_jump{-1};
+    int look_info_tab{};
+    LookSettings look_disabled_values{};
+    std::array<float, 7> look_effect_restore{0, 0, .25F, 1, .12F, .18F, .012F};
+    // Native-owned live depth-of-field controls (not part of the wire format).
+    bool dof_enabled{false};
+    float dof_focus{0.5F};
+    float dof_strength{1.0F};
+    float dof_radius{6.0F};
+    bool dof_depth_available{false};
     bool movie_progress_active{};
     std::int64_t movie_progress_start_tick{};
     std::int64_t movie_progress_end_tick{};
@@ -115,6 +131,7 @@ struct SmvmUiFrameParams final {
     bool has_path{};
     const CampathDocumentsPayload* documents{};
     bool menu_open{};
+    bool effects_open{};
     float viewport_width{};
     float viewport_height{};
     std::uint32_t frame_microseconds{};
@@ -137,6 +154,7 @@ struct SmvmUiFrameParams final {
     bool movie_audio_failed{};
     bool movie_depth_observer_active{};
     bool movie_depth_observer_failed{};
+    const char* look_status{"Awaiting renderer"};
     std::uint32_t renderer_error{};
     std::uint64_t raw_mouse_timestamp_ms{};
     std::uint64_t fallback_mouse_timestamp_ms{};
@@ -177,6 +195,7 @@ struct SmvmBindingRowStatus final {
 void SmvmBeginBindingCapture(std::int32_t action, std::uint32_t original) noexcept;
 void SmvmClearBinding(std::int32_t action, std::uint32_t original) noexcept;
 void SmvmCloseMenu() noexcept;
+void SmvmToggleEffectsMenu() noexcept;
 void SmvmOpenMenu() noexcept;
 [[nodiscard]] bool SmvmArmCinematicStart(std::uint64_t replay_session_generation) noexcept;
 void SmvmSetReplayTickInputActive(bool active) noexcept;

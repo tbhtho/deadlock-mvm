@@ -94,13 +94,19 @@ public sealed class NativeReplayCameraClient : IAsyncDisposable
     public Task<InProcessCameraStatus> ClearCampathAsync(CancellationToken cancellationToken = default) =>
         RequestAsync(InProcessMessageType.ClearCampath, Array.Empty<byte>(), cancellationToken);
 
-    public Task<InProcessCameraStatus> UpdateSmvmSnapshotAsync(
+    private ulong _publishedLookLutRevision;
+    public async Task<InProcessCameraStatus> UpdateSmvmSnapshotAsync(
         SmvmSnapshot snapshot,
-        CancellationToken cancellationToken = default) =>
-        RequestAsync(
-            InProcessMessageType.UpdateSmvmSnapshot,
-            InProcessProtocol.SerializeSmvmSnapshot(snapshot),
-            cancellationToken);
+        CancellationToken cancellationToken = default)
+    {
+        if (snapshot.Look is { LutSize: > 0, LutRgb: not null } look && look.LutRevision != _publishedLookLutRevision)
+        {
+            var result = await RequestAsync(InProcessMessageType.SetLookLut, InProcessProtocol.SerializeLookLut(look), cancellationToken).ConfigureAwait(false);
+            if (result.Error != InProcessErrorCode.None) throw new InvalidDataException("Native renderer rejected the LUT upload.");
+            _publishedLookLutRevision = look.LutRevision;
+        }
+        return await RequestAsync(InProcessMessageType.UpdateSmvmSnapshot, InProcessProtocol.SerializeSmvmSnapshot(snapshot), cancellationToken).ConfigureAwait(false);
+    }
 
     public Task<InProcessCameraStatus> SetEditorCampathAsync(
         IReadOnlyList<CampathKeyframe> keyframes,

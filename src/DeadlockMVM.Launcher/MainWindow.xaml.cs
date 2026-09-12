@@ -3,8 +3,8 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using DeadlockMVM.Core.Models;
+using DeadlockMVM.Core.Services;
 using DeadlockMVM.Launcher.ViewModels;
-using Forms = System.Windows.Forms;
 using WpfListBox = System.Windows.Controls.ListBox;
 using WpfOpenFileDialog = Microsoft.Win32.OpenFileDialog;
 
@@ -13,6 +13,39 @@ namespace DeadlockMVM.Launcher;
 public partial class MainWindow : Window
 {
     private readonly LauncherWindowLifecycle _launcherLifecycle = new();
+    private DevConsoleWindow? _devConsole;
+
+    /// <summary>Shared VConsole controller, assigned by App for the optional dev console.</summary>
+    public ReplayController? ConsoleSource { get; set; }
+
+    private void OpenDevConsole_Click(object sender, RoutedEventArgs e)
+    {
+        if (ConsoleSource is not { } controller)
+        {
+            System.Windows.MessageBox.Show(
+                this,
+                "The Deadlock console connection is not ready yet.",
+                "Deadlock MVM",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+            return;
+        }
+
+        if (_devConsole is { IsVisible: true })
+        {
+            _devConsole.Activate();
+            return;
+        }
+
+        _devConsole = new DevConsoleWindow(controller) { Owner = this };
+        _devConsole.Closed += (_, _) => _devConsole = null;
+        _devConsole.Show();
+    }
+
+    private void OpenKeyboardBindings_Click(object sender, RoutedEventArgs e)
+    {
+        if (ViewModel is { } vm) new KeyboardBindingsWindow(vm) { Owner = this }.ShowDialog();
+    }
 
     public MainWindow()
     {
@@ -146,15 +179,14 @@ public partial class MainWindow : Window
 
     private void LocateDeadlockFolderButton_Click(object sender, RoutedEventArgs e)
     {
-        using var dialog = new Forms.FolderBrowserDialog
+        var dialog = new Microsoft.Win32.OpenFolderDialog
         {
-            Description = "Select the Deadlock installation folder",
-            UseDescriptionForTitle = true,
-            ShowNewFolderButton = false,
+            Title = "Select the Deadlock installation folder",
+            Multiselect = false,
         };
 
-        if (dialog.ShowDialog() == Forms.DialogResult.OK)
-            ViewModel?.SetManualDeadlockPath(dialog.SelectedPath);
+        if (dialog.ShowDialog(this) == true)
+            ViewModel?.SetManualDeadlockPath(dialog.FolderName);
     }
 
     private void ImportReplayButton_Click(object sender, RoutedEventArgs e)

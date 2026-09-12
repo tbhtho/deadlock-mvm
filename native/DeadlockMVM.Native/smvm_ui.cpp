@@ -1,5 +1,6 @@
 #include "smvm_ui.hpp"
 
+#include "campath_math.hpp"
 #include "movie_recording_progress.hpp"
 #include "replay_timeline_policy.hpp"
 #include "smvm_theme.hpp"
@@ -127,6 +128,7 @@ void RequestCapture(const FrameContext& context) noexcept {
         static_cast<void>(std::snprintf(generated.data(), generated.size(), "F%u", base - VK_F1 + 1));
     } else {
         switch (base) {
+            case VK_CAPITAL: base_name = "Caps Lock"; break;
             case VK_TAB: base_name = "Tab"; break;
             case VK_RETURN: base_name = "Enter"; break;
             case VK_ESCAPE: base_name = "Esc"; break;
@@ -162,13 +164,13 @@ void RequestCapture(const FrameContext& context) noexcept {
 }
 
 [[nodiscard]] const char* BindingActionName(const std::int32_t action) noexcept {
-    constexpr std::array<const char*, 29> names{
+    constexpr std::array<const char*, 36> names{
         "Forward", "Backward", "Left", "Right", "Up", "Down", "Fast", "Precision",
         "Roll Left", "Roll Right", "Reset Roll", "Menu", "Add Keyframe", "Delete Keyframe",
         "Clean Footage", "Play From Start", "Play From Current", "Stop", "Undo", "Redo",
         "Show Path", "Show Cameras", "Emergency Exit + Restore", "Cycle Replay Interface",
         "Enter Free Camera", "Replay Play/Pause", "Show Labels", "Replay Step Back",
-        "Replay Step Forward",
+        "Replay Step Forward", "Effects panel", "Start ready cinematic", "Slower replay", "Faster replay", "Cancel recording / camera", "Slower camera", "Faster camera",
     };
     return action >= kSmvmFirstManualBindingAction && action <= kSmvmLastBindingAction
         ? names[static_cast<std::size_t>(action - kSmvmFirstManualBindingAction)]
@@ -720,7 +722,7 @@ void DrawPathWorkflow(
     smvm_theme::EndSection();
 }
 
-[[maybe_unused]] void DrawCampathPage(const FrameContext& context) noexcept {
+void DrawCampathPage(const FrameContext& context) noexcept {
     const auto& snapshot = *context.snapshot;
     auto& state = *context.state;
     const auto scale = smvm_theme::GetScale();
@@ -752,9 +754,22 @@ void DrawPathWorkflow(
             std::memcpy(state.save_as_name.data(), current_name, length);
     };
 
-    std::array<char, 32> count_text{};
-    static_cast<void>(std::snprintf(count_text.data(), count_text.size(), "%u keyframes",
-                                    snapshot.keyframe_count));
+    std::array<char, 64> count_text{};
+    if (has_keys && keyframe_count >= 2) {
+        // The recorded clip spans exactly the keyframed tick range, so show the
+        // resulting file length next to the keyframe count. A sub-second path
+        // produces a sub-second AVI even though the replay preview takes
+        // longer at the cinematic slowdown.
+        const auto clip_seconds =
+            static_cast<double>(keys[keyframe_count - 1].demo_tick - keys[0].demo_tick) *
+            kSource2ReplayTickInterval;
+        static_cast<void>(std::snprintf(
+            count_text.data(), count_text.size(), "%u keyframes  |  clip %.1f s",
+            snapshot.keyframe_count, clip_seconds));
+    } else {
+        static_cast<void>(std::snprintf(count_text.data(), count_text.size(),
+                                        "%u keyframes", snapshot.keyframe_count));
+    }
     SecondaryText(count_text.data());
     if (playing) {
         ImGui::SameLine();
@@ -1319,7 +1334,7 @@ void DrawAdvancedSettings(const FrameContext& context) noexcept {
 
 // --- Modals (rendered at shell level so popup IDs share one stack) ---------
 
-[[maybe_unused]] void DrawModals(const FrameContext& context) noexcept {
+void DrawModals(const FrameContext& context) noexcept {
     auto& state = *context.state;
     const auto scale = smvm_theme::GetScale();
 
@@ -1688,31 +1703,104 @@ void DrawMinimalPill(const FrameContext& context) noexcept {
         smvm_theme::colors::kText, text.data());
 }
 
+void DrawAllBindings(const FrameContext& context) noexcept {
+    const auto& snapshot = *context.snapshot;
+    ImGui::TextWrapped("Click a binding, then press the new key. Use Clear to unbind. Changes save to the launcher. Escape cancels key capture.");
+    BindingField("Move forward", snapshot.forward_key, 100);
+    BindingField("Move backward", snapshot.backward_key, 101);
+    BindingField("Move left", snapshot.left_key, 102);
+    BindingField("Move right", snapshot.right_key, 103);
+    BindingField("Move up", snapshot.up_key, 104);
+    BindingField("Move down", snapshot.down_key, 105);
+    BindingField("Fast movement", snapshot.fast_key, 106);
+    BindingField("Precision movement", snapshot.precision_key, 107);
+    BindingField("Roll left", snapshot.roll_left_key, 108);
+    BindingField("Roll right", snapshot.roll_right_key, 109);
+    BindingField("Reset roll", snapshot.roll_reset_key, 110);
+    BindingField("Main menu", snapshot.menu_key, 111);
+    BindingField("Add keyframe", snapshot.add_key, 112);
+    BindingField("Delete keyframe", snapshot.delete_key, 113);
+    BindingField("Clean footage", snapshot.clean_view_key, 114);
+    BindingField("Play path from start", snapshot.play_start_key, 115);
+    BindingField("Play path from current", snapshot.play_current_key, 116);
+    BindingField("Stop path", snapshot.stop_key, 117);
+    BindingField("Undo", snapshot.undo_key, 118);
+    BindingField("Redo", snapshot.redo_key, 119);
+    BindingField("Show path", snapshot.show_path_key, 120);
+    BindingField("Show cameras", snapshot.show_cameras_key, 121);
+    BindingField("Emergency restore UI", snapshot.restore_ui_key, 122);
+    BindingField("Cycle UI", snapshot.cycle_ui_key, 123);
+    BindingField("Toggle free camera", snapshot.toggle_free_camera_key, 124);
+    BindingField("Pause replay", snapshot.replay_pause_key, 125);
+    BindingField("Show labels", snapshot.show_labels_key, 126);
+    BindingField("Step back", snapshot.step_back_key, 127);
+    BindingField("Step forward", snapshot.step_forward_key, 128);
+    BindingField("Effects panel", snapshot.effects_key, 129);
+    BindingField("Start ready cinematic", snapshot.cinematic_start_key, 130);
+    BindingField("Slower replay", snapshot.playback_slower_key, 131);
+    BindingField("Faster replay", snapshot.playback_faster_key, 132);
+    BindingField("Cancel recording / camera", snapshot.cancel_key, 133);
+    BindingField("Slower camera", snapshot.camera_slower_key, 134);
+    BindingField("Faster camera", snapshot.camera_faster_key, 135);
+}
+
 void DrawMovieRecordingMenu(const FrameContext& context) noexcept {
-    if (!context.params->menu_open)
+    if (!context.params->menu_open && !context.params->effects_open)
         return;
 
     const auto& snapshot = *context.snapshot;
     auto& state = *context.state;
-    if (state.page == SmvmPage::replay || state.page == SmvmPage::camera)
-        state.page = SmvmPage::capture;
+    const auto effects = context.params->effects_open;
+    auto& page = effects ? state.effects_page : state.page;
+    if (page == SmvmPage::replay || page == SmvmPage::camera)
+        page = SmvmPage::capture;
     const auto scale = smvm_theme::GetScale();
-    const auto width = std::min(660.0F * scale, context.params->viewport_width - (32.0F * scale));
-    const auto height = std::min(570.0F * scale, context.params->viewport_height - (32.0F * scale));
-    const auto x = std::max(16.0F * scale, (context.params->viewport_width - width) * 0.5F);
-    const auto y = std::max(16.0F * scale, (context.params->viewport_height - height) * 0.5F);
+    // A viewport-bounded inspector stays narrow at high DPI and uses the
+    // available vertical space above the replay timeline.
+    const auto margin = std::min(16.0F * scale, 24.0F);
+    const auto width = effects ? std::min(480.0F * scale, context.params->viewport_width * 0.38F) : std::min(660.0F * scale, context.params->viewport_width - 32.0F * scale);
+    const auto timeline = ComputeReplayTimelineGeometry(
+        context.params->viewport_width, context.params->viewport_height, scale, false);
+    const auto height = effects ? std::max(240.0F, timeline.y - margin * 2.0F) : std::min(570.0F * scale, context.params->viewport_height - 32.0F * scale);
+    const auto x = effects ? context.params->viewport_width - width - margin : (context.params->viewport_width - width) * .5F;
+    const auto y = effects ? margin : (context.params->viewport_height - height) * .5F;
 
-    ImGui::SetNextWindowPos(ImVec2(x, y), ImGuiCond_Always);
+    ImGui::SetNextWindowPos(ImVec2(x, y), effects ? ImGuiCond_Always : ImGuiCond_Once);
     ImGui::SetNextWindowSize(ImVec2(width, height), ImGuiCond_Always);
-    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.97F);
-    ImGui::PushStyleVar(
-        ImGuiStyleVar_WindowPadding,
-        ImVec2(20.0F * scale, 16.0F * scale));
+    if (effects) {
+    // Scope the reference's compact charcoal/blue skin to this inspector.
+    ImGui::PushFont(smvm_theme::GetFonts().mono);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 1.0F);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0F * scale, 6.0F * scale));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(2.0F * scale, 2.0F * scale));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.0F * scale, 4.0F * scale));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0F);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0F * scale);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 3.0F * scale);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0F);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0F);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(.12F, .12F, .12F, 1));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(.115F, .115F, .115F, 1));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(.34F, .34F, .34F, 1));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(.15F, .16F, .16F, 1));
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(.23F, .32F, .46F, 1));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(.32F, .44F, .62F, 1));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(.36F, .50F, .72F, 1));
+    ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(.23F, .32F, .46F, 1));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(.32F, .44F, .62F, 1));
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(.36F, .50F, .72F, 1));
+    ImGui::PushStyleColor(ImGuiCol_CheckMark, ImVec4(.38F, .57F, .86F, 1));
+    ImGui::PushStyleColor(ImGuiCol_SliderGrab, ImVec4(.38F, .57F, .86F, 1));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(.80F, .80F, .80F, 1));
+    } else {
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, .97F);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(20.0F * scale, 16.0F * scale));
+    }
     const auto open = ImGui::Begin(
-        "##deadlockmvm_movie_tools",
+        effects ? "##deadlockmvm_effects" : "Deadlock MVM - drag to move###deadlockmvm_movie_tools",
         nullptr,
-        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+        (effects ? ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove : 0) | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoCollapse |
             ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
             ImGuiWindowFlags_NoSavedSettings);
     if (open) {
@@ -1723,39 +1811,24 @@ void DrawMovieRecordingMenu(const FrameContext& context) noexcept {
         const auto finalizing =
             (snapshot.movie_recording_flags & movie_recording_finalizing) != 0;
         const auto ready = context.params->cinematic_start_ready;
-        const auto status_color = active
-            ? smvm_theme::colors::kWarning
-            : (armed || ready ? smvm_theme::colors::kSuccess : smvm_theme::colors::kMuted);
-        ImGui::TextColored(
-            smvm_theme::Vec4(status_color),
-            "%s",
-            active ? "RECORDING" :
-            finalizing ? "FINISHING FILES" :
-            armed ? "READY TO RECORD" :
-            ready ? "CINEMATIC READY" : "TAKE SETTINGS");
-        ImGui::SameLine();
-        ImGui::TextDisabled("%u FPS", snapshot.movie_recording_fps);
-        ImGui::SameLine(width - (72.0F * scale));
-        if (smvm_theme::Button(kTimes, true, ImVec2(30.0F * scale, 0.0F)))
-            SmvmCloseMenu();
-
-        const auto tab_width =
-            (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 2.0F) / 3.0F;
-        const auto tab = [&state, tab_width](const char* label, const SmvmPage page) noexcept {
-            const auto selected = state.page == page;
-            if (selected)
-                ImGui::PushStyleColor(ImGuiCol_Button, smvm_theme::Vec4(smvm_theme::colors::kAccent));
-            const auto pressed = ImGui::Button(label, ImVec2(tab_width, 0.0F));
-            if (selected)
-                ImGui::PopStyleColor();
-            if (pressed)
-                state.page = page;
+        const auto tab = [&page, &state, effects](const char* label, SmvmPage target, int info = 0) {
+            const auto selected = page == target && (!effects || state.look_info_tab == info);
+            if (selected) ImGui::PushStyleColor(ImGuiCol_Button, effects ? ImVec4(.36F,.50F,.72F,1) : smvm_theme::Vec4(smvm_theme::colors::kAccent));
+            if (ImGui::Button(label)) { page = target; state.look_info_tab = info; }
+            if (selected) ImGui::PopStyleColor();
+            ImGui::SameLine();
         };
-        tab("RECORD", SmvmPage::capture);
-        ImGui::SameLine();
-        tab("PASSES", SmvmPage::settings);
-        ImGui::SameLine();
-        tab("LOOK", SmvmPage::visuals);
+        if (effects) {
+            tab("Home", SmvmPage::visuals);
+            tab("Keybinds", SmvmPage::campath);
+            tab("Stats", SmvmPage::visuals, 1);
+            tab("About", SmvmPage::visuals, 2);
+        } else {
+            tab("RECORD", SmvmPage::capture);
+            tab("PASSES", SmvmPage::settings);
+            tab("CAMPATHS", SmvmPage::campath);
+        }
+        ImGui::NewLine();
         ImGui::Separator();
 
         const auto draw_recording_option = [&context, &snapshot](
@@ -1795,12 +1868,16 @@ void DrawMovieRecordingMenu(const FrameContext& context) noexcept {
 
         ImGui::BeginChild(
             "##movie_setup_page",
-            ImVec2(0.0F, height - (235.0F * scale)),
+            ImVec2(0.0F, std::max(80.0F, ImGui::GetContentRegionAvail().y -
+                (effects || page == SmvmPage::campath ? 0.0F : 150.0F * scale))),
             false,
-            ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar |
-                ImGuiWindowFlags_NoScrollWithMouse);
-        ImGui::BeginDisabled(active || armed || finalizing);
-        if (state.page == SmvmPage::capture) {
+            ImGuiWindowFlags_NoBackground);
+        ImGui::BeginDisabled((active || armed || finalizing) && page != SmvmPage::campath);
+        if (effects && page == SmvmPage::campath) {
+            DrawAllBindings(context);
+        } else if (!effects && page == SmvmPage::campath) {
+            DrawCampathPage(context);
+        } else if (page == SmvmPage::capture) {
             auto preset = static_cast<int>(snapshot.movie_recording_preset);
             ImGui::SetNextItemWidth(250.0F * scale);
             if (ImGui::Combo(
@@ -1879,8 +1956,16 @@ void DrawMovieRecordingMenu(const FrameContext& context) noexcept {
                         -1,
                         static_cast<double>(fps_choices[index]));
             }
-            const auto timeline_slowdown =
-                static_cast<double>(snapshot.movie_recording_fps) / 60.0;
+            const auto cinematic_speed =
+                snapshot.timescale > 0.0 && std::isfinite(snapshot.timescale)
+                    ? snapshot.timescale
+                    : 1.0;
+            // The saved clip already carries the cinematic slowdown, so its
+            // declared frame rate is the sampling rate scaled by the preview
+            // speed instead of the raw capture rate.
+            const auto clip_fps = std::max(
+                1.0,
+                static_cast<double>(snapshot.movie_recording_fps) * cinematic_speed);
             if (snapshot.movie_output_mode != MovieOutputMode::image_sequence &&
                 (snapshot.movie_capture_pass_flags & movie_capture_pass_beauty) != 0) {
                 const auto output_dimensions = ResolveMovieOutputDimensions(
@@ -1900,18 +1985,16 @@ void DrawMovieRecordingMenu(const FrameContext& context) noexcept {
                      movie_capture_pass_greenscreen_free_camera) != 0 ? 1u : 0u;
                 const auto peak_avi_count = std::max(1u, std::max(world_avi_count, chroma_avi_count));
                 ImGui::TextDisabled(
-                    "%.1fx slow motion at 60 FPS  |  ~%.1f GiB/s",
-                    timeline_slowdown,
+                    "%.0f FPS clip at %.2fx speed  |  ~%.1f GiB/s",
+                    clip_fps,
+                    cinematic_speed,
                     gib_per_second * peak_avi_count);
             } else {
                 ImGui::TextDisabled(
-                    "%.1fx slow motion at 60 FPS",
-                    timeline_slowdown);
+                    "%.0f FPS clip at %.2fx speed",
+                    clip_fps,
+                    cinematic_speed);
             }
-            const auto cinematic_speed =
-                snapshot.timescale > 0.0 && std::isfinite(snapshot.timescale)
-                    ? snapshot.timescale
-                    : 1.0;
             ImGui::TextColored(
                 smvm_theme::Vec4(smvm_theme::colors::kSuccess),
                 "Cinematic speed: %.2fx",
@@ -1927,7 +2010,7 @@ void DrawMovieRecordingMenu(const FrameContext& context) noexcept {
                 movie_recording_mute_dialogue,
                 MovieRecordingOption::mute_dialogue,
                 "Keeps other game sounds.");
-        } else if (state.page == SmvmPage::settings) {
+        } else if (page == SmvmPage::settings) {
             ImGui::TextUnformatted("Choose your files");
             draw_pass(
                 "World",
@@ -1958,30 +2041,161 @@ void DrawMovieRecordingMenu(const FrameContext& context) noexcept {
                     "RECORDS TWICE: WORLD + DEPTH, THEN GREEN SCREEN");
             }
             ImGui::TextDisabled("Stopped or incomplete files are marked PARTIAL.");
-        } else if (state.page == SmvmPage::visuals) {
-            auto thirds = (snapshot.movie_tool_flags & movie_tool_rule_of_thirds) != 0;
-            if (ImGui::Checkbox("Rule of thirds", &thirds))
-                QueueAction(
-                    context,
-                    SmvmActionType::set_rule_of_thirds,
-                    -1,
-                    -1,
-                    thirds ? 1.0 : 0.0);
-            smvm_theme::Tooltip("Preview guide only; it is never burned into captures.");
+        } else if (page == SmvmPage::visuals) {
+            if (state.look_info_tab == 1) {
+                ImGui::TextWrapped("%s", context.params->look_status);
+                ImGui::Separator();
+                ImGui::Text("Capture target: %u FPS", snapshot.movie_recording_fps);
+                ImGui::TextWrapped("GPU timings measure effects only. Game rendering, source recovery and capture readback are excluded.");
+            } else if (state.look_info_tab == 2) {
+                ImGui::TextUnformatted("Deadlock MVM - In-house Reshade");
+                auto thirds = (snapshot.movie_tool_flags & movie_tool_rule_of_thirds) != 0;
+                if (ImGui::Checkbox("Rule of thirds preview guide", &thirds))
+                    QueueAction(context, SmvmActionType::set_rule_of_thirds, -1, -1, thirds ? 1.0 : 0.0);
 
-            const auto greenscreen =
-                snapshot.greenscreen_mode == GreenscreenMode::free_camera;
-            ImGui::TextUnformatted("Preview");
+                ImGui::Separator();
+                ImGui::TextWrapped("Integrated D3D11 post-processing. Effects apply before the editor and Beauty export; raw depth and chroma stay clean.");
+                ImGui::TextWrapped("SDR color grading, bloom, 3D CUBE LUT, sharpening, vignette and deterministic grain. Depth effects require validated scene depth.");
+
+                ImGui::Separator();
+                if (ImGui::Button("Exit Deadlock", ImVec2(ImGui::GetContentRegionAvail().x, 0.0F)))
+                    QueueAction(context, SmvmActionType::exit_deadlock);
+                smvm_theme::Tooltip("Force-closes the game immediately.");
+            } else {
+            const auto& look = snapshot.look;
+            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 54.0F * scale);
+            if (ImGui::BeginCombo("##look_preset", snapshot.look_preset_name[0] ? snapshot.look_preset_name.data() : "Neutral")) {
+                constexpr std::array<const char*, 6> names{"Neutral", "Clean Cinematic", "Warm Film", "Cool Night", "Moody Contrast", "Soft Dream"};
+                for (std::size_t i = 0; i < names.size(); ++i)
+                    if (ImGui::Selectable(names[i])) QueueAction(context, SmvmActionType::select_look_preset, static_cast<std::int32_t>(i));
+                ImGui::EndCombo();
+            }
             ImGui::SameLine();
-            ImGui::TextColored(
-                smvm_theme::Vec4(
-                    greenscreen ? smvm_theme::colors::kSuccess : smvm_theme::colors::kMuted),
-                "%s",
-                greenscreen ? "GREEN SCREEN" : "WORLD");
+            if (ImGui::Button("+")) QueueAction(context, SmvmActionType::save_look_preset, 1);
+            smvm_theme::Tooltip("Save As / Duplicate look");
+            ImGui::SameLine();
+            if (ImGui::Button("...")) ImGui::OpenPopup("Preset options");
+            smvm_theme::Tooltip("Preset options");
+            if (ImGui::BeginPopup("Preset options")) {
+            if (ImGui::SmallButton("Save look")) QueueAction(context, SmvmActionType::save_look_preset, 0);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Save As / Duplicate")) QueueAction(context, SmvmActionType::save_look_preset, 1);
+            if (ImGui::SmallButton("Rename look")) {
+                state.look_rename = snapshot.look_preset_name;
+                ImGui::OpenPopup("Rename Reshade look");
+            }
+            if (ImGui::BeginPopup("Rename Reshade look")) {
+                ImGui::InputText("Name", state.look_rename.data(), 49);
+                if (ImGui::Button("Apply name")) {
+                    QueueAction(context, SmvmActionType::save_look_preset, 2, -1, 0, state.look_rename.data());
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::TextDisabled("Factory definitions are protected; save a user copy.");
+                ImGui::EndPopup();
+            }
+            if (ImGui::SmallButton("Open / Import look")) QueueAction(context, SmvmActionType::import_look_preset);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Export look")) QueueAction(context, SmvmActionType::export_look_preset);
+                ImGui::EndPopup();
+            }
 
+            if (ImGui::SmallButton("Load LUT...")) QueueAction(context, SmvmActionType::load_look_lut);
+            ImGui::Separator();
+            auto look_enabled = look.enabled != 0;
+            if (ImGui::Checkbox("Enable effects", &look_enabled))
+                QueueAction(context, SmvmActionType::set_look_enabled, -1, -1, look_enabled ? 1.0 : 0.0);
+            if (snapshot.look_modified) ImGui::TextDisabled("Modified (unsaved)");
+            if (ImGui::SmallButton("Reset Reshade")) QueueAction(context, SmvmActionType::reset_look);
+            smvm_theme::Tooltip("Resets only Reshade. Fog, camera and capture settings are preserved.");
+            ImGui::SameLine();
+            ImGui::Button("Hold: before / after");
+            state.look_compare = ImGui::IsItemActive();
+            smvm_theme::Tooltip("Temporary ungraded preview. The recorded look is unchanged.");
+            const auto search_buttons_width = ImGui::CalcTextSize("Active to top").x +
+                ImGui::CalcTextSize("Collapse all").x + ImGui::GetStyle().FramePadding.x * 4 +
+                ImGui::GetStyle().ItemSpacing.x * 2;
+            ImGui::SetNextItemWidth(std::max(60.0F * scale, ImGui::GetContentRegionAvail().x - search_buttons_width));
+            ImGui::InputTextWithHint("##effect_search", "Search", state.look_search.data(), state.look_search.size());
+            ImGui::SameLine();
+            if (ImGui::Button("Active to top")) state.look_active_first = !state.look_active_first;
+            ImGui::SameLine();
+            if (ImGui::Button("Collapse all")) state.look_collapse_all = true;
+            const ImGuiTextFilter filter(state.look_search.data());
+            constexpr std::array<const char*, 8> effect_names{"Fog", "Color", "Bloom", "LUT", "Sharpen", "Vignette", "Grain", "Depth of Field"};
+            const std::array<bool, 8> enabled{
+                (snapshot.movie_tool_flags & movie_tool_custom_fog) != 0,
+                look.enabled != 0 && (look.exposure != 0 || look.contrast != 1 || look.saturation != 1 || look.temperature != 0 || look.tint != 0 || look.lift_r != 0 || look.lift_g != 0 || look.lift_b != 0 || look.gamma_r != 1 || look.gamma_g != 1 || look.gamma_b != 1 || look.gain_r != 1 || look.gain_g != 1 || look.gain_b != 1 || look.shadows != 0 || look.highlights != 0 || look.vibrance != 0),
+                look.enabled != 0 && look.bloom_intensity > 0,
+                look.enabled != 0 && look.lut_intensity > 0 && look.lut_size > 0,
+                look.enabled != 0 && look.sharpen > 0,
+                look.enabled != 0 && look.vignette > 0,
+                look.enabled != 0 && look.grain_strength > 0,
+                state.dof_enabled};
+            const auto list_height = std::max(110.0F * scale, ImGui::GetContentRegionAvail().y * .43F);
+            ImGui::BeginChild("##effects_list", ImVec2(0, list_height), true);
+            for (int pass = 0; pass < (state.look_active_first ? 2 : 1); ++pass) {
+            for (std::size_t i = 0; i < effect_names.size(); ++i) {
+                    if (!filter.PassFilter(effect_names[i]) || (state.look_active_first && enabled[i] != (pass == 0))) continue;
+                    ImGui::PushID(static_cast<int>(i));
+                    auto on = enabled[i];
+                    ImGui::BeginDisabled(i == 3 && look.lut_size == 0);
+                    if (ImGui::Checkbox("##enabled", &on)) {
+                        if (i == 0) QueueAction(context, SmvmActionType::set_custom_fog_enabled, -1, -1, on ? 1 : 0);
+                        else if (i == 7) {
+                            // Native-owned: no wire action, no Reshade grading change.
+                            state.dof_enabled = on;
+                        }
+                        else {
+                            if (on && !look.enabled) QueueAction(context, SmvmActionType::set_look_enabled, -1, -1, 1);
+                            if (i == 1) {
+                                const LookSettings neutral{};
+                                const auto color_differs = [&neutral](const LookSettings& values) {
+                                    return std::memcmp(reinterpret_cast<const char*>(&values) + 20,
+                                        reinterpret_cast<const char*>(&neutral) + 20, 17 * sizeof(float)) != 0;
+                                };
+                                if (!on || (!look.enabled && color_differs(look))) state.look_disabled_values = look;
+                                for (int field = 1; field <= 17; ++field) {
+                                    float value{};
+                                    const auto& source = on ? state.look_disabled_values : neutral;
+                                    std::memcpy(&value, reinterpret_cast<const char*>(&source) + 16 + field * 4, sizeof(value));
+                                    if (on && field == 2 && !color_differs(source)) value = 1.06F;
+                                    QueueAction(context, SmvmActionType::set_look_value, field, -1, value);
+                                }
+                            } else {
+                                constexpr std::array<int, 7> fields{0, 0, 20, 25, 22, 23, 24};
+                                const std::array<float, 7> current{0, 0, look.bloom_intensity, look.lut_intensity,
+                                    look.sharpen, look.vignette, look.grain_strength};
+                                if (!on) state.look_effect_restore[i] = current[i];
+                                const auto restored = current[i] > 0 ? current[i] : state.look_effect_restore[i];
+                                QueueAction(context, SmvmActionType::set_look_value, fields[i], -1, on ? restored : 0);
+                            }
+                        }
+                    }
+                    ImGui::EndDisabled();
+                    ImGui::SameLine();
+                    if (!enabled[i]) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(.48F,.48F,.48F,1));
+                    if (ImGui::Selectable(effect_names[i], state.look_jump == static_cast<int>(i)) && enabled[i]) state.look_jump = static_cast<int>(i);
+                    if (!enabled[i]) ImGui::PopStyleColor();
+                    ImGui::PopID();
+                }
+            }
+            ImGui::EndChild();
+            ImGui::Separator();
+            ImGui::BeginChild("##effect_parameters", ImVec2(0, -30.0F * scale), true);
+            const auto section = [&](const char* label, int group) {
+                if (!enabled[group]) return false;
+                if (state.look_collapse_all) ImGui::SetNextItemOpen(false, ImGuiCond_Always);
+                if (state.look_jump == group) ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+                const auto expanded = ImGui::CollapsingHeader(label, ImGuiTreeNodeFlags_DefaultOpen);
+                if (state.look_jump == group) { ImGui::SetScrollHereY(0); state.look_jump = -1; }
+                return expanded;
+            };
+
+            const auto greenscreen = snapshot.greenscreen_mode == GreenscreenMode::free_camera;
+            if (section("Fog", 0)) {
             auto fog_enabled = (snapshot.movie_tool_flags & movie_tool_custom_fog) != 0;
             ImGui::BeginDisabled(greenscreen);
-            if (ImGui::Checkbox("Fog", &fog_enabled))
+            if (ImGui::Checkbox("Enable Fog", &fog_enabled))
                 QueueAction(
                     context,
                     SmvmActionType::set_custom_fog_enabled,
@@ -2030,10 +2244,98 @@ void DrawMovieRecordingMenu(const FrameContext& context) noexcept {
             ImGui::EndDisabled();
             if (greenscreen)
                 ImGui::TextDisabled("Fog is off during Green Screen.");
+            }
+            ImGui::BeginDisabled(!look_enabled || greenscreen);
+            const auto look_slider = [&](const char* label, const float current, const float minimum, const float maximum, const std::int32_t index) {
+                auto value = current;
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * .68F);
+                if (ImGui::SliderFloat(label, &value, minimum, maximum, "%.3f", ImGuiSliderFlags_AlwaysClamp))
+                    QueueAction(context, SmvmActionType::set_look_value, index, -1, value);
+                if (ImGui::BeginPopupContextItem(label)) {
+                    if (ImGui::Selectable("Reset parameter")) {
+                        const LookSettings defaults{};
+                        float reset{};
+                        if (index >= 0 && index < 25) std::memcpy(&reset, reinterpret_cast<const char*>(&defaults) + 16 + index * 4, sizeof(float));
+                        QueueAction(context, SmvmActionType::set_look_value, index, -1, reset);
+                    }
+                    ImGui::EndPopup();
+                }
+            };
+            if (look_enabled) look_slider("Look strength", look.strength, 0.0F, 1.0F, 0);
+            if (section("Color", 1)) {
+                look_slider("Exposure", look.exposure, -5.0F, 5.0F, 1);
+                look_slider("Contrast", look.contrast, 0.0F, 2.0F, 2);
+                look_slider("Saturation", look.saturation, 0.0F, 2.0F, 3);
+                look_slider("Temperature", look.temperature, -1.0F, 1.0F, 4);
+                look_slider("Tint", look.tint, -1.0F, 1.0F, 5);
+                look_slider("Lift R", look.lift_r, -1.0F, 1.0F, 6);
+                look_slider("Lift G", look.lift_g, -1.0F, 1.0F, 7);
+                look_slider("Lift B", look.lift_b, -1.0F, 1.0F, 8);
+                look_slider("Gamma R", look.gamma_r, 0.1F, 4.0F, 9);
+                look_slider("Gamma G", look.gamma_g, 0.1F, 4.0F, 10);
+                look_slider("Gamma B", look.gamma_b, 0.1F, 4.0F, 11);
+                look_slider("Gain R", look.gain_r, 0.0F, 4.0F, 12);
+                look_slider("Gain G", look.gain_g, 0.0F, 4.0F, 13);
+                look_slider("Gain B", look.gain_b, 0.0F, 4.0F, 14);
+                look_slider("Shadows", look.shadows, -1.0F, 1.0F, 15);
+                look_slider("Highlights", look.highlights, -1.0F, 1.0F, 16);
+                look_slider("Vibrance", look.vibrance, -1.0F, 1.0F, 17);
+            }
+            if (section("Bloom", 2)) {
+                look_slider("Threshold", look.bloom_threshold, 0.0F, 1.0F, 18);
+                look_slider("Knee", look.bloom_knee, 0.0F, 1.0F, 19);
+                look_slider("Intensity", look.bloom_intensity, 0.0F, 2.0F, 20);
+                look_slider("Radius", look.bloom_radius, 0.25F, 4.0F, 21);
+                auto quality = static_cast<int>(look.bloom_quality);
+                if (ImGui::Combo("Bloom quality", &quality, "Low\0Medium\0High\0")) QueueAction(context, SmvmActionType::set_look_value, 26, -1, quality);
+            }
+            if (section("LUT", 3)) {
+                ImGui::TextWrapped("3D CUBE, size 2-33. Trilinear SDR color lookup.");
+                if (ImGui::Button("Load .cube")) QueueAction(context, SmvmActionType::load_look_lut);
+                ImGui::Text("Loaded cube: %u", look.lut_size);
+                ImGui::BeginDisabled(look.lut_size == 0);
+                look_slider("LUT intensity", look.lut_intensity, 0.0F, 1.0F, 25);
+                ImGui::EndDisabled();
+            }
+            if (section("Sharpen", 4)) look_slider("Sharpen", look.sharpen, 0.0F, 1.0F, 22);
+            if (section("Vignette", 5)) look_slider("Vignette", look.vignette, 0.0F, 1.0F, 23);
+            if (section("Grain", 6)) {
+                look_slider("Grain Strength", look.grain_strength, 0.0F, 0.2F, 24);
+                auto seed = look.grain_seed;
+                if (ImGui::InputScalar("Grain seed", ImGuiDataType_U32, &seed)) QueueAction(context, SmvmActionType::set_look_value, 27, -1, static_cast<double>(seed));
+                ImGui::TextWrapped("Grain is deterministic; seed is stored in the preset.");
+            }
+            if (section("Depth of Field", 7)) {
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * .68F);
+                ImGui::SliderFloat("Focus", &state.dof_focus, 0.0F, 1.0F, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+                smvm_theme::Tooltip("Higher is closer to the camera (reversed-Z depth).");
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * .68F);
+                ImGui::SliderFloat("Defocus", &state.dof_strength, 0.0F, 8.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+                smvm_theme::Tooltip("How quickly blur grows away from the focus plane.");
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * .68F);
+                ImGui::SliderFloat("Max blur", &state.dof_radius, 0.0F, 24.0F, "%.1f px", ImGuiSliderFlags_AlwaysClamp);
+                ImGui::TextDisabled(state.dof_depth_available
+                    ? "Uses the live world depth."
+                    : "Waiting for sampleable world depth...");
+            }
+            ImGui::EndDisabled();
+            if (greenscreen) ImGui::TextDisabled("Reshade is bypassed for clean chroma.");
+
+
+            state.look_collapse_all = false;
+            ImGui::EndChild();
+            if (ImGui::Button("Save look", ImVec2(ImGui::GetContentRegionAvail().x * .5F, 0)))
+                QueueAction(context, SmvmActionType::save_look_preset, 0);
+            ImGui::SameLine();
+            if (ImGui::Button("Reset all to default", ImVec2(ImGui::GetContentRegionAvail().x, 0)))
+                QueueAction(context, SmvmActionType::reset_look);
+            }
+
         }
         ImGui::EndDisabled();
         ImGui::EndChild();
 
+        if (!effects && page != SmvmPage::campath) {
         ImGui::Separator();
         ImGui::TextDisabled(active || armed || finalizing ? "SAVING TO" : "CAPTURE FOLDER");
         ImGui::SameLine();
@@ -2159,30 +2461,35 @@ void DrawMovieRecordingMenu(const FrameContext& context) noexcept {
         } else {
             const auto main_label = armed ? "Cancel recording" :
                 (ready ? "Record this cinematic" : "Record next cinematic");
+            const auto offer_play_without_recording = ready && !armed;
             if (smvm_theme::PrimaryButton(
                     main_label,
                     armed || can_arm,
-                    ImVec2((ImGui::GetContentRegionAvail().x - (8.0F * scale)) * 0.62F, 0.0F))) {
+                    ImVec2(
+                        offer_play_without_recording
+                            ? (ImGui::GetContentRegionAvail().x - (8.0F * scale)) * 0.62F
+                            : ImGui::GetContentRegionAvail().x,
+                        0.0F))) {
                 if (QueueAction(
                         context,
                         armed ? SmvmActionType::stop_movie_recording
                               : SmvmActionType::start_movie_recording))
                     SmvmCloseMenu();
             }
-            ImGui::SameLine();
-            const auto secondary_label = ready ? "Play without recording" :
-                (armed ? "Cancel and close" : "Close");
-            if (ImGui::Button(
-                    secondary_label,
-                    ImVec2(ImGui::GetContentRegionAvail().x, 0.0F))) {
-                if (armed)
-                    QueueAction(context, SmvmActionType::stop_movie_recording);
-                SmvmCloseMenu();
+            if (offer_play_without_recording) {
+                ImGui::SameLine();
+                if (ImGui::Button(
+                        "Play without recording",
+                        ImVec2(ImGui::GetContentRegionAvail().x, 0.0F))) {
+                    SmvmCloseMenu();
+                }
             }
         }
     }
+    }
     ImGui::End();
-    ImGui::PopStyleVar(2);
+    if (effects) { ImGui::PopStyleVar(9); ImGui::PopStyleColor(13); ImGui::PopFont(); }
+    else ImGui::PopStyleVar(2);
 }
 
 void DrawCampathMiniMenu(const FrameContext& context) noexcept {
@@ -2199,13 +2506,15 @@ void DrawCampathMiniMenu(const FrameContext& context) noexcept {
         return;
 
     const auto& snapshot = *context.snapshot;
+    auto& state = *context.state;
     const auto scale = smvm_theme::GetScale();
     const auto width = 196.0F * scale;
     const auto row_height = 24.0F * scale;
     // Leave a full extra row of breathing room around the list and actions.
     // The previous base height technically fit the rows but clipped the first
     // entry once the header, separators, and footer buttons were laid out.
-    const auto base_height = 108.0F * scale;
+    // The Save Path row added one more button plus spacing.
+    const auto base_height = 140.0F * scale;
     const auto available_height = std::max(
         106.0F * scale,
         context.params->viewport_height - (106.0F * scale));
@@ -2301,6 +2610,28 @@ void DrawCampathMiniMenu(const FrameContext& context) noexcept {
         const auto playing = (snapshot.flags & smvm_snapshot_campath_playing) != 0;
         const auto selected = snapshot.selected_keyframe >= 0 &&
             snapshot.selected_keyframe < static_cast<std::int32_t>(count);
+        // Save the whole placed keyframe bunch. A path that has never been
+        // named opens the Save-As modal so the owner can name it; an existing
+        // named path is overwritten in place.
+        if (smvm_theme::PrimaryButton(
+                "Save Path",
+                context.params->menu_open && count >= 2 && !playing,
+                ImVec2(ImGui::GetContentRegionAvail().x, 0.0F))) {
+            if (snapshot.campath_session == SmvmCampathSession::saved_path) {
+                QueueAction(context, SmvmActionType::save_path);
+            } else {
+                state.save_as_name.fill('\0');
+                const auto* current_name = snapshot.path_name.data();
+                if (current_name[0] != '\0' &&
+                    std::strcmp(current_name, "Untitled Path") != 0) {
+                    const auto length = std::min(
+                        std::strlen(current_name), state.save_as_name.size() - 1);
+                    std::memcpy(state.save_as_name.data(), current_name, length);
+                }
+                state.open_save_as_modal = true;
+            }
+        }
+        ImGui::Spacing();
         const auto button_width =
             (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5F;
         if (smvm_theme::Button(
@@ -2487,6 +2818,59 @@ void DrawReplayPauseIndicator(const FrameContext& context) noexcept {
     ImGui::PopStyleVar(2);
 }
 
+// A prominent, always-on-top readiness badge while a movie take is armed. A
+// filled red dot means the replay has landed on the first camera and the start
+// key will begin the recorded cinematic; a hollow amber dot means the take is
+// armed but the free-camera boundary is not ready yet.
+void DrawRecordingReadinessBadge(const FrameContext& context) noexcept {
+    const auto& snapshot = *context.snapshot;
+    const auto armed = (snapshot.movie_recording_flags & movie_recording_armed) != 0;
+    if (!armed)
+        return;
+    const auto ready = context.params->cinematic_start_ready;
+    const auto scale = smvm_theme::GetScale();
+    const auto start_key = FormatInput(snapshot.cinematic_start_key);
+    const auto color = ready ? smvm_theme::colors::kError : smvm_theme::colors::kWarning;
+    const auto* label = ready ? "READY TO RECORD" : "RECORDING ARMED";
+
+    ImGui::SetNextWindowPos(
+        ImVec2(context.params->viewport_width * 0.5F, 18.0F * scale),
+        ImGuiCond_Always,
+        ImVec2(0.5F, 0.0F));
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.95F);
+    ImGui::PushStyleVar(
+        ImGuiStyleVar_WindowPadding,
+        ImVec2(12.0F * scale, 9.0F * scale));
+    if (ImGui::Begin(
+            "##deadlockmvm_record_ready",
+            nullptr,
+            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+                ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize |
+                ImGuiWindowFlags_NoInputs)) {
+        const auto radius = 6.0F * scale;
+        const auto line_height = ImGui::GetTextLineHeight();
+        const auto origin = ImGui::GetCursorScreenPos();
+        auto* draw = ImGui::GetWindowDrawList();
+        const auto center = ImVec2(origin.x + radius, origin.y + (line_height * 0.5F));
+        if (ready)
+            draw->AddCircleFilled(center, radius, color, 20);
+        else
+            draw->AddCircle(center, radius, color, 20, 2.0F * scale);
+        ImGui::Dummy(ImVec2(radius * 2.0F, line_height));
+        ImGui::SameLine();
+        ImGui::PushFont(smvm_theme::GetFonts().section);
+        ImGui::TextColored(smvm_theme::Vec4(color), "%s", label);
+        ImGui::PopFont();
+        if (ready && start_key[0] != '\0') {
+            ImGui::SameLine();
+            ImGui::TextDisabled("PRESS %s", start_key.data());
+        }
+    }
+    ImGui::End();
+    ImGui::PopStyleVar(2);
+}
+
 void DrawCenteredProgressPrompt(const FrameContext& context, const char* text) noexcept {
     const auto scale = smvm_theme::GetScale();
     const auto& fonts = smvm_theme::GetFonts();
@@ -2521,8 +2905,12 @@ void DrawCenteredProgressPrompt(const FrameContext& context, const char* text) n
 }
 
 void DrawCinematicStartPrompt(const FrameContext& context) noexcept {
-    if (context.params->cinematic_start_ready)
-        DrawCenteredProgressPrompt(context, "SPACE TO START CINEMATIC");
+    if (context.params->cinematic_start_ready) {
+        const auto key = FormatInput(context.snapshot->cinematic_start_key);
+        std::array<char, 96> prompt{};
+        static_cast<void>(std::snprintf(prompt.data(), prompt.size(), "%s TO START CINEMATIC", key.data()));
+        DrawCenteredProgressPrompt(context, prompt.data());
+    }
 }
 
 void DrawUpdatingTicksPrompt(const FrameContext& context) noexcept {
@@ -2859,12 +3247,13 @@ void DrawMovieRecordingProgress(const FrameContext& context) noexcept {
     std::array<char, 176> tick_text{};
     std::array<char, 160> frame_text{};
     std::array<char, 160> cadence_text{};
+    const auto cancel_key = FormatInput(snapshot.cancel_key);
     static_cast<void>(std::snprintf(
         tick_text.data(), tick_text.size(),
-        "RECORDING  %lld / %lld TICKS  |  %lld TICKS LEFT  |  ESC TO PAUSE + END",
+        "RECORDING  %lld / %lld TICKS  |  %lld TICKS LEFT  |  %s TO PAUSE + END",
         static_cast<long long>(progress.completed),
         static_cast<long long>(progress.total),
-        static_cast<long long>(progress.remaining)));
+        static_cast<long long>(progress.remaining), cancel_key.data()));
     const auto native_pass_active =
         (snapshot.movie_output_mode != MovieOutputMode::image_sequence &&
          (snapshot.movie_active_pass_flags & movie_capture_pass_beauty) != 0) ||
@@ -2896,12 +3285,12 @@ void DrawMovieRecordingProgress(const FrameContext& context) noexcept {
     }
     const auto cadence_warning = native_pass_active &&
         context.params->movie_repeated_visual_samples_captured != 0;
-    const auto duplicates_suppressed = native_pass_active &&
+    const auto duplicates_observed = native_pass_active &&
         context.params->movie_repeated_camera_sequences_captured != 0;
     if (cadence_warning) {
         static_cast<void>(std::snprintf(
             cadence_text.data(), cadence_text.size(),
-            "CADENCE WARNING  VISUAL %llu  |  %llu DUPLICATE PRESENTS SKIPPED  |  QUEUE %u/%u  |  %llu WAITS",
+            "CADENCE WARNING  VISUAL %llu  |  %llu DUPLICATE PRESENTS KEPT  |  QUEUE %u/%u  |  %llu WAITS",
             static_cast<unsigned long long>(
                 context.params->movie_repeated_visual_samples_captured),
             static_cast<unsigned long long>(
@@ -2910,10 +3299,10 @@ void DrawMovieRecordingProgress(const FrameContext& context) noexcept {
             context.params->movie_queue_capacity,
             static_cast<unsigned long long>(
                 context.params->movie_queue_backpressure_events)));
-    } else if (duplicates_suppressed) {
+    } else if (duplicates_observed) {
         static_cast<void>(std::snprintf(
             cadence_text.data(), cadence_text.size(),
-            "CADENCE CLEANUP  %llu DUPLICATE PRESENTS SKIPPED  |  QUEUE %u/%u  |  %llu WAITS",
+            "CADENCE CLEANUP  %llu DUPLICATE PRESENTS KEPT  |  QUEUE %u/%u  |  %llu WAITS",
             static_cast<unsigned long long>(
                 context.params->movie_repeated_camera_sequences_captured),
             context.params->movie_maximum_queue_depth,
@@ -2928,7 +3317,7 @@ void DrawMovieRecordingProgress(const FrameContext& context) noexcept {
         ImVec2((context.params->viewport_width - width) * 0.5F, 18.0F * scale),
         ImGuiCond_Always);
     ImGui::SetNextWindowSize(
-        ImVec2(width, (cadence_warning || duplicates_suppressed ? 90.0F : 70.0F) * scale),
+        ImVec2(width, (cadence_warning || duplicates_observed ? 90.0F : 70.0F) * scale),
         ImGuiCond_Always);
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.94F);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0F * scale, 10.0F * scale));
@@ -2942,7 +3331,7 @@ void DrawMovieRecordingProgress(const FrameContext& context) noexcept {
         ImGui::TextColored(smvm_theme::Vec4(smvm_theme::colors::kWarning), "%s", tick_text.data());
         ImGui::PopFont();
         ImGui::TextDisabled("%s", frame_text.data());
-        if (cadence_warning || duplicates_suppressed) {
+        if (cadence_warning || duplicates_observed) {
             if (cadence_warning) {
                 ImGui::TextColored(
                     smvm_theme::Vec4(smvm_theme::colors::kWarning),
@@ -2958,6 +3347,8 @@ void DrawMovieRecordingProgress(const FrameContext& context) noexcept {
 }
 
 void DrawFrame(const SmvmUiFrameParams& params, SmvmUiState& state) noexcept {
+    // Comparison is a frame-local hold, never a latched setting after page/tab changes.
+    state.look_compare = false;
     if (params.snapshot == nullptr)
         return;
     ObserveReplaySession(params.snapshot, state);
@@ -2971,7 +3362,7 @@ void DrawFrame(const SmvmUiFrameParams& params, SmvmUiState& state) noexcept {
     const auto show_editor_ui = ShouldShowEditorUi(
         show_timeline,
         hide_editor_ui,
-        params.menu_open);
+        params.menu_open || params.effects_open);
     if ((params.snapshot->flags & smvm_snapshot_replay_active) == 0) {
         state.replay_seek_pending = false;
         state.replay_seek_retry_at_ms = 0;
@@ -3005,8 +3396,21 @@ void DrawFrame(const SmvmUiFrameParams& params, SmvmUiState& state) noexcept {
     if (show_editor_ui) {
         DrawRuleOfThirdsGuide(context);
         DrawReplayPauseIndicator(context);
+        DrawRecordingReadinessBadge(context);
+        if (!params.effects_open && !params.menu_open) {
+            const auto scale = smvm_theme::GetScale();
+            const auto key = FormatInput(params.snapshot->effects_key);
+            ImGui::SetNextWindowPos(ImVec2(params.viewport_width - 185.0F * scale, 16.0F * scale), ImGuiCond_Always);
+            ImGui::SetNextWindowBgAlpha(.9F);
+            if (ImGui::Begin("##effects_tab", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
+                if (ImGui::Button("Effects")) SmvmToggleEffectsMenu();
+                ImGui::SameLine(); ImGui::TextDisabled("%s", key.data());
+            }
+            ImGui::End();
+        }
         DrawMovieRecordingMenu(context);
         DrawCampathMiniMenu(context);
+        DrawModals(context);
         DrawReplayTimeline(context);
         if ((params.snapshot->flags & smvm_snapshot_replay_seek_in_progress) != 0)
             DrawUpdatingTicksPrompt(context);

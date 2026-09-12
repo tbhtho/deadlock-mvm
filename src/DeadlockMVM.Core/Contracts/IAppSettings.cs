@@ -1,3 +1,4 @@
+using DeadlockMVM.Core.Models;
 namespace DeadlockMVM.Core.Contracts;
 
 using DeadlockMVM.Core.Native.InProcess;
@@ -28,6 +29,21 @@ public interface IAppSettings
     /// <summary>TCP port of Deadlock's VConsole2 command channel.</summary>
     int VConsolePort { get; set; }
 
+    /// <summary>
+    /// When true, launch through steam.exe -applaunch. When false (default),
+    /// launch project8.exe directly so +playdemo/+demo_pause stay on the exact
+    /// child command line. Steam forwarding can silently drop replay args after
+    /// game updates, landing in the normal menu instead of the demo.
+    /// </summary>
+    bool LaunchViaSteam { get; set; }
+
+    string SmvmEffectsHotkey { get; set; }
+    string SmvmCinematicStartHotkey { get; set; }
+    string SmvmPlaybackSlowerHotkey { get; set; }
+    string SmvmPlaybackFasterHotkey { get; set; }
+    string SmvmCancelHotkey { get; set; }
+    string SmvmCameraSlowerHotkey { get; set; }
+    string SmvmCameraFasterHotkey { get; set; }
     string SmvmMenuHotkey { get; set; }
     string SmvmAddHotkey { get; set; }
     string SmvmDeleteHotkey { get; set; }
@@ -95,6 +111,7 @@ public interface IAppSettings
     bool SmvmMovieDisablePostProcessing { get; set; }
     bool SmvmMovieMuteDialogue { get; set; }
     bool SmvmRuleOfThirds { get; set; }
+    LookSettings SmvmLook { get => new(); set { } }
     bool SmvmCustomFogEnabled { get; set; }
     FogConfiguration SmvmCustomFog { get; set; }
     GreenscreenMode SmvmGreenscreenMode { get; set; }

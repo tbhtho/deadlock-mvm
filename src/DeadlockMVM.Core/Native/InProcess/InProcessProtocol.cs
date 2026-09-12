@@ -23,6 +23,7 @@ internal enum InProcessMessageType : ushort
     EnableManualCamera = 15,
     DisableManualCamera = 16,
     SetCampathDocuments = 17,
+    SetLookLut = 18,
     Status = 100,
 }
 
@@ -279,7 +280,7 @@ public static class SmvmInputCode
     public const uint WheelDown = 0x1005;
 
     public static bool IsBindingAllowedForSlot(int slot, InputBinding binding) =>
-        slot is >= 100 and <= 128 && binding.IsValid && Encode(binding) != None &&
+        slot is >= 100 and <= 135 && binding.IsValid && Encode(binding) != None &&
         (slot is >= 111 and <= 121 || binding.Kind == InputBindingKind.Keyboard);
 
     public static uint Encode(InputBinding binding)
@@ -438,6 +439,15 @@ public enum SmvmActionType : uint
     RetiredCameraAttachmentOffset = 90,
     ChooseMovieCaptureFolder = 91,
     SetMovieOutputResolution = 92,
+    SetLookEnabled = 93,
+    SetLookValue = 94,
+    ResetLook = 95,
+    SelectLookPreset = 96,
+    SaveLookPreset = 97,
+    ImportLookPreset = 98,
+    ExportLookPreset = 99,
+    LoadLookLut = 100,
+    ExitDeadlock = 101,
 }
 
 public sealed record SmvmAction(
@@ -552,7 +562,15 @@ public sealed record SmvmSnapshot(
     MovieCapturePass MovieActivePasses = MovieCapturePass.Beauty,
     MovieCompositingStage MovieCompositingStage = MovieCompositingStage.None,
     bool MovieCaptureAudio = true,
-    ulong MovieExpectedFrameCount = 0);
+    ulong MovieExpectedFrameCount = 0,
+    LookSettings? Look = null,
+    uint EffectsKey = 0x14,
+    uint CinematicStartKey = 0x20,
+    uint PlaybackSlowerKey = 0x25,
+    uint PlaybackFasterKey = 0x27,
+    uint CancelKey = 0x1B,
+    uint CameraSlowerKey = 0xBD,
+    uint CameraFasterKey = 0xBB);
 
 [Flags]
 public enum InProcessStatusFlags : uint
@@ -609,16 +627,26 @@ public sealed record InProcessCameraStatus(
 internal static class InProcessProtocol
 {
     public const uint Magic = 0x4D564D43;
-    public const ushort Version = 24;
+    public const ushort Version = 26;
     public const int HeaderSize = 28;
     public const int StatusSize = 272;
-    public const int SmvmSnapshotSize = 1128;
+    public const int SmvmSnapshotSize = 1368;
     public const int CameraSampleSize = 56;
     public const int CampathKeyframeSize = 64;
     public const int CampathHeaderSize = 16;
     public const int CampathDocumentEntrySize = 144;
     public const int MaxCampathDocuments = 32;
-    public const int MaxPayloadSize = CampathHeaderSize + (CampathKeyframeSize * CampathPath.MaxKeyframes);
+    public const int MaxPayloadSize = 16 + 33 * 33 * 33 * 3 * sizeof(float);
+
+    public static byte[] SerializeLookLut(LookSettings look)
+    {
+        if (!look.IsValid || look.LutRgb is null || look.LutSize == 0) throw new InvalidDataException("Invalid LUT.");
+        var bytes = new byte[16 + look.LutRgb.Length * 4];
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes, look.LutRevision);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(8), look.LutSize);
+        for (var i = 0; i < look.LutRgb.Length; i++) BinaryPrimitives.WriteSingleLittleEndian(bytes.AsSpan(16 + i * 4), look.LutRgb[i]);
+        return bytes;
+    }
 
     public static byte[] CreateMessage(
         InProcessMessageType type,
@@ -819,7 +847,7 @@ internal static class InProcessProtocol
                 (snapshot.MovieExpectedFrameCount > 0))
             throw new ArgumentOutOfRangeException(nameof(snapshot));
         var payload = new byte[SmvmSnapshotSize];
-        BinaryPrimitives.WriteUInt32LittleEndian(payload, 13);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload, 14);
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(4), (uint)snapshot.Flags);
         BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(8), snapshot.CurrentTick);
         BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(16), snapshot.TotalTicks);
@@ -934,6 +962,16 @@ internal static class InProcessProtocol
             payload.AsSpan(1116), snapshot.MovieCaptureAudio ? 1u : 0u);
         BinaryPrimitives.WriteUInt64LittleEndian(
             payload.AsSpan(1120), snapshot.MovieExpectedFrameCount);
+        (snapshot.Look ?? new LookSettings()).Write(payload.AsSpan(1128));
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(1336), snapshot.EffectsKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(1340), snapshot.CinematicStartKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(1344), snapshot.PlaybackSlowerKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(1348), snapshot.PlaybackFasterKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(1352), snapshot.CancelKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(1356), snapshot.CameraSlowerKey);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(1360), snapshot.CameraFasterKey);
+        WriteUtf8(payload.AsSpan(1268, 64), snapshot.Look?.PresetName ?? "Neutral");
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(1332), snapshot.Look?.Modified == true ? 1u : 0u);
         return payload;
     }
 

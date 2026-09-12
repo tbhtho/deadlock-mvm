@@ -99,6 +99,7 @@ private:
             case SmvmActionType::set_replay_bar_opacity:
             case SmvmActionType::set_status_hud_scale:
             case SmvmActionType::set_status_hud_opacity:
+            case SmvmActionType::set_look_value:
             case SmvmActionType::set_custom_fog_value:
             case SmvmActionType::set_custom_fog_color:
                 return true;
@@ -111,6 +112,7 @@ private:
         const SmvmActionPayload& left,
         const SmvmActionPayload& right) noexcept {
         switch (left.type) {
+            case SmvmActionType::set_look_value:
             case SmvmActionType::set_custom_fog_value:
                 return left.index == right.index;
             default:

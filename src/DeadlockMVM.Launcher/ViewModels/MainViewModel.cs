@@ -69,6 +69,7 @@ public sealed class MainViewModel : ViewModelBase
             settings.ExtraLaunchArguments);
 
         LaunchCommand = new RelayCommand(Launch, () => CanLaunch);
+        StopDeadlockCommand = new RelayCommand(StopDeadlock, () => CanStopDeadlock);
         RefreshCommand = new RelayCommand(Refresh);
         OpenLogsCommand = new RelayCommand(OpenLogs);
         ResetDeadlockPathCommand = new RelayCommand(ResetDeadlockPath);
@@ -83,6 +84,8 @@ public sealed class MainViewModel : ViewModelBase
     }
 
     public ICommand LaunchCommand { get; }
+
+    public ICommand StopDeadlockCommand { get; }
 
     public ICommand RefreshCommand { get; }
 
@@ -163,6 +166,168 @@ public sealed class MainViewModel : ViewModelBase
             binding => _settings.SmvmShowCamerasHotkey = binding);
     }
 
+    public string SmvmForwardHotkey
+    {
+        get => _settings.SmvmForwardHotkey;
+        set => SetSmvmBinding(nameof(SmvmForwardHotkey), value, 100, binding => _settings.SmvmForwardHotkey = binding);
+    }
+
+    public string SmvmBackHotkey
+    {
+        get => _settings.SmvmBackHotkey;
+        set => SetSmvmBinding(nameof(SmvmBackHotkey), value, 101, binding => _settings.SmvmBackHotkey = binding);
+    }
+
+    public string SmvmLeftHotkey
+    {
+        get => _settings.SmvmLeftHotkey;
+        set => SetSmvmBinding(nameof(SmvmLeftHotkey), value, 102, binding => _settings.SmvmLeftHotkey = binding);
+    }
+
+    public string SmvmRightHotkey
+    {
+        get => _settings.SmvmRightHotkey;
+        set => SetSmvmBinding(nameof(SmvmRightHotkey), value, 103, binding => _settings.SmvmRightHotkey = binding);
+    }
+
+    public string SmvmUpHotkey
+    {
+        get => _settings.SmvmUpHotkey;
+        set => SetSmvmBinding(nameof(SmvmUpHotkey), value, 104, binding => _settings.SmvmUpHotkey = binding);
+    }
+
+    public string SmvmDownHotkey
+    {
+        get => _settings.SmvmDownHotkey;
+        set => SetSmvmBinding(nameof(SmvmDownHotkey), value, 105, binding => _settings.SmvmDownHotkey = binding);
+    }
+
+    public string SmvmFastHotkey
+    {
+        get => _settings.SmvmFastHotkey;
+        set => SetSmvmBinding(nameof(SmvmFastHotkey), value, 106, binding => _settings.SmvmFastHotkey = binding);
+    }
+
+    public string SmvmPrecisionHotkey
+    {
+        get => _settings.SmvmPrecisionHotkey;
+        set => SetSmvmBinding(nameof(SmvmPrecisionHotkey), value, 107, binding => _settings.SmvmPrecisionHotkey = binding);
+    }
+
+    public string SmvmPlayStartHotkey
+    {
+        get => _settings.SmvmPlayStartHotkey;
+        set => SetSmvmBinding(nameof(SmvmPlayStartHotkey), value, 115, binding => _settings.SmvmPlayStartHotkey = binding);
+    }
+
+    public string SmvmPlayCurrentHotkey
+    {
+        get => _settings.SmvmPlayCurrentHotkey;
+        set => SetSmvmBinding(nameof(SmvmPlayCurrentHotkey), value, 116, binding => _settings.SmvmPlayCurrentHotkey = binding);
+    }
+
+    public string SmvmStopHotkey
+    {
+        get => _settings.SmvmStopHotkey;
+        set => SetSmvmBinding(nameof(SmvmStopHotkey), value, 117, binding => _settings.SmvmStopHotkey = binding);
+    }
+
+    public string SmvmUndoHotkey
+    {
+        get => _settings.SmvmUndoHotkey;
+        set => SetSmvmBinding(nameof(SmvmUndoHotkey), value, 118, binding => _settings.SmvmUndoHotkey = binding);
+    }
+
+    public string SmvmRedoHotkey
+    {
+        get => _settings.SmvmRedoHotkey;
+        set => SetSmvmBinding(nameof(SmvmRedoHotkey), value, 119, binding => _settings.SmvmRedoHotkey = binding);
+    }
+
+    public string SmvmRestoreUiHotkey
+    {
+        get => _settings.SmvmRestoreUiHotkey;
+        set => SetSmvmBinding(nameof(SmvmRestoreUiHotkey), value, 122, binding => _settings.SmvmRestoreUiHotkey = binding);
+    }
+
+    public string SmvmCycleUiHotkey
+    {
+        get => _settings.SmvmCycleUiHotkey;
+        set => SetSmvmBinding(nameof(SmvmCycleUiHotkey), value, 123, binding => _settings.SmvmCycleUiHotkey = binding);
+    }
+
+    public string SmvmToggleFreeCameraHotkey
+    {
+        get => _settings.SmvmToggleFreeCameraHotkey;
+        set => SetSmvmBinding(nameof(SmvmToggleFreeCameraHotkey), value, 124, binding => _settings.SmvmToggleFreeCameraHotkey = binding);
+    }
+
+    public string SmvmReplayPauseHotkey
+    {
+        get => _settings.SmvmReplayPauseHotkey;
+        set => SetSmvmBinding(nameof(SmvmReplayPauseHotkey), value, 125, binding => _settings.SmvmReplayPauseHotkey = binding);
+    }
+
+    public string SmvmShowLabelsHotkey
+    {
+        get => _settings.SmvmShowLabelsHotkey;
+        set => SetSmvmBinding(nameof(SmvmShowLabelsHotkey), value, 126, binding => _settings.SmvmShowLabelsHotkey = binding);
+    }
+
+    public string SmvmStepBackHotkey
+    {
+        get => _settings.SmvmStepBackHotkey;
+        set => SetSmvmBinding(nameof(SmvmStepBackHotkey), value, 127, binding => _settings.SmvmStepBackHotkey = binding);
+    }
+
+    public string SmvmStepForwardHotkey
+    {
+        get => _settings.SmvmStepForwardHotkey;
+        set => SetSmvmBinding(nameof(SmvmStepForwardHotkey), value, 128, binding => _settings.SmvmStepForwardHotkey = binding);
+    }
+
+    public string SmvmEffectsHotkey
+    {
+        get => _settings.SmvmEffectsHotkey;
+        set => SetSmvmBinding(nameof(SmvmEffectsHotkey), value, 129, binding => _settings.SmvmEffectsHotkey = binding);
+    }
+
+    public string SmvmCinematicStartHotkey
+    {
+        get => _settings.SmvmCinematicStartHotkey;
+        set => SetSmvmBinding(nameof(SmvmCinematicStartHotkey), value, 130, binding => _settings.SmvmCinematicStartHotkey = binding);
+    }
+
+    public string SmvmPlaybackSlowerHotkey
+    {
+        get => _settings.SmvmPlaybackSlowerHotkey;
+        set => SetSmvmBinding(nameof(SmvmPlaybackSlowerHotkey), value, 131, binding => _settings.SmvmPlaybackSlowerHotkey = binding);
+    }
+
+    public string SmvmPlaybackFasterHotkey
+    {
+        get => _settings.SmvmPlaybackFasterHotkey;
+        set => SetSmvmBinding(nameof(SmvmPlaybackFasterHotkey), value, 132, binding => _settings.SmvmPlaybackFasterHotkey = binding);
+    }
+
+    public string SmvmCancelHotkey
+    {
+        get => _settings.SmvmCancelHotkey;
+        set => SetSmvmBinding(nameof(SmvmCancelHotkey), value, 133, binding => _settings.SmvmCancelHotkey = binding);
+    }
+
+    public string SmvmCameraSlowerHotkey
+    {
+        get => _settings.SmvmCameraSlowerHotkey;
+        set => SetSmvmBinding(nameof(SmvmCameraSlowerHotkey), value, 134, binding => _settings.SmvmCameraSlowerHotkey = binding);
+    }
+
+    public string SmvmCameraFasterHotkey
+    {
+        get => _settings.SmvmCameraFasterHotkey;
+        set => SetSmvmBinding(nameof(SmvmCameraFasterHotkey), value, 135, binding => _settings.SmvmCameraFasterHotkey = binding);
+    }
+
     private void SetSmvmBinding(string propertyName, string? value, int slot, Action<string> assign)
     {
         var candidate = value?.Trim() ?? string.Empty;
@@ -185,7 +350,9 @@ public sealed class MainViewModel : ViewModelBase
             candidate = parsed.ToString();
         }
         var existing = GetSmvmBindings();
-        var conflict = existing.FirstOrDefault(pair => pair.Key != propertyName && parsedCandidate is { } binding &&
+        var conflict = existing.FirstOrDefault(pair => pair.Key != propertyName &&
+            !(slot == 130 && pair.Key == nameof(SmvmUpHotkey)) &&
+            !(slot == 104 && pair.Key == nameof(SmvmCinematicStartHotkey)) && parsedCandidate is { } binding &&
             MvmInputBinding.TryParse(pair.Value, out var existingBinding) && existingBinding == binding);
         if (!string.IsNullOrEmpty(conflict.Key))
         {
@@ -201,28 +368,42 @@ public sealed class MainViewModel : ViewModelBase
 
     private Dictionary<string, string> GetSmvmBindings() => new(StringComparer.Ordinal)
     {
+        [nameof(SmvmForwardHotkey)] = _settings.SmvmForwardHotkey,
+        [nameof(SmvmBackHotkey)] = _settings.SmvmBackHotkey,
+        [nameof(SmvmLeftHotkey)] = _settings.SmvmLeftHotkey,
+        [nameof(SmvmRightHotkey)] = _settings.SmvmRightHotkey,
+        [nameof(SmvmUpHotkey)] = _settings.SmvmUpHotkey,
+        [nameof(SmvmDownHotkey)] = _settings.SmvmDownHotkey,
+        [nameof(SmvmFastHotkey)] = _settings.SmvmFastHotkey,
+        [nameof(SmvmPrecisionHotkey)] = _settings.SmvmPrecisionHotkey,
+        [nameof(SmvmRollLeftHotkey)] = _settings.SmvmRollLeftHotkey,
+        [nameof(SmvmRollRightHotkey)] = _settings.SmvmRollRightHotkey,
+        [nameof(SmvmRollResetHotkey)] = _settings.SmvmRollResetHotkey,
         [nameof(SmvmMenuHotkey)] = _settings.SmvmMenuHotkey,
         [nameof(SmvmAddHotkey)] = _settings.SmvmAddHotkey,
         [nameof(SmvmDeleteHotkey)] = _settings.SmvmDeleteHotkey,
         [nameof(SmvmCleanViewHotkey)] = _settings.SmvmCleanViewHotkey,
-        [nameof(SmvmRollLeftHotkey)] = _settings.SmvmRollLeftHotkey,
-        [nameof(SmvmRollRightHotkey)] = _settings.SmvmRollRightHotkey,
-        [nameof(SmvmRollResetHotkey)] = _settings.SmvmRollResetHotkey,
+        [nameof(SmvmPlayStartHotkey)] = _settings.SmvmPlayStartHotkey,
+        [nameof(SmvmPlayCurrentHotkey)] = _settings.SmvmPlayCurrentHotkey,
+        [nameof(SmvmStopHotkey)] = _settings.SmvmStopHotkey,
+        [nameof(SmvmUndoHotkey)] = _settings.SmvmUndoHotkey,
+        [nameof(SmvmRedoHotkey)] = _settings.SmvmRedoHotkey,
         [nameof(SmvmShowPathHotkey)] = _settings.SmvmShowPathHotkey,
         [nameof(SmvmShowCamerasHotkey)] = _settings.SmvmShowCamerasHotkey,
-        ["Forward"] = _settings.SmvmForwardHotkey,
-        ["Backward"] = _settings.SmvmBackHotkey,
-        ["Move Left"] = _settings.SmvmLeftHotkey,
-        ["Move Right"] = _settings.SmvmRightHotkey,
-        ["Move Up"] = _settings.SmvmUpHotkey,
-        ["Move Down"] = _settings.SmvmDownHotkey,
-        ["Fast Movement"] = _settings.SmvmFastHotkey,
-        ["Precision Movement"] = _settings.SmvmPrecisionHotkey,
-        ["Play From Start"] = _settings.SmvmPlayStartHotkey,
-        ["Play From Current"] = _settings.SmvmPlayCurrentHotkey,
-        ["Stop Campath"] = _settings.SmvmStopHotkey,
-        ["Undo"] = _settings.SmvmUndoHotkey,
-        ["Redo"] = _settings.SmvmRedoHotkey,
+        [nameof(SmvmRestoreUiHotkey)] = _settings.SmvmRestoreUiHotkey,
+        [nameof(SmvmCycleUiHotkey)] = _settings.SmvmCycleUiHotkey,
+        [nameof(SmvmToggleFreeCameraHotkey)] = _settings.SmvmToggleFreeCameraHotkey,
+        [nameof(SmvmReplayPauseHotkey)] = _settings.SmvmReplayPauseHotkey,
+        [nameof(SmvmShowLabelsHotkey)] = _settings.SmvmShowLabelsHotkey,
+        [nameof(SmvmStepBackHotkey)] = _settings.SmvmStepBackHotkey,
+        [nameof(SmvmStepForwardHotkey)] = _settings.SmvmStepForwardHotkey,
+        [nameof(SmvmEffectsHotkey)] = _settings.SmvmEffectsHotkey,
+        [nameof(SmvmCinematicStartHotkey)] = _settings.SmvmCinematicStartHotkey,
+        [nameof(SmvmPlaybackSlowerHotkey)] = _settings.SmvmPlaybackSlowerHotkey,
+        [nameof(SmvmPlaybackFasterHotkey)] = _settings.SmvmPlaybackFasterHotkey,
+        [nameof(SmvmCancelHotkey)] = _settings.SmvmCancelHotkey,
+        [nameof(SmvmCameraSlowerHotkey)] = _settings.SmvmCameraSlowerHotkey,
+        [nameof(SmvmCameraFasterHotkey)] = _settings.SmvmCameraFasterHotkey,
     };
 
     public ObservableCollection<ReplayInfo> Replays { get; } = new();
@@ -278,6 +459,23 @@ public sealed class MainViewModel : ViewModelBase
             _settings.Save();
             OnPropertyChanged();
             LauncherVisibilityPreferenceChanged?.Invoke(this, EventArgs.Empty);
+        }
+    }
+
+    public bool LaunchViaSteam
+    {
+        get => _settings.LaunchViaSteam;
+        set
+        {
+            if (_settings.LaunchViaSteam == value)
+                return;
+            _settings.LaunchViaSteam = value;
+            _settings.Save();
+            OnPropertyChanged();
+            UpdateCommandPreview();
+            _log.Info(value
+                ? "Launch mode: through Steam (-applaunch). If the demo is ignored, turn this off for direct launch."
+                : "Launch mode: direct project8.exe (recommended for replays; keeps +playdemo on the game command line).");
         }
     }
 
@@ -364,6 +562,9 @@ public sealed class MainViewModel : ViewModelBase
 
     public bool CanLaunch => DeadlockInstalled && !DeadlockRunning && !IsLaunching;
 
+    /// <summary>Fast force-exit is offered whenever a Deadlock process is running.</summary>
+    public bool CanStopDeadlock => DeadlockRunning;
+
     public bool IsReplaysPage
     {
         get => _isReplaysPage;
@@ -429,6 +630,44 @@ public sealed class MainViewModel : ViewModelBase
     public void Refresh()
     {
         RefreshProcesses();
+        OnPropertyChanged(nameof(LaunchViaSteam));
+        OnPropertyChanged(nameof(SmvmForwardHotkey));
+        OnPropertyChanged(nameof(SmvmBackHotkey));
+        OnPropertyChanged(nameof(SmvmLeftHotkey));
+        OnPropertyChanged(nameof(SmvmRightHotkey));
+        OnPropertyChanged(nameof(SmvmUpHotkey));
+        OnPropertyChanged(nameof(SmvmDownHotkey));
+        OnPropertyChanged(nameof(SmvmFastHotkey));
+        OnPropertyChanged(nameof(SmvmPrecisionHotkey));
+        OnPropertyChanged(nameof(SmvmRollLeftHotkey));
+        OnPropertyChanged(nameof(SmvmRollRightHotkey));
+        OnPropertyChanged(nameof(SmvmRollResetHotkey));
+        OnPropertyChanged(nameof(SmvmMenuHotkey));
+        OnPropertyChanged(nameof(SmvmAddHotkey));
+        OnPropertyChanged(nameof(SmvmDeleteHotkey));
+        OnPropertyChanged(nameof(SmvmCleanViewHotkey));
+        OnPropertyChanged(nameof(SmvmPlayStartHotkey));
+        OnPropertyChanged(nameof(SmvmPlayCurrentHotkey));
+        OnPropertyChanged(nameof(SmvmStopHotkey));
+        OnPropertyChanged(nameof(SmvmUndoHotkey));
+        OnPropertyChanged(nameof(SmvmRedoHotkey));
+        OnPropertyChanged(nameof(SmvmShowPathHotkey));
+        OnPropertyChanged(nameof(SmvmShowCamerasHotkey));
+        OnPropertyChanged(nameof(SmvmRestoreUiHotkey));
+        OnPropertyChanged(nameof(SmvmCycleUiHotkey));
+        OnPropertyChanged(nameof(SmvmToggleFreeCameraHotkey));
+        OnPropertyChanged(nameof(SmvmReplayPauseHotkey));
+        OnPropertyChanged(nameof(SmvmShowLabelsHotkey));
+        OnPropertyChanged(nameof(SmvmStepBackHotkey));
+        OnPropertyChanged(nameof(SmvmStepForwardHotkey));
+        OnPropertyChanged(nameof(SmvmEffectsHotkey));
+        OnPropertyChanged(nameof(SmvmCinematicStartHotkey));
+        OnPropertyChanged(nameof(SmvmPlaybackSlowerHotkey));
+        OnPropertyChanged(nameof(SmvmPlaybackFasterHotkey));
+        OnPropertyChanged(nameof(SmvmCancelHotkey));
+        OnPropertyChanged(nameof(SmvmCameraSlowerHotkey));
+        OnPropertyChanged(nameof(SmvmCameraFasterHotkey));
+
 
         var configuredGame = _steam.ValidateGamePath(_settings.DeadlockPath);
         var steam = _steam.DetectSteam();
@@ -496,6 +735,27 @@ public sealed class MainViewModel : ViewModelBase
         UpdateStatusText();
     }
 
+    /// <summary>
+    /// Force-terminates Deadlock immediately. The PID from launch is not
+    /// retained (Steam owns the process), so the running game is located by
+    /// process name and killed without a graceful shutdown wait.
+    /// </summary>
+    private void StopDeadlock()
+    {
+        var terminated = DeadlockProcessControl.ForceExit(out var error);
+        if (terminated > 0)
+        {
+            _log.Info($"Exit Deadlock: force-terminated {terminated} Deadlock process(es).");
+            StatusMessage = "Deadlock closed.";
+            DeadlockRunning = false;
+        }
+        else
+        {
+            _log.Warn($"Exit Deadlock: no running Deadlock process was found. {error}");
+            StatusMessage = "No running Deadlock process was found.";
+        }
+    }
+
     private void Launch()
     {
         if (IsLaunching || DeadlockRunning)
@@ -527,7 +787,9 @@ public sealed class MainViewModel : ViewModelBase
 
         var gameArguments = MovieModeLaunchPolicy.BuildReplayArguments(
             additionalArguments, replay.GamePath);
-        var steamExecutable = ResolveSteamExecutable();
+        var steamExecutable = LaunchViaSteam ? ResolveSteamExecutable() : null;
+        if (LaunchViaSteam && steamExecutable is null)
+            _log.Warn("Launch through Steam was requested but steam.exe was not found; falling back to direct launch.");
         var launchThroughSteam = steamExecutable is not null;
         var request = new LaunchRequest
         {
@@ -571,7 +833,7 @@ public sealed class MainViewModel : ViewModelBase
             }
             StatusMessage = "Launching replay...";
             BeginLaunchDetectionTimeout(launchAttempt, replay.FileName);
-            BeginVerifyPlayback(launchOperation, replay.GamePath);
+            BeginVerifyPlayback(launchOperation, replay.GamePath, launchThroughSteam);
         }
         else
         {
@@ -723,7 +985,7 @@ public sealed class MainViewModel : ViewModelBase
     /// actually started. The game truncates the log on every launch, so the
     /// whole file is scanned; readiness comes from file writes, not sleeps.
     /// </summary>
-    private void BeginVerifyPlayback(int launchOperation, string gamePath)
+    private void BeginVerifyPlayback(int launchOperation, string gamePath, bool launchedThroughSteam)
     {
         var consoleLogPath = DeadlockConsoleLog.GetConsoleLogPath(_gameExecutablePath);
         var startedAfterLocal = DateTime.Now.AddMinutes(-1);
@@ -760,10 +1022,13 @@ public sealed class MainViewModel : ViewModelBase
                         return;
                     StatusMessage = confirmed
                         ? "Replay playback confirmed."
-                        : "Could not confirm playback in Deadlock's console log.";
+                        : launchedThroughSteam
+                            ? "Launched via Steam but playback was not confirmed. Turn off 'Launch through Steam' and try direct launch."
+                            : "Could not confirm playback in Deadlock's console log.";
                     _log.Info(confirmed
                         ? $"Playback confirmed by engine: '{gamePath}.dem'"
-                        : $"Playback NOT confirmed within timeout: '{gamePath}.dem'");
+                        : $"Playback NOT confirmed within timeout: '{gamePath}.dem' (viaSteam={launchedThroughSteam}). " +
+                          "If via Steam, retry with direct launch so +playdemo stays on the game command line.");
                 },
                 CancellationToken.None,
                 TaskCreationOptions.None,
@@ -932,7 +1197,7 @@ public sealed class MainViewModel : ViewModelBase
         }
 
         var arguments = MovieModeLaunchPolicy.BuildPreviewArguments(ExtraArguments);
-        var steamExecutable = ResolveSteamExecutable();
+        var steamExecutable = LaunchViaSteam ? ResolveSteamExecutable() : null;
         if (steamExecutable is not null)
         {
             var steamArguments = new[] { "-applaunch", DeadlockConstants.AppIdString }
@@ -950,6 +1215,8 @@ public sealed class MainViewModel : ViewModelBase
     private void NotifyLaunchStateChanged()
     {
         OnPropertyChanged(nameof(CanLaunch));
+        OnPropertyChanged(nameof(CanStopDeadlock));
         (LaunchCommand as RelayCommand)?.RaiseCanExecuteChanged();
+        (StopDeadlockCommand as RelayCommand)?.RaiseCanExecuteChanged();
     }
 }

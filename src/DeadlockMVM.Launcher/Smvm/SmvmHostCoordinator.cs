@@ -45,6 +45,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
     private readonly DeadlockUiController _deadlockUi;
     private readonly MovieRecordingController _movieRecording;
     private readonly MovieVisualController _movieVisual;
+    private string? _lookPresetPath;
     private readonly DemoStartupPolicy _demoStartup = new();
     private readonly DemoPlaybackSpeedPolicy _demoPlaybackSpeed = new();
     private readonly Dispatcher _dispatcher;
@@ -73,6 +74,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
     private bool? _observedReplayPaused;
     private int _compositingTransitionInFlight;
     private int _compositingCancelled;
+    private long? _compositingChromaStopTick;
 
     public SmvmHostCoordinator(
         ICameraService camera,
@@ -474,9 +476,11 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                     groupDirectory,
                     "world",
                     "deadlockmvm_capture.txt");
-                var worldFrameCount = File.Exists(worldManifestPath)
-                    ? ReadCaptureMetric(File.ReadAllLines(worldManifestPath), "Frames observed:")
-                    : null;
+                var worldManifest = File.Exists(worldManifestPath)
+                    ? File.ReadAllLines(worldManifestPath)
+                    : Array.Empty<string>();
+                var worldFrameCount = ReadCaptureMetric(worldManifest, "Frames observed:");
+                var worldLastTick = ReadCaptureMetric(worldManifest, "Last replay tick:");
                 if (worldFrameCount is not > 0 ||
                     !_movieRecording.ArmCompositingChroma(worldFrameCount.Value) ||
                     !_movieVisual.SetGreenscreenMode(GreenscreenMode.FreeCamera))
@@ -487,6 +491,11 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                         succeeded: false);
                     return;
                 }
+                // Bound the Chroma take by the World tick span as well as its
+                // frame count: the second play can run at a different cadence,
+                // and the frame cap alone allowed it to stop short of the
+                // World's last tick.
+                _compositingChromaStopTick = worldLastTick is >= 0 ? worldLastTick : null;
                 await EnterSmvmFreeCameraAsync().ConfigureAwait(true);
                 await _campath.PlayAsync(
                         CampathPlayMode.FromStart,
@@ -549,6 +558,20 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         BeginInvokeIsolated(() =>
         {
             var current = _controller.State;
+            var recording = _movieRecording.State;
+            if (_compositingChromaStopTick is { } stopTick &&
+                recording.CompositingStage == MovieCompositingStage.Chroma &&
+                recording.IsRecording &&
+                current.CurrentTick is { } currentTick &&
+                currentTick >= stopTick)
+            {
+                // The Chroma replay can advance at a different cadence than the
+                // World pass. Stop it at the World's last tick so both AVI
+                // layers cover the identical replay range instead of trusting
+                // the frame count alone.
+                _compositingChromaStopTick = null;
+                _movieRecording.StopCinematicRecording();
+            }
             if (replayEpochChanged)
             {
                 _movieRecording.Stop();
@@ -1199,7 +1222,116 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
             movieRecording.ActivePasses,
             movieRecording.CompositingStage,
             movieRecording.CaptureAudio,
-            checked((ulong)Math.Max(0, movieRecording.ExpectedFrameCount)));
+            checked((ulong)Math.Max(0, movieRecording.ExpectedFrameCount)),
+            _settings.SmvmLook,
+            SmvmInputCode.ParseForSlotOrDefault(129, _settings.SmvmEffectsHotkey, "CapsLock"),
+            SmvmInputCode.ParseForSlotOrDefault(130, _settings.SmvmCinematicStartHotkey, "Space"),
+            SmvmInputCode.ParseForSlotOrDefault(131, _settings.SmvmPlaybackSlowerHotkey, "Left"),
+            SmvmInputCode.ParseForSlotOrDefault(132, _settings.SmvmPlaybackFasterHotkey, "Right"),
+            SmvmInputCode.ParseForSlotOrDefault(133, _settings.SmvmCancelHotkey, "Escape"),
+            SmvmInputCode.ParseForSlotOrDefault(134, _settings.SmvmCameraSlowerHotkey, "OemMinus"),
+            SmvmInputCode.ParseForSlotOrDefault(135, _settings.SmvmCameraFasterHotkey, "OemPlus"));
+    }
+
+    private async Task ExecuteLookActionAsync(SmvmAction action, Func<bool> actionStillCurrent)
+    {
+        bool CanApplyLook()
+        {
+            var recording = _movieRecording.State;
+            return actionStillCurrent() &&
+                !recording.IsArmed && !recording.IsRecording && !recording.IsFinalizing &&
+                recording.CompositingStage == MovieCompositingStage.None;
+        }
+
+        if (!CanApplyLook())
+            return;
+
+        var previous = _settings.SmvmLook;
+        var next = previous;
+        var nextPresetPath = _lookPresetPath;
+        switch (action.Type)
+        {
+            case SmvmActionType.SetLookEnabled:
+                if (action.Value is not 0 and not 1)
+                    return;
+                next = previous with { Enabled = action.Value == 1, Modified = true };
+                break;
+            case SmvmActionType.SetLookValue:
+                next = previous.SetValue(action.Index, action.Value);
+                break;
+            case SmvmActionType.ResetLook:
+                next = new LookSettings();
+                nextPresetPath = null;
+                break;
+            case SmvmActionType.SelectLookPreset:
+                next = LookPresetService.Factory(action.Index);
+                nextPresetPath = null;
+                break;
+            case SmvmActionType.ImportLookPreset:
+            case SmvmActionType.LoadLookLut:
+                var open = new Microsoft.Win32.OpenFileDialog
+                {
+                    Filter = action.Type == SmvmActionType.LoadLookLut
+                        ? "3D CUBE LUT (*.cube)|*.cube"
+                        : "Reshade preset (*.json)|*.json",
+                    InitialDirectory = Path.Combine(DeadlockMVM.Core.AppPaths.DataDirectory, "looks"),
+                };
+                if (open.ShowDialog() != true || !CanApplyLook())
+                    return;
+                next = await Task.Run(() => action.Type == SmvmActionType.LoadLookLut
+                    ? LookPresetService.LoadCube(open.FileName, previous)
+                    : LookPresetService.Read(open.FileName));
+                if (action.Type == SmvmActionType.ImportLookPreset)
+                    nextPresetPath = open.FileName;
+                break;
+            case SmvmActionType.SaveLookPreset:
+            case SmvmActionType.ExportLookPreset:
+                if (action.Type == SmvmActionType.SaveLookPreset && action.Index == 2)
+                {
+                    next = previous with { PresetName = action.Text.Trim(), Modified = true };
+                    break;
+                }
+                var destination = action.Type == SmvmActionType.SaveLookPreset && action.Index == 0
+                    ? nextPresetPath
+                    : null;
+                if (destination is null)
+                {
+                    var save = new Microsoft.Win32.SaveFileDialog
+                    {
+                        Filter = "Reshade preset (*.json)|*.json",
+                        FileName = previous.PresetName + " copy.json",
+                        InitialDirectory = Path.Combine(DeadlockMVM.Core.AppPaths.DataDirectory, "looks"),
+                    };
+                    if (save.ShowDialog() != true)
+                        return;
+                    destination = save.FileName;
+                    next = previous with { PresetName = Path.GetFileNameWithoutExtension(destination) };
+                }
+                // A modal dialog can pump replay/take transitions. Revalidate before disk writes.
+                if (!CanApplyLook())
+                    return;
+                next = next with { Modified = false };
+                await Task.Run(() => LookPresetService.Save(destination, next));
+                if (action.Type == SmvmActionType.SaveLookPreset)
+                    nextPresetPath = destination;
+                break;
+        }
+
+        // Publish settings and their save destination together after asynchronous work.
+        if (!CanApplyLook())
+            return;
+        if (!next.IsValid)
+            throw new InvalidDataException("Invalid Reshade preset.");
+
+        var revision = checked(previous.Revision + 1);
+        var lutRevision = next.LutSize == 0
+            ? 0
+            : ReferenceEquals(next.LutRgb, previous.LutRgb) && previous.LutRevision != 0
+                ? previous.LutRevision
+                : revision;
+        _settings.SmvmLook = next with { Revision = revision, LutRevision = lutRevision };
+        _lookPresetPath = nextPresetPath;
+        _settings.Save();
     }
 
     private CameraOwnership ResolveCameraOwnership(bool replayActive, InProcessCameraStatus? native)
@@ -1721,6 +1853,16 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                     _settings.Save();
                 }
                 break;
+            case SmvmActionType.SetLookEnabled:
+            case SmvmActionType.SetLookValue:
+            case SmvmActionType.ResetLook:
+            case SmvmActionType.SelectLookPreset:
+            case SmvmActionType.SaveLookPreset:
+            case SmvmActionType.ImportLookPreset:
+            case SmvmActionType.ExportLookPreset:
+            case SmvmActionType.LoadLookLut:
+                await ExecuteLookActionAsync(action, actionStillCurrent);
+                break;
             case SmvmActionType.SetCustomFogEnabled:
                 if (action.Value is 0.0 or 1.0)
                 {
@@ -2142,6 +2284,15 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                     selfTestPath!,
                     _stop.Token).ConfigureAwait(true);
                 break;
+            case SmvmActionType.ExitDeadlock:
+            {
+                var terminated = DeadlockProcessControl.ForceExit(out var exitError);
+                if (terminated > 0)
+                    _log.Info($"Exit Deadlock: force-terminated {terminated} Deadlock process(es) from the in-game menu.");
+                else
+                    _log.Warn($"Exit Deadlock: no running Deadlock process was found. {exitError}");
+                break;
+            }
         }
     }
 
@@ -2697,7 +2848,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
             (108, "Q"), (109, "E"), (110, "R"),
             (115, "F3"), (116, "F5"), (117, "F4"), (118, "Ctrl+Z"), (119, "Ctrl+Y"),
             (120, string.Empty), (121, string.Empty), (126, string.Empty),
-            (127, "PageUp"), (128, "PageDown")
+            (127, "PageUp"), (128, "PageDown"), (129, "CapsLock"), (130, "Space"), (131, "Left"), (132, "Right"), (133, "Escape"), (134, "OemMinus"), (135, "OemPlus")
         ], "Canonical defaults");
     }
 
@@ -2712,7 +2863,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
             (115, "F3"), (116, string.Empty), (117, "F4"),
             (118, "Ctrl+Z"), (119, "Ctrl+Y"),
             (120, string.Empty), (121, string.Empty), (126, string.Empty),
-            (127, string.Empty), (128, string.Empty)
+            (127, string.Empty), (128, string.Empty), (129, "CapsLock"), (130, "Space"), (131, "Left"), (132, "Right"), (133, "Escape"), (134, "OemMinus"), (135, "OemPlus")
         ], "Movie Maker defaults");
     }
 
@@ -2732,7 +2883,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
             }
             foreach (var other in parsed)
             {
-                if (!BindingsConflict(other.Binding, binding))
+                if ((item.Slot == 130 && other.Slot == 104) || (item.Slot == 104 && other.Slot == 130) || !BindingsConflict(other.Binding, binding))
                     continue;
                 _log.Warn($"SMVM {name} rejected: {item.Binding} conflicts with " +
                           $"{DescribeSmvmBinding(other.Slot)}.");
@@ -2765,7 +2916,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
 
     private void SetSmvmBinding(int index, double rawValue)
     {
-        if (index is < 100 or > 128)
+        if (index is < 100 or > 135)
         {
             _log.Warn($"SMVM binding rejected: unsupported slot {index}.");
             return;
@@ -2793,9 +2944,9 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         }
 
         var canonical = binding.ToString();
-        foreach (var otherIndex in Enumerable.Range(100, 29))
+        foreach (var otherIndex in Enumerable.Range(100, 36))
         {
-            if (otherIndex == index ||
+            if (otherIndex == index || (otherIndex == 104 && index == 130) || (otherIndex == 130 && index == 104) ||
                 !InputBinding.TryParse(ReadSmvmBinding(otherIndex), out var existing) ||
                 !BindingsConflict(existing, binding))
                 continue;
@@ -2840,6 +2991,14 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         126 => _settings.SmvmShowLabelsHotkey,
         127 => _settings.SmvmStepBackHotkey,
         128 => _settings.SmvmStepForwardHotkey,
+        129 => _settings.SmvmEffectsHotkey,
+        130 => _settings.SmvmCinematicStartHotkey,
+        131 => _settings.SmvmPlaybackSlowerHotkey,
+        132 => _settings.SmvmPlaybackFasterHotkey,
+        133 => _settings.SmvmCancelHotkey,
+        134 => _settings.SmvmCameraSlowerHotkey,
+        135 => _settings.SmvmCameraFasterHotkey,
+
         _ => string.Empty,
     };
 
@@ -2876,6 +3035,14 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
             case 126: _settings.SmvmShowLabelsHotkey = value; break;
             case 127: _settings.SmvmStepBackHotkey = value; break;
             case 128: _settings.SmvmStepForwardHotkey = value; break;
+            case 129: _settings.SmvmEffectsHotkey = value; break;
+            case 130: _settings.SmvmCinematicStartHotkey = value; break;
+            case 131: _settings.SmvmPlaybackSlowerHotkey = value; break;
+            case 132: _settings.SmvmPlaybackFasterHotkey = value; break;
+            case 133: _settings.SmvmCancelHotkey = value; break;
+            case 134: _settings.SmvmCameraSlowerHotkey = value; break;
+            case 135: _settings.SmvmCameraFasterHotkey = value; break;
+
         }
     }
 
@@ -2910,6 +3077,8 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
         126 => "Show Labels",
         127 => "Replay Step Back",
         128 => "Replay Step Forward",
+        129 => "Effects panel", 130 => "Start ready cinematic", 131 => "Slower replay",
+        132 => "Faster replay", 133 => "Cancel recording / camera", 134 => "Slower camera", 135 => "Faster camera",
         _ => $"Slot {index}",
     };
 
@@ -2940,6 +3109,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
 
     private void RestoreGreenscreenAfterCompositing()
     {
+        _compositingChromaStopTick = null;
         if (_movieVisual.State.Greenscreen != GreenscreenMode.Off)
             _ = _movieVisual.SetGreenscreenMode(GreenscreenMode.Off);
         if (_settings.SmvmGreenscreenMode != GreenscreenMode.Off)
@@ -3073,18 +3243,26 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
             var chromaFramesWithSubject = ReadCaptureMetric(
                 chromaManifest,
                 "Green Screen frames with isolated subject:");
+            var chromaRepeatedVisualSamples = ReadCaptureMetric(
+                chromaManifest,
+                "Repeated sampled visual frames observed:");
 
             var worldAvi = Path.Combine(worldDirectory, "avi", "world.avi");
             var depthAvi = Path.Combine(worldDirectory, "avi", "zdepth.avi");
             var chromaAvi = Path.Combine(chromaDirectory, "avi", "chroma.avi");
             var wave = Path.Combine(worldDirectory, "audio", "world.wav");
+            var chromaStatic = chromaFrames is { } chromaFrameTotal &&
+                               chromaFrameTotal > 0 &&
+                               chromaRepeatedVisualSamples is { } chromaRepeats &&
+                               chromaRepeats * 2 >= chromaFrameTotal;
             var greenPlateUsable = MovieCompositingAlignmentPolicy.IsGreenscreenPlateUsable(
                 new MovieGreenscreenPlateMetrics(
                     chromaFrames,
                     chromaBackgroundPixels,
                     chromaSubjectPixels,
                     chromaFramesWithBackground,
-                    chromaFramesWithSubject));
+                    chromaFramesWithSubject,
+                    chromaRepeatedVisualSamples));
             var aligned = MovieCompositingAlignmentPolicy.IsFrameTickAndTimingAligned(
                 new MoviePassAlignmentMetrics(
                     worldFrames,
@@ -3124,10 +3302,12 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                 : chromaMissing
                     ? "FAILED - GREEN SCREEN DID NOT RECORD"
                     : !greenPlateUsable
-                        ? "FAILED - GREEN SCREEN PLATE IS NOT USABLE"
-                    : visualLayersComplete && !waveHasAudio
-                        ? "VISUAL LAYERS READY - AUDIO MISSING"
-                    : "REVIEW REQUIRED - SEE ALIGNMENT VALUES BELOW";
+                        ? chromaStatic
+                            ? "FAILED - GREEN SCREEN PLATE IS STATIC"
+                            : "FAILED - GREEN SCREEN PLATE IS NOT USABLE"
+                        : visualLayersComplete && !waveHasAudio
+                            ? "VISUAL LAYERS READY - AUDIO MISSING"
+                            : "REVIEW REQUIRED - SEE ALIGNMENT VALUES BELOW";
             File.WriteAllLines(
                 Path.Combine(groupDirectory, "COMPOSITING_TAKE.txt"),
                 [
@@ -3145,6 +3325,7 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                     $"Chroma camera samples/digest: {chromaCameraSamples?.ToString(CultureInfo.InvariantCulture) ?? "missing"} / {(chromaCameraDigest is { } chromaCameraHash ? $"0x{chromaCameraHash:x16}" : "missing")}",
                     $"Green background pixels/frames: {chromaBackgroundPixels?.ToString(CultureInfo.InvariantCulture) ?? "missing"} / {chromaFramesWithBackground?.ToString(CultureInfo.InvariantCulture) ?? "missing"}",
                     $"Green subject pixels/frames: {chromaSubjectPixels?.ToString(CultureInfo.InvariantCulture) ?? "missing"} / {chromaFramesWithSubject?.ToString(CultureInfo.InvariantCulture) ?? "missing"}",
+                    $"Chroma repeated samples/frames: {chromaRepeatedVisualSamples?.ToString(CultureInfo.InvariantCulture) ?? "missing"} / {chromaFrames?.ToString(CultureInfo.InvariantCulture) ?? "missing"}",
                     $"Audio payload: {(waveHasAudio ? $"{new FileInfo(wave).Length:N0} bytes" : "missing or empty")}",
                     string.Empty,
                     "EDITOR FILES",
@@ -3167,10 +3348,12 @@ public sealed class SmvmHostCoordinator : IAsyncDisposable
                 : chromaMissing
                     ? "World and Z-Depth were preserved, but Green Screen recorded no usable AVI."
                     : !greenPlateUsable
-                        ? "Green Screen AVI exists, but it contains no validated key background or isolated subject."
-                    : visualLayersComplete && !waveHasAudio
-                        ? "World, Z-Depth, and Green Screen are aligned; WAV is missing or empty."
-                    : "The passes were preserved, but their alignment report requires review.";
+                        ? chromaStatic
+                            ? "Green Screen AVI is effectively a static image and cannot key."
+                            : "Green Screen AVI exists, but it contains no validated key background or isolated subject."
+                        : visualLayersComplete && !waveHasAudio
+                            ? "World, Z-Depth, and Green Screen are aligned; WAV is missing or empty."
+                            : "The passes were preserved, but their alignment report requires review.";
             return complete;
         }
         catch (Exception ex)

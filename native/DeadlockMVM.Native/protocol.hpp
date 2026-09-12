@@ -1,6 +1,7 @@
 #pragma once
 
 #include "movie_frame_resize_policy.hpp"
+#include "look_settings.hpp"
 
 #include <algorithm>
 #include <array>
@@ -12,7 +13,7 @@
 namespace deadlock_mvm {
 
 constexpr std::uint32_t kProtocolMagic = 0x4D564D43; // "CMVM" little-endian
-constexpr std::uint16_t kProtocolVersion = 24;
+constexpr std::uint16_t kProtocolVersion = 26;
 constexpr std::size_t kMaxCampathKeyframes = 128;
 constexpr double kMinFov = 5.0;
 constexpr double kMaxFov = 170.0;
@@ -36,6 +37,7 @@ enum class MessageType : std::uint16_t {
     enable_manual_camera = 15,
     disable_manual_camera = 16,
     set_campath_documents = 17,
+    set_look_lut = 18,
     status = 100,
 };
 
@@ -509,6 +511,15 @@ enum class SmvmActionType : std::uint32_t {
     retired_camera_attachment_offset = 90,
     choose_movie_capture_folder = 91,
     set_movie_output_resolution = 92,
+    set_look_enabled = 93,
+    set_look_value = 94,
+    reset_look = 95,
+    select_look_preset = 96,
+    save_look_preset = 97,
+    import_look_preset = 98,
+    export_look_preset = 99,
+    load_look_lut = 100,
+    exit_deadlock = 101,
 };
 
 #pragma pack(push, 1)
@@ -662,6 +673,17 @@ struct SmvmSnapshotPayload final {
     MovieCompositingStage movie_compositing_stage;
     std::uint32_t movie_capture_audio;
     std::uint64_t movie_expected_frame_count;
+    LookSettings look;
+    std::array<char, 64> look_preset_name;
+    std::uint32_t look_modified;
+    std::uint32_t effects_key;
+    std::uint32_t cinematic_start_key;
+    std::uint32_t playback_slower_key;
+    std::uint32_t playback_faster_key;
+    std::uint32_t cancel_key;
+    std::uint32_t camera_slower_key;
+    std::uint32_t camera_faster_key;
+    std::uint32_t binding_reserved;
 };
 
 constexpr std::size_t kMaxCampathDocuments = 32;
@@ -718,13 +740,13 @@ static_assert(sizeof(CameraSample) == 56);
 static_assert(sizeof(RollPayload) == 8);
 static_assert(sizeof(CampathKeyframe) == 64);
 static_assert(sizeof(CampathPayloadHeader) == 16);
-static_assert(sizeof(SmvmSnapshotPayload) == 1128);
+static_assert(sizeof(SmvmSnapshotPayload) == 1368);
 static_assert(sizeof(SmvmActionPayload) == 152);
 static_assert(sizeof(StatusPayload) == 272);
 static_assert(sizeof(CampathDocumentEntry) == 144);
 
 constexpr std::size_t kMaxMessageBytes =
-    sizeof(CampathPayloadHeader) + (sizeof(CampathKeyframe) * kMaxCampathKeyframes);
+    16 + 33 * 33 * 33 * 3 * sizeof(float);
 
 [[nodiscard]] inline bool IsKnownMessageType(const MessageType type) noexcept {
     switch (type) {
@@ -745,6 +767,7 @@ constexpr std::size_t kMaxMessageBytes =
         case MessageType::enable_manual_camera:
         case MessageType::disable_manual_camera:
         case MessageType::set_campath_documents:
+        case MessageType::set_look_lut:
         case MessageType::status:
             return true;
     }
@@ -882,7 +905,7 @@ constexpr std::size_t kMaxMessageBytes =
                        (value >= '0' && value <= '9') || value == '-' || value == '_';
             });
     }();
-    if (snapshot.snapshot_version != 13 || (snapshot.flags & ~known_flags) != 0 ||
+    if (snapshot.snapshot_version != 14 || !ValidateLookSettings(snapshot.look) || (snapshot.flags & ~known_flags) != 0 ||
         (snapshot.movie_recording_flags & ~kKnownMovieRecordingFlags) != 0 ||
         !recording_name_valid ||
         snapshot.movie_recording_reserved != 0 ||
@@ -942,6 +965,13 @@ constexpr std::size_t kMaxMessageBytes =
         snapshot.playback_state > max_playback_state || snapshot.start_failure > max_start_failure ||
         !std::isfinite(snapshot.timescale) || snapshot.timescale < 0.01 || snapshot.timescale > 16.0 ||
         !std::isfinite(snapshot.fov_step) || snapshot.fov_step < 0.05 || snapshot.fov_step > 30.0 ||
+        !ValidateSmvmKeyboardInput(snapshot.effects_key) ||
+        !ValidateSmvmKeyboardInput(snapshot.cinematic_start_key) ||
+        !ValidateSmvmKeyboardInput(snapshot.playback_slower_key) ||
+        !ValidateSmvmKeyboardInput(snapshot.playback_faster_key) ||
+        !ValidateSmvmKeyboardInput(snapshot.cancel_key) ||
+        !ValidateSmvmKeyboardInput(snapshot.camera_slower_key) ||
+        !ValidateSmvmKeyboardInput(snapshot.camera_faster_key) ||
         !ValidateSmvmInput(snapshot.menu_key) || !ValidateSmvmInput(snapshot.add_key) ||
         !ValidateSmvmInput(snapshot.delete_key) || !ValidateSmvmInput(snapshot.clean_view_key) ||
         !ValidateSmvmKeyboardInput(snapshot.restore_ui_key) ||
@@ -996,7 +1026,7 @@ constexpr std::size_t kMaxMessageBytes =
         return false;
     return snapshot.replay_name.back() == '\0' && snapshot.path_name.back() == '\0' &&
            snapshot.status.back() == '\0' && snapshot.camera_status.back() == '\0' &&
-           snapshot.movie_capture_path.back() == '\0';
+           snapshot.movie_capture_path.back() == '\0' && snapshot.look_preset_name.back() == '\0' && snapshot.look_modified <= 1;
 }
 
 [[nodiscard]] inline bool ValidateCampath(
@@ -1046,6 +1076,7 @@ constexpr std::size_t kMaxMessageBytes =
         case MessageType::set_campath: return kMaxMessageBytes + 1;
         case MessageType::set_editor_campath: return kMaxMessageBytes + 1;
         case MessageType::set_campath_documents: return kMaxMessageBytes + 1;
+        case MessageType::set_look_lut: return kMaxMessageBytes + 1;
         case MessageType::update_smvm_snapshot: return sizeof(SmvmSnapshotPayload);
         case MessageType::enable_override:
         case MessageType::disable_override:
@@ -1064,10 +1095,11 @@ constexpr std::size_t kMaxMessageBytes =
 
 [[nodiscard]] inline bool ValidatePayloadSize(
     const MessageType type, const std::size_t payload_size) noexcept {
+    if (type == MessageType::set_look_lut) return payload_size >= 16 && payload_size <= kMaxMessageBytes && (payload_size - 16) % 12 == 0;
     if (type == MessageType::set_campath || type == MessageType::set_editor_campath) {
         const auto minimum_count = type == MessageType::set_campath ? 2u : 1u;
         return payload_size >= sizeof(CampathPayloadHeader) + (minimum_count * sizeof(CampathKeyframe)) &&
-               payload_size <= kMaxMessageBytes &&
+               payload_size <= sizeof(CampathPayloadHeader) + kMaxCampathKeyframes * sizeof(CampathKeyframe) &&
                (payload_size - sizeof(CampathPayloadHeader)) % sizeof(CampathKeyframe) == 0;
     }
     if (type == MessageType::set_campath_documents) {

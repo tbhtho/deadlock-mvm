@@ -29,3 +29,60 @@ set_target_properties(DeadlockMVM.Native PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/artifacts/$<CONFIG>"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/artifacts/$<CONFIG>"
 )
+
+# Compile project-authored effects at build time; never compile shaders in Present.
+file(GLOB SMVM_FXC_CANDIDATES "C:/Program Files (x86)/Windows Kits/10/bin/*/x64/fxc.exe")
+list(SORT SMVM_FXC_CANDIDATES COMPARE NATURAL ORDER DESCENDING)
+find_program(SMVM_FXC NAMES fxc.exe HINTS ${SMVM_FXC_CANDIDATES})
+if(NOT SMVM_FXC AND SMVM_FXC_CANDIDATES)
+    list(GET SMVM_FXC_CANDIDATES 0 SMVM_FXC)
+endif()
+if(NOT SMVM_FXC)
+    message(FATAL_ERROR "Windows SDK fxc.exe is required for in-house Reshade shaders")
+endif()
+foreach(stage IN ITEMS vs ps)
+    if(stage STREQUAL "vs")
+        set(entry VSMain)
+    else()
+        set(entry PSMain)
+    endif()
+    add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/look_${stage}.h"
+        COMMAND "${SMVM_FXC}" /nologo /WX /O3 /T ${stage}_5_0 /E ${entry} /Vn g_look_${stage}
+            /Fh "${CMAKE_CURRENT_BINARY_DIR}/look_${stage}.h" "${CMAKE_CURRENT_SOURCE_DIR}/look_pipeline.hlsl"
+        DEPENDS look_pipeline.hlsl VERBATIM)
+endforeach()
+target_sources(DeadlockMVM.Native PRIVATE look_pipeline.cpp)
+target_include_directories(DeadlockMVM.Native PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+foreach(stage IN ITEMS cs ps)
+    if(stage STREQUAL "cs")
+        set(entry CompareCS)
+    else()
+        set(entry RecoverPS)
+    endif()
+    add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/look_fresh_${stage}.h"
+        COMMAND "${SMVM_FXC}" /nologo /WX /O3 /T ${stage}_5_0 /E ${entry} /Vn g_look_fresh_${stage}
+            /Fh "${CMAKE_CURRENT_BINARY_DIR}/look_fresh_${stage}.h" "${CMAKE_CURRENT_SOURCE_DIR}/look_freshness.hlsl"
+        DEPENDS look_freshness.hlsl VERBATIM)
+endforeach()
+
+
+set(SMVM_LOOK_GENERATED "${CMAKE_CURRENT_BINARY_DIR}/look_vs.h" "${CMAKE_CURRENT_BINARY_DIR}/look_ps.h" "${CMAKE_CURRENT_BINARY_DIR}/look_fresh_cs.h" "${CMAKE_CURRENT_BINARY_DIR}/look_fresh_ps.h")
+# One producer avoids parallel DLL/test shader-generation races.
+add_custom_target(SmvmLookShaders DEPENDS ${SMVM_LOOK_GENERATED})
+add_dependencies(DeadlockMVM.Native SmvmLookShaders)
+add_executable(DeadlockMVM.Look.Tests ../DeadlockMVM.Native.Tests/look_pipeline_tests.cpp look_pipeline.cpp)
+add_dependencies(DeadlockMVM.Look.Tests SmvmLookShaders)
+target_include_directories(DeadlockMVM.Look.Tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}")
+target_compile_definitions(DeadlockMVM.Look.Tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(DeadlockMVM.Look.Tests PRIVATE /W4 /WX /permissive- /EHsc)
+target_link_libraries(DeadlockMVM.Look.Tests PRIVATE D3D11 DXGI)
+add_test(NAME DeadlockMVM.Look.Tests COMMAND DeadlockMVM.Look.Tests)
+
+
+add_executable(DeadlockMVM.CaptureLook.Tests ../DeadlockMVM.Native.Tests/capture_look_tests.cpp world_depth_capture.cpp engine_movie_audio.cpp pattern_scan.cpp look_pipeline.cpp)
+add_dependencies(DeadlockMVM.CaptureLook.Tests SmvmLookShaders)
+target_include_directories(DeadlockMVM.CaptureLook.Tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}")
+target_compile_definitions(DeadlockMVM.CaptureLook.Tests PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(DeadlockMVM.CaptureLook.Tests PRIVATE /W4 /WX /permissive- /EHsc)
+target_link_libraries(DeadlockMVM.CaptureLook.Tests PRIVATE libgmavi D3D11 D3DCompiler DXGI User32)
+add_test(NAME DeadlockMVM.CaptureLook.Tests COMMAND DeadlockMVM.CaptureLook.Tests)

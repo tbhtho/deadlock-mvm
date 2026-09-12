@@ -2112,6 +2112,20 @@ enum class PipeConnectionResult : std::uint8_t {
             case MessageType::clear_editor_campath:
                 backend.editor_campath_available.store(false, std::memory_order_release);
                 break;
+            case MessageType::set_look_lut: {
+                std::uint64_t revision{};
+                std::uint32_t size{}, reserved{};
+                std::memcpy(&revision, payload.data(), 8);
+                std::memcpy(&size, payload.data() + 8, 4);
+                std::memcpy(&reserved, payload.data() + 12, 4);
+                const auto count = static_cast<std::size_t>(size) * size * size * 3;
+                const auto* values = reinterpret_cast<const float*>(payload.data() + 16);
+                bool valid = hello_received && revision != 0 && reserved == 0 && size >= 2 && size <= 33 && 16 + count * sizeof(float) == header.payload_size;
+                if (valid) for (std::size_t i = 0; i < count; ++i) if (!std::isfinite(values[i]) || values[i] < 0 || values[i] > 1) { valid = false; break; }
+                if (!valid) backend.error.store(ErrorCode::protocol_error, std::memory_order_release);
+                else backend.error.store(SetSmvmLookLut(revision, size, values, count) ? ErrorCode::none : ErrorCode::invalid_sample, std::memory_order_release);
+                break;
+            }
             case MessageType::set_campath_documents: {
                 CampathDocumentsPayload documents{};
                 std::memcpy(&documents, payload.data(), header.payload_size);

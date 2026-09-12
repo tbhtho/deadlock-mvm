@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <string_view>
@@ -20,7 +21,15 @@ enum class EngineMovieAudioError : std::uint32_t {
     recorder_unavailable,
     invalid_vtable,
     invocation_failed,
+    output_empty,
 };
+
+// Returns the size declared by the first RIFF/WAVE `data` chunk, or 0 when the
+// buffer is malformed, truncated, or header-only. Deadlock's audio sink can
+// finalize a 44-byte header without samples; that must not read as usable.
+[[nodiscard]] std::uint32_t WaveDataChunkBytes(
+    const std::uint8_t* bytes,
+    std::size_t size) noexcept;
 
 struct EngineMovieAudioStatus final {
     bool active{};

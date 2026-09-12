@@ -1,28 +1,19 @@
 # Controls
 
+Defaults can be changed in **Advanced > Open keyboard + mouse** in the launcher. Select an action and click a key or mouse button. Modifier checkboxes create chords; conflicts and unsupported mouse bindings are rejected. The in-game **ReShade > Keybinds** list saves the same settings.
 
-| Action | Default |
+| Input | Action |
 | --- | --- |
-| Move | `W`, `A`, `S`, `D` |
-| Move up / down | `Space` / `Left Ctrl` |
-| Fast / precision movement | `Left Shift` / `Left Alt` |
-| Look | Mouse |
-| Change FOV | Mouse wheel or typed FOV field |
-| Roll left / right / reset | `Q` / `E` / `R` |
-| Open or close SMVM menu | `Tab` |
-| Enter or retry Free Camera | `F2` |
-| Deliberately exit Free Camera with the menu closed | `Escape` |
-| Add or replace Campath | `Mouse3` |
-| Delete selected Campath | `L` |
-| Play cinematic from Campath 1 | `F3` |
-| Play from current point | `F5` |
-| Stop Campath playback | `F4` |
-| Pause / resume replay | `N` |
-| Step one tick backward / forward | `PageUp` / `PageDown` |
-| Decrease / increase camera movement speed | `-` / `+` |
-| Clean footage | `F10` |
-| Cycle replay UI mode | `F8` |
-| Emergency Exit + Restore | `F9` |
+| Tab | Open or close the main menu; drag its title bar to move it |
+| CapsLock | Open the separate effects panel |
+| F9 | Restore Deadlock's presentation and release editor input |
+| N | Pause or resume the replay |
+| Space | Start the cinematic; move upward during Free Camera movement |
+| Middle mouse | Capture a camera keyframe |
+| WASD | Move in Free Camera |
+| Q / E | Roll left / right in the archived source defaults |
+| R | Reset roll |
 
-Camera settings and the bindings exposed under **Advanced** can be changed in the launcher. This snapshot does not ship a separate in-game settings page. `Space` continues to move the camera upward while composing; cinematic start accepts only a fresh press after the readiness prompt is armed.
+If recovery fails, restart Deadlock and the launcher. Native hook compatibility depends on the installed game build.
 
+Effects are built into MVM. Disabled effects hide their parameter controls; external ReShade and arbitrary `.fx` loading are unsupported.

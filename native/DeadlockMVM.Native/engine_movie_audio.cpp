@@ -5,9 +5,11 @@
 #include <Windows.h>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -203,7 +205,80 @@ AudioState& State() noexcept {
     };
 }
 
+// Walks the RIFF chunk list rather than trusting the file size: the engine's
+// sink writes a valid 44-byte header before any audio arrives, so a header-only
+// file is indistinguishable from a real take unless the data size is checked.
+[[nodiscard]] bool ReadWaveDataBytes(
+    const std::filesystem::path& path,
+    std::uint32_t& data_bytes) noexcept {
+    data_bytes = 0;
+    try {
+        std::ifstream stream(path, std::ios::binary);
+        if (!stream)
+            return false;
+        std::array<std::uint8_t, 12> header{};
+        stream.read(
+            reinterpret_cast<char*>(header.data()),
+            static_cast<std::streamsize>(header.size()));
+        if (stream.gcount() != static_cast<std::streamsize>(header.size()) ||
+            std::memcmp(header.data(), "RIFF", 4) != 0 ||
+            std::memcmp(header.data() + 8, "WAVE", 4) != 0) {
+            return false;
+        }
+        for (;;) {
+            std::array<std::uint8_t, 8> chunk{};
+            stream.read(
+                reinterpret_cast<char*>(chunk.data()),
+                static_cast<std::streamsize>(chunk.size()));
+            if (stream.gcount() != static_cast<std::streamsize>(chunk.size()))
+                return false;
+            const auto chunk_bytes =
+                static_cast<std::uint32_t>(chunk[4]) |
+                (static_cast<std::uint32_t>(chunk[5]) << 8) |
+                (static_cast<std::uint32_t>(chunk[6]) << 16) |
+                (static_cast<std::uint32_t>(chunk[7]) << 24);
+            if (std::memcmp(chunk.data(), "data", 4) == 0) {
+                data_bytes = chunk_bytes;
+                return true;
+            }
+            stream.seekg(
+                static_cast<std::streamoff>(chunk_bytes + (chunk_bytes & 1u)),
+                std::ios::cur);
+            if (!stream)
+                return false;
+        }
+    } catch (...) {
+        return false;
+    }
+}
+
 } // namespace
+
+std::uint32_t WaveDataChunkBytes(
+    const std::uint8_t* bytes,
+    const std::size_t size) noexcept {
+    if (bytes == nullptr || size < 12 ||
+        std::memcmp(bytes, "RIFF", 4) != 0 ||
+        std::memcmp(bytes + 8, "WAVE", 4) != 0) {
+        return 0;
+    }
+    std::size_t offset = 12;
+    while (offset + 8 <= size) {
+        const auto chunk_bytes =
+            static_cast<std::uint32_t>(bytes[offset + 4]) |
+            (static_cast<std::uint32_t>(bytes[offset + 5]) << 8) |
+            (static_cast<std::uint32_t>(bytes[offset + 6]) << 16) |
+            (static_cast<std::uint32_t>(bytes[offset + 7]) << 24);
+        if (std::memcmp(bytes + offset, "data", 4) == 0)
+            return chunk_bytes;
+        const std::uint64_t advance =
+            8ull + chunk_bytes + (chunk_bytes & 1u);
+        if (advance > size - offset)
+            break;
+        offset += static_cast<std::size_t>(advance);
+    }
+    return 0;
+}
 
 bool StartEngineMovieAudio(
     const std::filesystem::path& wave_path) noexcept {
@@ -319,14 +394,14 @@ void StopEngineMovieAudio() noexcept {
     state.status.stop_invoked = stopped;
     if (!stopped)
         state.status.error = EngineMovieAudioError::invocation_failed;
-    try {
-        std::error_code file_error{};
-        state.status.file_available =
-            std::filesystem::is_regular_file(state.wave_path, file_error) &&
-            !file_error && std::filesystem::file_size(state.wave_path, file_error) >= 44 &&
-            !file_error;
-    } catch (...) {
-        state.status.file_available = false;
+    std::uint32_t data_bytes = 0;
+    state.status.file_available =
+        !state.wave_path.empty() &&
+        ReadWaveDataBytes(state.wave_path, data_bytes) &&
+        data_bytes > 0;
+    if (!state.status.file_available &&
+        state.status.error == EngineMovieAudioError::none) {
+        state.status.error = EngineMovieAudioError::output_empty;
     }
 }
 
@@ -349,6 +424,7 @@ const char* DescribeEngineMovieAudioError(
         case EngineMovieAudioError::recorder_unavailable: return "movie audio recorder unavailable";
         case EngineMovieAudioError::invalid_vtable: return "movie audio vtable rejected";
         case EngineMovieAudioError::invocation_failed: return "movie audio invocation failed";
+        case EngineMovieAudioError::output_empty: return "movie audio output has no samples";
     }
     return "unknown";
 }

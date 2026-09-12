@@ -109,11 +109,18 @@ void		*gmav_open(
 		FCC('hdrl')							/*	fccListType			*/
 	};
 
+	/*
+	 * DeadLockMVM fix: consumers derive the reported bit rate by multiplying
+	 * maxBytesPerSec by 8 in a signed 32-bit field. A raw 300 FPS 1080p stream
+	 * is ~1.87 GB/s, so a value above 0x0FFFFFFF overflows that product and the
+	 * Windows property handler reports 0 kbps. Reference muxers cap the field
+	 * at 0x0FFFFFFF for the same reason.
+	 */
 	uint32_t	avihMaxBytesPerSec;
-	if ((uint32_t)0x7FFFFFFF / out->bitmapSize > framesPerSec)
+	if ((uint32_t)0x0FFFFFFF / out->bitmapSize > framesPerSec)
 		avihMaxBytesPerSec = out->bitmapSize * framesPerSec;
 	else
-		avihMaxBytesPerSec = 0x7FFFFFFF;
+		avihMaxBytesPerSec = 0x0FFFFFFF;
 
 	contents.aviHeader = (AVIMAINHEADER){
 		FCC('avih'),						/*	fcc					*/
@@ -125,7 +132,7 @@ void		*gmav_open(
 		TO_BE_DETERMINED,					/*	totalFrames			*/
 		0,									/*	initialFames		*/
 		1,									/*	streams				*/
-		0,									/*	suggestedBufferSize	*/
+		out->bitmapSize,					/*	suggestedBufferSize	*/
 		width,								/*	width				*/
 		height								/*	height				*/
 	};

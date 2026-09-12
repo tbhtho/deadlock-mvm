@@ -96,6 +96,9 @@ public partial class App : System.Windows.Application
             connection.Start();
 
             var window = new MainWindow { DataContext = viewModel };
+            // Optional first-party dev console reuses this single VConsole
+            // connection; the game's own console is left alone.
+            window.ConsoleSource = controller;
             window.Closed += async (_, _) =>
             {
                 await smvm.DisposeAsync();

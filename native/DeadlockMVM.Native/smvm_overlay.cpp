@@ -18,6 +18,9 @@
 #include "replay_timeline_policy.hpp"
 #include "smvm_input_route.hpp"
 #include "world_depth_capture.hpp"
+#include "look_pipeline.hpp"
+#include "device_failure_policy.hpp"
+#include "look_capture_policy.hpp"
 
 #include "campath_math.hpp"
 #include "pattern_scan.hpp"
@@ -50,6 +53,8 @@
 #include <cwchar>
 #include <cstring>
 #include <optional>
+#include <mutex>
+#include <vector>
 #include <span>
 #include <string_view>
 
@@ -259,6 +264,9 @@ struct Vertex final {
 
 struct SavedD3D11State final {
     std::array<ID3D11RenderTargetView*, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> render_targets{};
+    std::array<ID3D11UnorderedAccessView*, D3D11_PS_CS_UAV_REGISTER_COUNT> output_uavs{};
+    ID3D11Predicate* predicate{};
+    BOOL predicate_value{};
     ID3D11DepthStencilView* depth_stencil_view{};
     ID3D11BlendState* blend_state{};
     FLOAT blend_factor[4]{};
@@ -273,6 +281,13 @@ struct SavedD3D11State final {
     D3D11_PRIMITIVE_TOPOLOGY topology{};
     ID3D11VertexShader* vertex_shader{};
     ID3D11PixelShader* pixel_shader{};
+    ID3D11GeometryShader* geometry_shader{};
+    ID3D11HullShader* hull_shader{};
+    ID3D11DomainShader* domain_shader{};
+    std::array<ID3D11ClassInstance*, 256> vertex_classes{}, pixel_classes{},
+        geometry_classes{}, hull_classes{}, domain_classes{};
+    UINT vertex_class_count{256}, pixel_class_count{256}, geometry_class_count{256},
+        hull_class_count{256}, domain_class_count{256};
     ID3D11Buffer* vertex_constant_buffer{};
     ID3D11ShaderResourceView* pixel_resource{};
     ID3D11SamplerState* pixel_sampler{};
@@ -290,6 +305,11 @@ struct OverlayState final {
     std::atomic<bool> present_observed{false};
     std::atomic<bool> ready{false};
     std::atomic<bool> menu_open{false};
+    std::atomic<bool> effects_open{false};
+    // When true, keyboard input is handed back to Deadlock so its own
+    // developer console (and normal game input) can be used. Toggled with the
+    // engine console key (grave/backquote) while the SMVM menu is closed.
+    std::atomic<bool> game_input_passthrough{false};
     std::atomic<bool> replay_tick_input_active{false};
     std::atomic<bool> cinematic_start_armed{false};
     std::atomic<bool> cinematic_start_ready{false};
@@ -297,6 +317,9 @@ struct OverlayState final {
     std::atomic<bool> cinematic_space_consumed{false};
     std::atomic<std::int64_t> cinematic_start_tick{-1};
     std::atomic<std::uint64_t> cinematic_replay_session_generation{0};
+    // Edge latch so arming a movie take also arms the contextual cinematic
+    // start gate exactly once instead of re-seeking every frame.
+    std::atomic<bool> cinematic_recording_autostart{false};
     std::atomic<bool> clean_view{false};
     std::atomic<std::uint32_t> presentation_mode{
         static_cast<std::uint32_t>(DeadlockUiMode::deadlock_ui)};
@@ -434,6 +457,24 @@ struct OverlayState final {
     std::atomic<bool> manual_raw_mouse_restore_pending{false};
 
     ID3D11Device* device{};
+    std::atomic<bool> device_failure_pending{false};
+    bool device_failure_handled{};
+    bool device_failure_cleanup_succeeded{};
+    bool capture_restart_requires_idle{};
+    Microsoft::WRL::ComPtr<ID3D11Device> failed_device{};
+    LookPipeline look_pipeline{};
+    LookTakeState look_take{};
+    const char* look_status{"Awaiting D3D11 renderer"};
+    std::array<char, 256> look_status_text{};
+    bool look_initialized{};
+    bool look_initialize_attempted{};
+    bool look_history_active{};
+    std::uint64_t look_frame_sequence{};
+    std::uint64_t look_session{};
+    std::mutex look_lut_mutex{};
+    std::vector<float> look_lut_values{};
+    std::uint64_t look_lut_revision{}, look_uploaded_lut_revision{}, look_lut_hash{}, look_uploaded_lut_hash{};
+    std::uint32_t look_lut_size{};
     ID3D11DeviceContext* context{};
     ID3D11RenderTargetView* render_target{};
     ID3D11Buffer* vertex_buffer{};
@@ -818,7 +859,7 @@ void MarkRecordingProfileRecoveryActionQueued(std::uint64_t generation) noexcept
 [[nodiscard]] bool RequestOwnerPresentationMode(
     DeadlockUiMode target_mode,
     const SmvmSnapshotPayload& snapshot) noexcept;
-[[nodiscard]] bool ToggleMovieSetupMenu(const SmvmSnapshotPayload& snapshot) noexcept;
+[[nodiscard]] bool ToggleMovieSetupMenu(const SmvmSnapshotPayload& snapshot, bool effects = false) noexcept;
 void ReconcileRecordingProfileRecovery(const SmvmSnapshotPayload& snapshot) noexcept;
 
 [[nodiscard]] DeadlockUiMode PreviousVisibleMode() noexcept {
@@ -1128,10 +1169,10 @@ void MarkRecordingProfileRecoveryActionQueued(const std::uint64_t generation) no
     return true;
 }
 
-[[nodiscard]] bool ToggleMovieSetupMenu(const SmvmSnapshotPayload& snapshot) noexcept {
+[[nodiscard]] bool ToggleMovieSetupMenu(const SmvmSnapshotPayload& snapshot, const bool effects) noexcept {
     auto& state = g_overlay;
     const auto menu_open = state.menu_open.load(std::memory_order_acquire);
-    if (menu_open) {
+    if (menu_open && state.effects_open.load(std::memory_order_acquire) == effects) {
         SetMenuOpen(false);
         return true;
     }
@@ -1147,7 +1188,9 @@ void MarkRecordingProfileRecoveryActionQueued(const std::uint64_t generation) no
         state.presentation_mode.load(std::memory_order_acquire));
     if (current != DeadlockUiMode::smvm_replay_ui)
         static_cast<void>(RequestOwnerPresentationMode(DeadlockUiMode::smvm_replay_ui, snapshot));
+    if (menu_open) SetMenuOpen(false);
     SetMenuOpen(true);
+    state.effects_open.store(effects, std::memory_order_release);
     return true;
 }
 
@@ -1554,7 +1597,7 @@ enum class BindingFeedback : std::uint32_t {
     SmvmSnapshotPayload snapshot{};
     if (!ReadSnapshot(snapshot))
         return -1;
-    const std::array<std::uint32_t, 29> values{
+    const std::array<std::uint32_t, 36> values{
         snapshot.forward_key, snapshot.backward_key, snapshot.left_key, snapshot.right_key,
         snapshot.up_key, snapshot.down_key, snapshot.fast_key, snapshot.precision_key,
         snapshot.roll_left_key, snapshot.roll_right_key, snapshot.roll_reset_key,
@@ -1564,10 +1607,12 @@ enum class BindingFeedback : std::uint32_t {
         snapshot.restore_ui_key,
         snapshot.cycle_ui_key, snapshot.toggle_free_camera_key, snapshot.replay_pause_key,
         snapshot.show_labels_key, snapshot.step_back_key, snapshot.step_forward_key,
+        snapshot.effects_key, snapshot.cinematic_start_key, snapshot.playback_slower_key, snapshot.playback_faster_key,
+        snapshot.cancel_key, snapshot.camera_slower_key, snapshot.camera_faster_key,
     };
     for (std::size_t index = 0; index < values.size(); ++index) {
         const auto candidate = kFirstManualBindingAction + static_cast<std::int32_t>(index);
-        if (candidate != action && values[index] == value)
+        if (candidate != action && !(candidate == 104 && action == 130) && !(candidate == 130 && action == 104) && values[index] == value)
             return candidate;
     }
     return -1;
@@ -2085,12 +2130,26 @@ void ReleaseSavedState(SavedD3D11State& saved) noexcept {
     SafeRelease(saved.vertex_buffer);
     SafeRelease(saved.vertex_shader);
     SafeRelease(saved.pixel_shader);
+    SafeRelease(saved.geometry_shader);
+    SafeRelease(saved.hull_shader);
+    SafeRelease(saved.domain_shader);
+    for (auto& instance : saved.vertex_classes) SafeRelease(instance);
+    for (auto& instance : saved.pixel_classes) SafeRelease(instance);
+    for (auto& instance : saved.geometry_classes) SafeRelease(instance);
+    for (auto& instance : saved.hull_classes) SafeRelease(instance);
+    for (auto& instance : saved.domain_classes) SafeRelease(instance);
     SafeRelease(saved.vertex_constant_buffer);
     SafeRelease(saved.pixel_resource);
     SafeRelease(saved.pixel_sampler);
+    SafeRelease(saved.predicate);
+    for (auto& uav : saved.output_uavs) SafeRelease(uav);
 }
 
 void SavePipelineState(ID3D11DeviceContext* context, SavedD3D11State& saved) noexcept {
+    context->GetPredication(&saved.predicate, &saved.predicate_value);
+    context->SetPredication(nullptr, FALSE);
+    context->OMGetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 0,
+        static_cast<UINT>(saved.output_uavs.size()), saved.output_uavs.data());
     context->OMGetRenderTargets(
         static_cast<UINT>(saved.render_targets.size()),
         saved.render_targets.data(),
@@ -2102,18 +2161,24 @@ void SavePipelineState(ID3D11DeviceContext* context, SavedD3D11State& saved) noe
     context->IAGetInputLayout(&saved.input_layout);
     context->IAGetVertexBuffers(0, 1, &saved.vertex_buffer, &saved.vertex_stride, &saved.vertex_offset);
     context->IAGetPrimitiveTopology(&saved.topology);
-    context->VSGetShader(&saved.vertex_shader, nullptr, nullptr);
+    context->VSGetShader(&saved.vertex_shader, saved.vertex_classes.data(), &saved.vertex_class_count);
     context->VSGetConstantBuffers(0, 1, &saved.vertex_constant_buffer);
-    context->PSGetShader(&saved.pixel_shader, nullptr, nullptr);
+    context->PSGetShader(&saved.pixel_shader, saved.pixel_classes.data(), &saved.pixel_class_count);
+    context->GSGetShader(&saved.geometry_shader, saved.geometry_classes.data(), &saved.geometry_class_count);
+    context->HSGetShader(&saved.hull_shader, saved.hull_classes.data(), &saved.hull_class_count);
+    context->DSGetShader(&saved.domain_shader, saved.domain_classes.data(), &saved.domain_class_count);
     context->PSGetShaderResources(0, 1, &saved.pixel_resource);
     context->PSGetSamplers(0, 1, &saved.pixel_sampler);
 }
 
 void RestorePipelineState(ID3D11DeviceContext* context, SavedD3D11State& saved) noexcept {
-    context->OMSetRenderTargets(
-        static_cast<UINT>(saved.render_targets.size()),
-        saved.render_targets.data(),
-        saved.depth_stencil_view);
+    UINT target_count = 0;
+    for (UINT i = 0; i < saved.render_targets.size(); ++i)
+        if (saved.render_targets[i] != nullptr) target_count = i + 1;
+    context->OMSetRenderTargetsAndUnorderedAccessViews(target_count,
+        saved.render_targets.data(), saved.depth_stencil_view, target_count,
+        static_cast<UINT>(saved.output_uavs.size()) - target_count,
+        saved.output_uavs.data() + target_count, nullptr);
     context->OMSetBlendState(saved.blend_state, saved.blend_factor, saved.sample_mask);
     context->OMSetDepthStencilState(saved.depth_stencil_state, saved.stencil_reference);
     context->RSSetState(saved.rasterizer_state);
@@ -2123,15 +2188,21 @@ void RestorePipelineState(ID3D11DeviceContext* context, SavedD3D11State& saved) 
     context->IASetInputLayout(saved.input_layout);
     context->IASetVertexBuffers(0, 1, &saved.vertex_buffer, &saved.vertex_stride, &saved.vertex_offset);
     context->IASetPrimitiveTopology(saved.topology);
-    context->VSSetShader(saved.vertex_shader, nullptr, 0);
+    context->VSSetShader(saved.vertex_shader, saved.vertex_classes.data(), saved.vertex_class_count);
     context->VSSetConstantBuffers(0, 1, &saved.vertex_constant_buffer);
-    context->PSSetShader(saved.pixel_shader, nullptr, 0);
+    context->PSSetShader(saved.pixel_shader, saved.pixel_classes.data(), saved.pixel_class_count);
+    context->GSSetShader(saved.geometry_shader, saved.geometry_classes.data(), saved.geometry_class_count);
+    context->HSSetShader(saved.hull_shader, saved.hull_classes.data(), saved.hull_class_count);
+    context->DSSetShader(saved.domain_shader, saved.domain_classes.data(), saved.domain_class_count);
     context->PSSetShaderResources(0, 1, &saved.pixel_resource);
     context->PSSetSamplers(0, 1, &saved.pixel_sampler);
+    context->SetPredication(saved.predicate, saved.predicate_value);
     ReleaseSavedState(saved);
 }
 
 void ReleaseRenderTarget() noexcept {
+    g_overlay.look_pipeline.ResetSizeResources();
+    g_overlay.look_history_active = false;
     SafeRelease(g_overlay.render_target);
 }
 
@@ -3147,6 +3218,10 @@ void DrawWorldLabels() noexcept {
     if (!RemoveDepthContextObservation())
         return false;
     ShutdownImGui();
+    state.look_pipeline.Reset();
+    state.look_initialized = false;
+    state.look_initialize_attempted = false;
+    state.look_uploaded_lut_revision = 0;
     ReleaseRenderTarget();
     SafeRelease(state.vertex_buffer);
     SafeRelease(state.constant_buffer);
@@ -3326,6 +3401,7 @@ float4 PSMain(PSInput input) : SV_TARGET { return input.color * Atlas.Sample(Atl
 
 void SetMenuOpen(const bool open) noexcept {
     auto& state = g_overlay;
+    if (!open) state.effects_open.store(false, std::memory_order_release);
     // Text editing is subordinate to the modal boundary. Clearing it on both
     // open and close prevents stale tick-field ownership from suppressing the
     // Free Camera keyboard/pointer reacquisition path.
@@ -3631,6 +3707,30 @@ void RequestManualPointerState(const bool enabled) noexcept {
            ((binding & kSmvmInputModifierMask) >> 16) == modifiers;
 }
 
+// Camera-speed keys are shifted symbols on common layouts ('+' needs Shift),
+// so they tolerate a held Shift and treat the numpad plus/minus as aliases of
+// the main-row keys. Ctrl/Alt/Win chords still require an explicit binding.
+[[nodiscard]] bool InputMatchesCameraSpeedKeyboard(
+    const std::uint32_t binding,
+    const WPARAM key) noexcept {
+    const auto base = binding & kSmvmInputBaseMask;
+    if (base == 0)
+        return false;
+    auto actual = static_cast<std::uint32_t>(key);
+    if (base == VK_OEM_PLUS && actual == VK_ADD)
+        actual = VK_OEM_PLUS;
+    else if (base == VK_OEM_MINUS && actual == VK_SUBTRACT)
+        actual = VK_OEM_MINUS;
+    const auto base_matches = base == actual ||
+        (base == VK_SHIFT && (actual == VK_LSHIFT || actual == VK_RSHIFT)) ||
+        (base == VK_CONTROL && (actual == VK_LCONTROL || actual == VK_RCONTROL)) ||
+        (base == VK_MENU && (actual == VK_LMENU || actual == VK_RMENU));
+    return base_matches &&
+           CameraSpeedModifiersMatch(
+               (binding & kSmvmInputModifierMask) >> 16,
+               CurrentModifiers(base));
+}
+
 [[nodiscard]] bool InputMatchesMouse(const std::uint32_t binding, const UINT message, const WPARAM wparam) noexcept {
     const auto modifiers = CurrentModifiers();
     if (((binding & kSmvmInputModifierMask) >> 16) != modifiers)
@@ -3728,7 +3828,7 @@ void UpdateKeyState(const std::uint32_t key, const bool down) noexcept {
         return base > 0 && base <= 0xFFu && base == key &&
                RequiredInputModifiers(binding) == CurrentModifiers(base);
     };
-    return matches(snapshot.menu_key) || matches(snapshot.add_key) ||
+    return matches(snapshot.menu_key) || matches(snapshot.effects_key) || matches(snapshot.add_key) ||
            matches(snapshot.delete_key) || matches(snapshot.clean_view_key) ||
            matches(snapshot.play_start_key) || matches(snapshot.play_current_key) ||
            matches(snapshot.stop_key) || matches(snapshot.undo_key) ||
@@ -3736,7 +3836,9 @@ void UpdateKeyState(const std::uint32_t key, const bool down) noexcept {
            matches(snapshot.show_cameras_key) || matches(snapshot.show_labels_key) ||
            matches(snapshot.restore_ui_key) || matches(snapshot.cycle_ui_key) ||
            matches(snapshot.toggle_free_camera_key) || matches(snapshot.replay_pause_key) ||
-           matches(snapshot.step_back_key) || matches(snapshot.step_forward_key);
+           matches(snapshot.step_back_key) || matches(snapshot.step_forward_key) ||
+           matches(snapshot.camera_slower_key) || matches(snapshot.camera_faster_key) ||
+           matches(snapshot.playback_slower_key) || matches(snapshot.playback_faster_key);
 }
 
 void TrackConsumedKeyDown(const std::uint32_t key, const std::uint8_t route) noexcept {
@@ -3817,7 +3919,7 @@ void UpdateCinematicStartGate(
         ready, std::memory_order_acq_rel);
     if (ready && !was_ready) {
         const auto space_is_up =
-            state.key_down[VK_SPACE].load(std::memory_order_acquire) == 0;
+            state.key_down[snapshot.cinematic_start_key & kSmvmInputBaseMask].load(std::memory_order_acquire) == 0;
         state.cinematic_space_released.store(space_is_up, std::memory_order_release);
         // Keep the ready gate focused on starting the shot. Movie Setup opens
         // only when the user asks for it with Tab; reaching Campath 1 must not
@@ -3833,8 +3935,12 @@ void UpdateCinematicStartGate(
     const bool repeated,
     const std::uint8_t route) noexcept {
     auto& state = g_overlay;
-    if (key != VK_SPACE)
+    SmvmSnapshotPayload start_snapshot{};
+    if (!ReadSnapshot(start_snapshot) || start_snapshot.cinematic_start_key == 0 ||
+        (start_snapshot.cinematic_start_key & kSmvmInputBaseMask) != key ||
+        (down && !InputMatchesKeyboard(start_snapshot.cinematic_start_key, key)))
         return false;
+    if (state.menu_open.load(std::memory_order_acquire)) return false;
 
     const auto ready = state.cinematic_start_ready.load(std::memory_order_acquire);
     const auto consumed = state.cinematic_space_consumed.load(std::memory_order_acquire);
@@ -3944,7 +4050,7 @@ void ClearPreMenuKeyRoute(const std::uint32_t key, const std::uint8_t route) noe
         return (binding & kSmvmInputBaseMask) == static_cast<std::uint32_t>(code) &&
                RequiredInputModifiers(binding) == CurrentModifiers();
     };
-    return matches(snapshot.menu_key) || matches(snapshot.add_key) ||
+    return matches(snapshot.menu_key) || matches(snapshot.effects_key) || matches(snapshot.add_key) ||
            matches(snapshot.delete_key) || matches(snapshot.clean_view_key) ||
            matches(snapshot.play_start_key) || matches(snapshot.play_current_key) ||
            matches(snapshot.stop_key) || matches(snapshot.undo_key) ||
@@ -4001,7 +4107,7 @@ void ResetConsumedReleaseRoutes() noexcept {
     }
     const auto action = ResolveManualCameraShortcut(
         InputMatchesKeyboard(snapshot.toggle_free_camera_key, key),
-        key == VK_ESCAPE && CurrentModifiers(key) == 0,
+        InputMatchesKeyboard(snapshot.cancel_key, key),
         menu_open,
         (snapshot.flags & smvm_snapshot_replay_active) != 0,
         (snapshot.flags & smvm_snapshot_campath_playing) != 0,
@@ -4200,7 +4306,7 @@ void RefreshMenuCursorPosition(const HWND window) noexcept {
         const auto reserved_menu_binding = has_snapshot && ShouldReserveEditorMenuBinding(
             true,
             (snapshot.flags & smvm_snapshot_replay_active) != 0,
-            InputMatchesKeyboard(snapshot.menu_key, key));
+            (InputMatchesKeyboard(snapshot.menu_key, key) || InputMatchesKeyboard(snapshot.effects_key, key)));
         if (reserved_menu_binding) {
             if (down) {
                 TrackConsumedKeyDown(key, kMenuRawKeyRoute);
@@ -4226,15 +4332,15 @@ void RefreshMenuCursorPosition(const HWND window) noexcept {
                 static_cast<void>(ConsumeTrackedKeyUp(key, kMenuRawKeyRoute));
             return true;
         }
-        const auto playback_arrow_key = key == VK_LEFT || key == VK_RIGHT;
+        const auto playback_arrow_key = InputMatchesKeyboard(snapshot.playback_slower_key, key) || InputMatchesKeyboard(snapshot.playback_faster_key, key);
         const auto playback_arrow_action = down
             ? ResolvePlaybackSpeedShortcut(
-                key == VK_LEFT,
-                key == VK_RIGHT,
+                InputMatchesKeyboard(snapshot.playback_slower_key, key),
+                InputMatchesKeyboard(snapshot.playback_faster_key, key),
                 has_snapshot && (snapshot.flags & smvm_snapshot_replay_active) != 0,
                 menu_open,
                 false,
-                CurrentModifiers(key) == 0)
+                true)
             : PlaybackSpeedShortcutAction::none;
         if (playback_arrow_action != PlaybackSpeedShortcutAction::none) {
             // Reserve the raw route so Deadlock cannot act on the arrow. The
@@ -4440,18 +4546,30 @@ void RefreshMenuCursorPosition(const HWND window) noexcept {
     // shortcuts resume only after it closes.
     if (menu_open)
         return false;
-    const auto fixed_pause_key = key == 'N' &&
-        PlainReplayPauseModifiersMatch(CurrentModifiers(key));
-    const auto decrease = key == VK_OEM_MINUS || key == VK_SUBTRACT;
-    const auto increase = key == VK_OEM_PLUS || key == VK_ADD;
+    const auto fixed_pause_key = false;
+    const auto decrease = InputMatchesCameraSpeedKeyboard(snapshot.camera_slower_key, key);
+    const auto increase = InputMatchesCameraSpeedKeyboard(snapshot.camera_faster_key, key);
+    // The replay-pause binding tolerates a held Shift, so both the configured
+    // key and Shift+that key toggle transport. Ctrl/Alt/Win chords still belong
+    // to their explicit bindings.
+    const auto pause_base = snapshot.replay_pause_key & kSmvmInputBaseMask;
+    const auto pause_base_matches = pause_base != 0 &&
+        (pause_base == static_cast<std::uint32_t>(key) ||
+         (pause_base == VK_SHIFT && (key == VK_LSHIFT || key == VK_RSHIFT)) ||
+         (pause_base == VK_CONTROL && (key == VK_LCONTROL || key == VK_RCONTROL)) ||
+         (pause_base == VK_MENU && (key == VK_LMENU || key == VK_RMENU)));
+    const auto configured_pause_matches =
+        InputMatchesKeyboard(snapshot.replay_pause_key, key) ||
+        (pause_base_matches &&
+         PlainReplayPauseModifiersMatch(CurrentModifiers(pause_base)));
     const auto action = ResolveMovieMakerShortcut(
         fixed_pause_key,
-        InputMatchesKeyboard(snapshot.replay_pause_key, key),
+        configured_pause_matches,
         decrease,
         increase,
         (snapshot.flags & smvm_snapshot_replay_active) != 0,
         CanUseManualCamera(snapshot),
-        (CurrentModifiers(key) & ~4u) == 0);
+        true);
     if (action == MovieMakerShortcutAction::toggle_replay_pause) {
         static_cast<void>(QueueActionForSnapshot(snapshot, SmvmActionType::toggle_replay_pause));
         return true;
@@ -4475,12 +4593,12 @@ void RefreshMenuCursorPosition(const HWND window) noexcept {
     const bool text_input_owns_keyboard,
     const SmvmSnapshotPayload& snapshot) noexcept {
     const auto action = ResolvePlaybackSpeedShortcut(
-        key == VK_LEFT,
-        key == VK_RIGHT,
+        InputMatchesKeyboard(snapshot.playback_slower_key, key),
+        InputMatchesKeyboard(snapshot.playback_faster_key, key),
         (snapshot.flags & smvm_snapshot_replay_active) != 0,
         menu_open,
         text_input_owns_keyboard,
-        CurrentModifiers(key) == 0);
+        true);
     if (action == PlaybackSpeedShortcutAction::none)
         return false;
 
@@ -4505,7 +4623,7 @@ void RefreshMenuCursorPosition(const HWND window) noexcept {
     const std::uint32_t key,
     const bool down,
     const std::uint8_t route) noexcept {
-    if (key != VK_ESCAPE)
+    if ((snapshot.cancel_key & kSmvmInputBaseMask) != key || snapshot.cancel_key == 0)
         return false;
 
     auto& queued = g_overlay.recording_escape_queued;
@@ -4791,6 +4909,24 @@ LRESULT CALLBACK SmvmWindowProcedure(
         ? NormalizeWindowVirtualKey(wparam, lparam)
         : static_cast<std::uint32_t>(wparam);
     const auto repeated_key = key_down_message && (lparam & (1LL << 30)) != 0;
+    // Hand keyboard back to Deadlock so its native developer console can be
+    // used. The engine console key toggles passthrough and is forwarded to the
+    // game so the same press opens/closes the console. While active, keys are
+    // neither suppressed nor fed to SMVM, and the engine console keeps them.
+    if (normalized_key == VK_OEM_3 && key_down_message && !repeated_key && !menu_open &&
+        !state.replay_tick_input_active.load(std::memory_order_acquire)) {
+        const auto enable = !state.game_input_passthrough.load(std::memory_order_acquire);
+        state.game_input_passthrough.store(enable, std::memory_order_release);
+        if (!enable)
+            ResetSmvmManualInput();
+        return CallWindowProcW(original, window, message, wparam, lparam);
+    }
+    if (state.game_input_passthrough.load(std::memory_order_acquire) &&
+        (message == WM_KEYDOWN || message == WM_KEYUP ||
+         message == WM_SYSKEYDOWN || message == WM_SYSKEYUP ||
+         message == WM_CHAR || message == WM_SYSCHAR)) {
+        return CallWindowProcW(original, window, message, wparam, lparam);
+    }
     const auto restore_pressed = key_down_message && !repeated_key &&
         (normalized_key == VK_F9 ||
          (has_snapshot && InputMatchesKeyboard(snapshot.restore_ui_key, normalized_key)));
@@ -4896,7 +5032,7 @@ LRESULT CALLBACK SmvmWindowProcedure(
     }
 
     const auto menu_binding_matches = has_snapshot &&
-        InputMatchesKeyboard(snapshot.menu_key, normalized_key);
+        (InputMatchesKeyboard(snapshot.menu_key, normalized_key) || InputMatchesKeyboard(snapshot.effects_key, normalized_key));
     if (ReplayTimelineTextInputConsumesKey(
             replay_tick_editor_owns_keyboard,
             menu_binding_matches) &&
@@ -5070,10 +5206,10 @@ LRESULT CALLBACK SmvmWindowProcedure(
             static_cast<void>(ToggleCleanFootage(false, snapshot));
             return 0;
         }
-        if (!repeated && InputMatchesKeyboard(snapshot.menu_key, normalized_key) &&
+        if (!repeated && (InputMatchesKeyboard(snapshot.menu_key, normalized_key) || InputMatchesKeyboard(snapshot.effects_key, normalized_key)) &&
             ((snapshot.flags & smvm_snapshot_replay_active) != 0 || menu_open)) {
             TrackConsumedKeyDown(normalized_key, kMenuWindowKeyRoute);
-            static_cast<void>(ToggleMovieSetupMenu(snapshot));
+            static_cast<void>(ToggleMovieSetupMenu(snapshot, InputMatchesKeyboard(snapshot.effects_key, normalized_key)));
             return 0;
         }
         if (!repeated && HandleMovieMakerKeyboardShortcut(normalized_key, menu_open, snapshot)) {
@@ -5465,6 +5601,9 @@ LRESULT CALLBACK SmvmWindowProcedure(
     state.context->IASetVertexBuffers(0, 1, &state.vertex_buffer, &stride, &offset);
     state.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     state.context->VSSetShader(state.vertex_shader, nullptr, 0);
+    state.context->GSSetShader(nullptr, nullptr, 0);
+    state.context->HSSetShader(nullptr, nullptr, 0);
+    state.context->DSSetShader(nullptr, nullptr, 0);
     state.context->VSSetConstantBuffers(0, 1, &state.constant_buffer);
     state.context->PSSetShader(state.pixel_shader, nullptr, 0);
     state.context->PSSetShaderResources(0, 1, &state.atlas_view);
@@ -5548,6 +5687,9 @@ LRESULT CALLBACK SmvmWindowProcedure(
     state.context->IASetVertexBuffers(0, 1, &state.vertex_buffer, &stride, &offset);
     state.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     state.context->VSSetShader(state.vertex_shader, nullptr, 0);
+    state.context->GSSetShader(nullptr, nullptr, 0);
+    state.context->HSSetShader(nullptr, nullptr, 0);
+    state.context->DSSetShader(nullptr, nullptr, 0);
     state.context->VSSetConstantBuffers(0, 1, &state.constant_buffer);
     state.context->PSSetShader(state.pixel_shader, nullptr, 0);
     state.context->PSSetShaderResources(0, 1, &state.atlas_view);
@@ -5615,6 +5757,9 @@ LRESULT CALLBACK SmvmWindowProcedure(
     state.context->IASetVertexBuffers(0, 1, &state.vertex_buffer, &stride, &offset);
     state.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     state.context->VSSetShader(state.vertex_shader, nullptr, 0);
+    state.context->GSSetShader(nullptr, nullptr, 0);
+    state.context->HSSetShader(nullptr, nullptr, 0);
+    state.context->DSSetShader(nullptr, nullptr, 0);
     state.context->VSSetConstantBuffers(0, 1, &state.constant_buffer);
     state.context->PSSetShader(state.pixel_shader, nullptr, 0);
     state.context->PSSetShaderResources(0, 1, &state.atlas_view);
@@ -5628,6 +5773,24 @@ LRESULT CALLBACK SmvmWindowProcedure(
     auto& state = g_overlay;
     if (state.render_lock.test_and_set(std::memory_order_acquire))
         return true;
+    if (state.device_failure_pending.load(std::memory_order_acquire)) {
+        Microsoft::WRL::ComPtr<ID3D11Device> candidate;
+        const auto replacement_ready = state.device_failure_handled &&
+            state.device_failure_cleanup_succeeded &&
+            SUCCEEDED(swapchain->GetDevice(IID_PPV_ARGS(&candidate))) && candidate &&
+            candidate.Get() != state.failed_device.Get() &&
+            SUCCEEDED(candidate->GetDeviceRemovedReason());
+        if (!replacement_ready) {
+            state.render_lock.clear(std::memory_order_release);
+            return false;
+        }
+        // Only a real, healthy replacement device can leave the failure latch.
+        // A removed device is never repeatedly reinitialized on later Presents.
+        state.failed_device.Reset();
+        state.device_failure_handled = false;
+        state.device_failure_cleanup_succeeded = false;
+        state.device_failure_pending.store(false, std::memory_order_release);
+    }
     if (state.target_swapchain != swapchain || state.render_target == nullptr) {
         if (!InitializeSwapchain(swapchain)) {
             state.render_lock.clear(std::memory_order_release);
@@ -5636,10 +5799,12 @@ LRESULT CALLBACK SmvmWindowProcedure(
     }
     SmvmSnapshotPayload snapshot{};
     const auto snapshot_read = ReadSnapshot(snapshot);
-    const auto recording_active = snapshot_read &&
+    const auto recording_requested = snapshot_read &&
         (snapshot.flags & smvm_snapshot_internal_enabled) != 0 &&
         (snapshot.flags & smvm_snapshot_replay_active) != 0 &&
         (snapshot.movie_recording_flags & movie_recording_active) != 0;
+    if (!recording_requested) state.capture_restart_requires_idle = false;
+    const auto recording_active = recording_requested && !state.capture_restart_requires_idle;
     const auto recording_armed = snapshot_read &&
         (snapshot.flags & smvm_snapshot_internal_enabled) != 0 &&
         (snapshot.flags & smvm_snapshot_replay_active) != 0 &&
@@ -5652,11 +5817,17 @@ LRESULT CALLBACK SmvmWindowProcedure(
         (snapshot.flags & smvm_snapshot_internal_enabled) != 0 &&
         (snapshot.flags & smvm_snapshot_replay_active) != 0 &&
         snapshot.greenscreen_mode == GreenscreenMode::free_camera;
+    // Native depth-of-field: needs the observed world depth while a replay is
+    // showing. It is held out of the green-screen plate to keep chroma clean.
+    const auto dof_active = snapshot_read &&
+        (snapshot.flags & smvm_snapshot_internal_enabled) != 0 &&
+        (snapshot.flags & smvm_snapshot_replay_active) != 0 &&
+        !greenscreen_active && state.ui.dof_enabled && state.ui.dof_radius > 0.0F;
     constexpr auto kDepthPassMask =
         movie_capture_pass_world_depth_pfm |
         movie_capture_pass_world_depth_avi |
         movie_capture_pass_greenscreen_free_camera;
-    const auto observe_depth = custom_fog_active || greenscreen_active ||
+    const auto observe_depth = custom_fog_active || greenscreen_active || dof_active ||
         (snapshot_read && NeedsDepthContextObservation(
             recording_armed,
             recording_active,
@@ -5681,12 +5852,61 @@ LRESULT CALLBACK SmvmWindowProcedure(
             rendered_camera,
             rendered_replay_tick,
             rendered_frame_sequence);
+    const auto replay_active = snapshot_read &&
+        (snapshot.flags & smvm_snapshot_internal_enabled) != 0 &&
+        (snapshot.flags & smvm_snapshot_replay_active) != 0;
+    const auto look = state.look_take.Observe(snapshot.look,
+        snapshot.replay_session_generation, replay_active &&
+        (recording_armed || recording_active ||
+         snapshot.movie_compositing_stage != MovieCompositingStage::none));
+    const auto look_requested = ShouldApplyBeautyLook(look, replay_active,
+        greenscreen_active, recording_active &&
+        (snapshot.movie_active_pass_flags & movie_capture_pass_greenscreen_free_camera) != 0);
+    if (state.look_session != snapshot.replay_session_generation) {
+        state.look_pipeline.ResetSizeResources();
+        state.look_history_active = false;
+        state.look_session = snapshot.replay_session_generation;
+    }
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> look_backbuffer;
+    auto look_source_ready = true;
+    // Depth of field runs through the same pipeline, so a DoF-only request must
+    // also initialize/fetch the source and backbuffer even when the grading is
+    // neutral and ShouldApplyBeautyLook declined.
+    if (look_requested || state.look_history_active || dof_active) {
+        look_source_ready = state.look_initialized &&
+            SUCCEEDED(swapchain->GetBuffer(0, IID_PPV_ARGS(&look_backbuffer)));
+        if (look_source_ready) {
+            look_source_ready = state.look_pipeline.RecoverRepeatedSource(state.context,
+                look_backbuffer.Get(), !has_rendered_camera ||
+                IsRepeatedMovieCameraSequence(state.look_frame_sequence, rendered_frame_sequence));
+            if (look_source_ready && look_requested)
+                state.look_history_active = true;
+        }
+        // A bypass/chroma transition still needs the previous presented image
+        // removed. Retain recovery history until that operation succeeds.
+        if (!look_requested && !dof_active && look_source_ready) {
+            state.look_pipeline.ResetSizeResources();
+            state.look_history_active = false;
+        }
+    }
+    if (look_source_ready)
+        state.look_frame_sequence = has_rendered_camera ? rendered_frame_sequence : 0;
     const auto movie_output_dimensions = ResolveMovieOutputDimensions(
         snapshot.movie_output_resolution,
         static_cast<std::uint32_t>(std::max(0.0F, state.viewport_width)),
         static_cast<std::uint32_t>(std::max(0.0F, state.viewport_height)));
+    const auto look_uses_lut = look.lut_intensity > 0 && look.lut_size != 0;
+    const auto look_lut_ready = !look_uses_lut ||
+        state.look_uploaded_lut_revision == look.lut_revision;
+    // A new writer must not snapshot the previous GPU LUT's content hash while
+    // the requested revision is still uploading. An already-active writer stays
+    // alive during temporary readiness loss; its frozen metadata remains valid.
+    const auto capture_resources_ready = HasActiveMovieCaptureIdentity(
+        std::string_view(snapshot.movie_recording_name.data(), movie_recording_name_length),
+        std::string_view(snapshot.movie_capture_path.data(), std::strlen(snapshot.movie_capture_path.data()))) ||
+        (look_source_ready && (!look_requested || look_lut_ready));
     SyncMovieCapture({
-        recording_active,
+        recording_active && capture_resources_ready,
         std::string_view(snapshot.movie_recording_name.data(), movie_recording_name_length),
         std::string_view(
             snapshot.movie_capture_path.data(),
@@ -5703,14 +5923,52 @@ LRESULT CALLBACK SmvmWindowProcedure(
         snapshot.movie_capture_audio != 0,
         snapshot.greenscreen_color_rgb,
         snapshot.movie_expected_frame_count,
+        look,
+        look_requested && look_uses_lut && look_lut_ready ? state.look_uploaded_lut_hash : 0,
     });
     // Green and fog are mutually exclusive compositions. Both run before the
     // pass writer so the live preview is exactly what its AVI contains.
-    auto movie_frame_ready = true;
-    if (greenscreen_active)
+    auto movie_frame_ready = look_source_ready;
+    if (look_source_ready && greenscreen_active)
         movie_frame_ready = DrawGreenscreenBackground(snapshot);
-    else if (custom_fog_active)
+    else if (look_source_ready && custom_fog_active)
         static_cast<void>(DrawCustomFog(snapshot));
+    auto look_applied = false;
+    state.look_status = greenscreen_active ? "Bypassed for Green Screen" : "Bypassed / neutral";
+    if (!look_requested && !look_source_ready)
+        state.look_status = "Waiting to restore clean source for bypass";
+    if (look_requested || dof_active) {
+        if (!look_source_ready || !look_lut_ready || look_backbuffer == nullptr) {
+            state.look_status = !state.look_initialized ? (state.look_initialize_attempted ?
+                state.look_pipeline.StatusMessage() : "Initializing D3D11 effects") :
+                !look_lut_ready ? "Waiting for validated LUT upload" : state.look_pipeline.StatusMessage();
+            movie_frame_ready = false;
+        } else {
+            const auto frame_key = recording_active ? GetWorldDepthCaptureStatus().observed_frames :
+                static_cast<std::uint64_t>(std::max<std::int64_t>(0, rendered_replay_tick));
+            LookDofParameters dof{state.ui.dof_enabled, state.ui.dof_focus,
+                                  state.ui.dof_strength, state.ui.dof_radius};
+            Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> dof_depth{};
+            if (dof_active) {
+                dof_depth.Attach(AcquireObservedWorldDepthShaderResourceView(
+                    state.device,
+                    state.context,
+                    static_cast<std::uint32_t>(std::max(0.0F, state.viewport_width)),
+                    static_cast<std::uint32_t>(std::max(0.0F, state.viewport_height))));
+            }
+            // Depth of field only runs when a real depth view is available; a
+            // color buffer must never be sampled as depth.
+            const auto dof_ready = dof_active && dof_depth != nullptr;
+            state.ui.dof_depth_available = dof_depth != nullptr;
+            const auto result = state.look_pipeline.Process(state.context, look_backbuffer.Get(), look,
+                frame_key, dof_ready ? &dof : nullptr, dof_ready ? dof_depth.Get() : nullptr);
+            look_applied = result == LookProcessStatus::Applied;
+            state.look_status = state.look_pipeline.StatusMessage();
+            movie_frame_ready = movie_frame_ready && (!look_requested || look_applied);
+            if (look_applied)
+                state.look_history_active = true;
+        }
+    }
     SetMovieFrameCompositionReady(movie_frame_ready);
     if (movie_frame_ready) {
         CaptureMovieFrame(
@@ -5719,8 +5977,15 @@ LRESULT CALLBACK SmvmWindowProcedure(
             swapchain,
             has_rendered_camera ? rendered_replay_tick : -1,
             has_rendered_camera ? &rendered_camera : nullptr,
-            has_rendered_camera ? rendered_frame_sequence : 0);
+            has_rendered_camera ? rendered_frame_sequence : 0,
+            look_applied ? state.look_pipeline.SourceTexture() : nullptr);
     }
+    // Comparison is preview-only and happens after Beauty capture; no label
+    // or temporary bypass can enter a take or mutate the authoritative look.
+    if (look_applied && state.ui.look_compare && state.ui.effects_page == SmvmPage::visuals && state.effects_open.load(std::memory_order_acquire) &&
+        state.menu_open.load(std::memory_order_acquire) &&
+        GetForegroundWindow() == state.output_window && (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0)
+        state.look_pipeline.RestoreSource(state.context, look_backbuffer.Get());
     smvm_ui::ObserveReplaySession(snapshot_read ? &snapshot : nullptr, state.ui);
     if (!snapshot_read && ShouldNotifyRecordingVisualHostDisconnectOnSnapshotAbsence(
             state.recording_profile_snapshot_observed.load(std::memory_order_acquire)))
@@ -5765,6 +6030,19 @@ LRESULT CALLBACK SmvmWindowProcedure(
     CampathPayloadHeader path_header{};
     std::array<CampathKeyframe, kMaxCampathKeyframes> keys{};
     const auto has_path = ReadPath(path_header, keys.data(), keys.size());
+    // "Start arms a take; the Space boundary activates it": arming a movie take
+    // must also arm the contextual cinematic start gate, otherwise the ready
+    // prompt never appears and the start key cannot begin playback while armed.
+    const auto movie_take_armed =
+        (snapshot.movie_recording_flags & movie_recording_armed) != 0;
+    const auto movie_take_armed_before = state.cinematic_recording_autostart.exchange(
+        movie_take_armed, std::memory_order_acq_rel);
+    if (movie_take_armed && !movie_take_armed_before &&
+        snapshot.movie_compositing_stage == MovieCompositingStage::none &&
+        !state.cinematic_start_armed.load(std::memory_order_acquire) &&
+        has_path && path_header.keyframe_count >= 3) {
+        static_cast<void>(SmvmArmCinematicStart(snapshot.replay_session_generation));
+    }
     UpdateCinematicStartGate(snapshot, has_path, path_header, keys.data());
     const auto menu_open = state.menu_open.load(std::memory_order_acquire);
     const auto clean_view = state.clean_view.load(std::memory_order_acquire);
@@ -5824,11 +6102,21 @@ LRESULT CALLBACK SmvmWindowProcedure(
             params.keyframes = keys.data();
             params.has_path = has_path;
             params.documents = nullptr;
-            params.menu_open = menu_open;
+            params.effects_open = menu_open && state.effects_open.load(std::memory_order_acquire);
+            params.menu_open = menu_open && !params.effects_open;
             params.viewport_width = state.viewport_width;
             params.viewport_height = state.viewport_height;
             params.frame_microseconds = state.frame_microseconds.load(std::memory_order_acquire);
             params.overlay_flags = OverlayFlags();
+            params.look_status = state.look_status;
+            const auto timing = state.look_pipeline.Timings();
+            if (look_requested && timing.samples != 0) {
+                std::snprintf(state.look_status_text.data(), state.look_status_text.size(),
+                    "%s | GPU median %.2f ms / p95 %.2f ms (%u samples; effects only), %.1f MiB textures",
+                    state.look_status, timing.median_ms, timing.p95_ms, timing.samples,
+                    static_cast<double>(timing.texture_bytes) / (1024.0 * 1024.0));
+                params.look_status = state.look_status_text.data();
+            }
             const auto movie_capture = GetWorldDepthCaptureStatus();
             params.movie_frames_observed = movie_capture.observed_frames;
             params.movie_frames_written = movie_capture.written_frames;
@@ -5902,6 +6190,8 @@ LRESULT CALLBACK SmvmWindowProcedure(
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         RestorePipelineState(state.context, saved);
     }
+    if (look_source_ready && state.look_history_active && look_backbuffer != nullptr)
+        state.look_pipeline.SavePresentedImage(state.context, look_backbuffer.Get());
     state.render_lock.clear(std::memory_order_release);
     return drawn;
 }
@@ -6584,6 +6874,50 @@ void PumpPresentationHookInstallation() noexcept {
     static_cast<void>(PumpTowerFadeOverride());
 }
 
+void PumpLookResources() noexcept {
+    auto& state = g_overlay;
+    if (state.render_lock.test_and_set(std::memory_order_acquire)) return;
+    if (state.device_failure_pending.load(std::memory_order_acquire)) {
+        if (!state.device_failure_handled) {
+            state.failed_device = state.device;
+            state.capture_restart_requires_idle = true;
+            AbortMovieCaptureForDeviceFailure();
+            ResetSmvmManualInput();
+            SetMenuOpen(false);
+            RequestManualPointerState(false);
+            ResetCinematicStartGate(true);
+            ReleaseBootstrapReplayPresentationSuppression();
+            SetLocalPresentationMode(DeadlockUiMode::deadlock_ui);
+            ArmEmergencyDeadlockUiRestore(true);
+            state.device_failure_cleanup_succeeded = ReleaseDeviceResources();
+            state.device_failure_handled = true;
+            state.look_status = state.device_failure_cleanup_succeeded
+                ? "Graphics device lost; waiting for a healthy replacement device"
+                : "Graphics device lost; cleanup could not safely finish; restart Deadlock";
+            PublishStatus(SmvmRendererBackend::d3d11, SmvmRendererError::device_reset);
+        }
+        state.render_lock.clear(std::memory_order_release);
+        return;
+    }
+    if (state.device != nullptr) {
+        if (!state.look_initialize_attempted) {
+            state.look_initialize_attempted = true;
+            state.look_initialized = state.look_pipeline.Initialize(state.device);
+        }
+        std::unique_lock lock(state.look_lut_mutex, std::try_to_lock);
+        if (lock.owns_lock() && state.look_initialized && state.look_lut_size != 0 &&
+            state.look_uploaded_lut_revision != state.look_lut_revision &&
+            (!state.look_take.locked || state.look_take.settings.lut_revision == state.look_lut_revision)) {
+            if (state.look_pipeline.PrepareLut(state.device,
+                    state.look_lut_values.data(), state.look_lut_size)) {
+                state.look_uploaded_lut_revision = state.look_lut_revision;
+                state.look_uploaded_lut_hash = state.look_lut_hash;
+            }
+        }
+    }
+    state.render_lock.clear(std::memory_order_release);
+}
+
 DWORD InstallerThreadBody() noexcept {
     const auto started = std::chrono::steady_clock::now();
     auto capture_attempted = false;
@@ -6621,6 +6955,7 @@ DWORD InstallerThreadBody() noexcept {
         PumpEmergencyDeadlockUiRestore();
         PumpPresentationHookInstallation();
         static_cast<void>(PumpTowerFadeOverride());
+        PumpLookResources();
         Sleep(100);
     }
     return 0;
@@ -6741,6 +7076,18 @@ HRESULT STDMETHODCALLTYPE PresentHook(
     const UINT flags) noexcept {
     auto& state = g_overlay;
     ActiveCallbackGuard callback_guard(state.active_hooks);
+    // DXGI_PRESENT_TEST is an occlusion probe; it must not render or record.
+    if ((flags & DXGI_PRESENT_TEST) != 0) {
+        const auto original = state.original_present;
+        const auto probe_result = original != nullptr ? original(swapchain, sync_interval, flags)
+            : DXGI_ERROR_INVALID_CALL;
+        if (IsTerminalD3D11PresentFailure(probe_result)) {
+            state.ready.store(false, std::memory_order_release);
+            state.device_failure_pending.store(true, std::memory_order_release);
+            PublishStatus(SmvmRendererBackend::d3d11, SmvmRendererError::device_reset);
+        }
+        return probe_result;
+    }
     const auto started = std::chrono::steady_clock::now();
     auto error = SmvmRendererError::none;
     if (!state.stop_requested.load(std::memory_order_acquire) &&
@@ -6756,11 +7103,20 @@ HRESULT STDMETHODCALLTYPE PresentHook(
     const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - started).count();
     const auto microseconds = static_cast<std::uint32_t>(std::clamp<std::int64_t>(elapsed, 0, 0xFFFFFFFFLL));
+    if (state.device_failure_pending.load(std::memory_order_acquire))
+        error = SmvmRendererError::device_reset;
     PublishStatus(SmvmRendererBackend::d3d11, error, microseconds);
     const auto original = state.original_present;
     const auto result = original != nullptr
         ? original(swapchain, sync_interval, flags)
         : DXGI_ERROR_INVALID_CALL;
+    if (IsTerminalD3D11PresentFailure(result)) {
+        // Teardown belongs to maintenance under render ownership, never to an
+        // in-flight Present callback that could otherwise wait on itself.
+        state.ready.store(false, std::memory_order_release);
+        state.device_failure_pending.store(true, std::memory_order_release);
+        PublishStatus(SmvmRendererBackend::d3d11, SmvmRendererError::device_reset);
+    }
     return result;
 }
 
@@ -6773,24 +7129,54 @@ HRESULT STDMETHODCALLTYPE ResizeBuffersHook(
     const UINT flags) noexcept {
     auto& state = g_overlay;
     ActiveCallbackGuard callback_guard(state.active_hooks);
-    if (!state.stop_requested.load(std::memory_order_acquire) &&
-        state.hooks_installed.load(std::memory_order_acquire) &&
-        state.target_swapchain == swapchain &&
-        !state.render_lock.test_and_set(std::memory_order_acquire)) {
+    const auto owns_target = state.target_swapchain == swapchain;
+    if (owns_target && state.render_lock.test_and_set(std::memory_order_acquire)) {
+        // Never forward a resize while Present owns our direct/indirect buffer
+        // references. A recoverable failure is safer than racing the renderer.
+        PublishStatus(SmvmRendererBackend::d3d11, SmvmRendererError::device_reset);
+        return DXGI_ERROR_INVALID_CALL;
+    }
+    if (owns_target) {
         ReleaseRenderTarget();
         state.ready.store(false, std::memory_order_release);
-        state.render_lock.clear(std::memory_order_release);
     }
     const auto original = state.original_resize;
     const auto result = original != nullptr
         ? original(swapchain, buffer_count, width, height, format, flags)
         : DXGI_ERROR_INVALID_CALL;
+    if (owns_target)
+        state.render_lock.clear(std::memory_order_release);
     if (FAILED(result))
         PublishStatus(SmvmRendererBackend::d3d11, SmvmRendererError::device_reset);
     return result;
 }
 
 } // namespace
+
+bool SetSmvmLookLut(const std::uint64_t revision, const std::uint32_t size,
+    const float* values, const std::size_t count) noexcept {
+    if (revision == 0 || size < 2 || size > 33 || values == nullptr ||
+        count != static_cast<std::size_t>(size) * size * size * 3u) return false;
+    for (std::size_t i = 0; i < count; ++i)
+        if (!std::isfinite(values[i]) || values[i] < 0 || values[i] > 1) return false;
+    try {
+        auto hash = std::uint64_t{14695981039346656037ULL};
+        const auto* bytes = reinterpret_cast<const unsigned char*>(values);
+        for (std::size_t i = 0; i < count * sizeof(float); ++i) {
+            hash ^= bytes[i]; hash *= 1099511628211ULL;
+        }
+        auto& state = g_overlay;
+        std::lock_guard lock(state.look_lut_mutex);
+        if (revision < state.look_lut_revision) return false;
+        if (revision == state.look_lut_revision)
+            return size == state.look_lut_size && hash == state.look_lut_hash;
+        state.look_lut_values.assign(values, values + count);
+        state.look_lut_revision = revision;
+        state.look_lut_size = size;
+        state.look_lut_hash = hash;
+        return true;
+    } catch (...) { return false; }
+}
 
 void ObserveSmvmRecordingVisualSnapshot(const SmvmSnapshotPayload& snapshot) noexcept {
     g_overlay.recording_profile_lease_lost.store(false, std::memory_order_release);
@@ -6917,6 +7303,11 @@ void SmvmBeginBindingCapture(const std::int32_t action, const std::uint32_t orig
 
 void SmvmClearBinding(const std::int32_t action, const std::uint32_t original) noexcept {
     static_cast<void>(SubmitBindingValue(action, 0, original));
+}
+
+void SmvmToggleEffectsMenu() noexcept {
+    SmvmSnapshotPayload snapshot{};
+    if (ReadSnapshot(snapshot)) static_cast<void>(ToggleMovieSetupMenu(snapshot, true));
 }
 
 void SmvmCloseMenu() noexcept {

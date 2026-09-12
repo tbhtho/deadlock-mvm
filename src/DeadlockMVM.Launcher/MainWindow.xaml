@@ -158,10 +158,32 @@
                               Margin="0,10,0,0"
                               ToolTip="Keeps the SMVM host running in the background and restores this window when Deadlock closes." />
 
+                    <CheckBox Content="Launch through Steam (off = direct, recommended for replays)"
+                              IsChecked="{Binding LaunchViaSteam, Mode=TwoWay}"
+                              Foreground="{StaticResource TextMutedBrush}"
+                              Margin="0,6,0,0"
+                              ToolTip="Steam forwarding can drop +playdemo after game updates and land in the normal menu. Direct launch keeps the replay arguments on the game command line. Keep Steam running either way." />
+
                     <Button Content="{Binding PlayButtonText}"
                             Style="{StaticResource LaunchButton}"
                             Command="{Binding LaunchCommand}"
                             Margin="0,18,0,0" />
+
+                    <Button Content="EXIT DEADLOCK (FORCE)"
+                            Command="{Binding StopDeadlockCommand}"
+                            Margin="0,8,0,0"
+                            ToolTip="Immediately force-closes the running Deadlock process.">
+                        <Button.Style>
+                            <Style TargetType="Button" BasedOn="{StaticResource LaunchButton}">
+                                <Setter Property="Visibility" Value="Collapsed" />
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding DeadlockRunning}" Value="True">
+                                        <Setter Property="Visibility" Value="Visible" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Button.Style>
+                    </Button>
 
                     <!-- Advanced -->
                     <Expander Margin="0,14,0,0" Style="{StaticResource CompactExpander}">
@@ -173,42 +195,15 @@
                             <TextBox Style="{StaticResource ReadOnlyCommand}"
                                      Text="{Binding CommandPreview, Mode=OneWay}"
                                      Margin="0,6,0,0" />
-                            <Grid Margin="0,10,0,0">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="*" />
-                                </Grid.ColumnDefinitions>
-                                <Grid.RowDefinitions>
-                                    <RowDefinition Height="Auto" />
-                                    <RowDefinition Height="Auto" />
-                                    <RowDefinition Height="Auto" />
-                                    <RowDefinition Height="Auto" />
-                                    <RowDefinition Height="Auto" />
-                                    <RowDefinition Height="Auto" />
-                                    <RowDefinition Height="Auto" />
-                                </Grid.RowDefinitions>
-                                <TextBlock Grid.Row="0" Text="SMVM menu" Style="{StaticResource SectionLabel}" />
-                                <TextBox Grid.Row="0" Grid.Column="1" Style="{StaticResource DarkTextBox}"
-                                         Text="{Binding SmvmMenuHotkey}" Margin="6,0,0,3" />
-                                <TextBlock Grid.Row="1" Text="Add keyframe" Style="{StaticResource SectionLabel}" />
-                                <TextBox Grid.Row="1" Grid.Column="1" Style="{StaticResource DarkTextBox}"
-                                         Text="{Binding SmvmAddHotkey}" Margin="6,0,0,3" />
-                                <TextBlock Grid.Row="2" Text="Delete keyframe" Style="{StaticResource SectionLabel}" />
-                                <TextBox Grid.Row="2" Grid.Column="1" Style="{StaticResource DarkTextBox}"
-                                         Text="{Binding SmvmDeleteHotkey}" Margin="6,0,0,3" />
-                                <TextBlock Grid.Row="3" Text="Clean footage" Style="{StaticResource SectionLabel}" />
-                                <TextBox Grid.Row="3" Grid.Column="1" Style="{StaticResource DarkTextBox}"
-                                         Text="{Binding SmvmCleanViewHotkey}" Margin="6,0,0,3" />
-                                <TextBlock Grid.Row="4" Text="Roll left" Style="{StaticResource SectionLabel}" />
-                                <TextBox Grid.Row="4" Grid.Column="1" Style="{StaticResource DarkTextBox}"
-                                         Text="{Binding SmvmRollLeftHotkey}" Margin="6,0,0,3" />
-                                <TextBlock Grid.Row="5" Text="Roll right" Style="{StaticResource SectionLabel}" />
-                                <TextBox Grid.Row="5" Grid.Column="1" Style="{StaticResource DarkTextBox}"
-                                         Text="{Binding SmvmRollRightHotkey}" Margin="6,0,0,3" />
-                                <TextBlock Grid.Row="6" Text="Reset roll" Style="{StaticResource SectionLabel}" />
-                                <TextBox Grid.Row="6" Grid.Column="1" Style="{StaticResource DarkTextBox}"
-                                         Text="{Binding SmvmRollResetHotkey}" Margin="6,0,0,0" />
-                            </Grid>
+                            <TextBlock Text="Keybinds" Style="{StaticResource SectionLabel}" Margin="0,12,0,6" />
+                            <Button Content="Open keyboard + mouse" Click="OpenKeyboardBindings_Click" Padding="12,8" HorizontalAlignment="Left" />
+                            <TextBlock Text="Developer console (optional; the game's console stays available)"
+                                       Style="{StaticResource MutedText}"
+                                       Margin="0,12,0,6" />
+                            <Button Content="Open developer console"
+                                    Click="OpenDevConsole_Click"
+                                    Padding="12,8"
+                                    HorizontalAlignment="Left" />
                             <Grid Margin="0,10,0,0">
     <Grid.ColumnDefinitions>
         <ColumnDefinition Width="Auto" />

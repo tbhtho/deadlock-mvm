@@ -370,6 +370,13 @@ bool SliderInput(
     const auto label_width = label != nullptr
         ? ImGui::CalcTextSize(label).x + ImGui::GetStyle().ItemSpacing.x
         : 0.0F;
+    const auto stacked_label = label != nullptr &&
+        width < field_width + label_width + 120.0F * g_scale;
+    if (stacked_label) {
+        ImGui::PushStyleColor(ImGuiCol_Text, Vec4(colors::kMuted));
+        ImGui::TextUnformatted(label);
+        ImGui::PopStyleColor();
+    }
     ImGui::SetNextItemWidth(field_width);
     // The numeric field and track share one optimistic value. Retain it after
     // release until the authoritative managed snapshot acknowledges the edit;
@@ -406,7 +413,8 @@ bool SliderInput(
     // deltas surviving a slow or collapsed render frame.
     const auto track_width = std::max(
         80.0F * g_scale,
-        width - field_width - label_width - ImGui::GetStyle().ItemSpacing.x * 2.0F);
+        width - field_width - (stacked_label ? 0.0F : label_width) -
+            ImGui::GetStyle().ItemSpacing.x * 2.0F);
     const auto track_height = ImGui::GetFrameHeight();
     const auto track_position = ImGui::GetCursorScreenPos();
     static_cast<void>(ImGui::InvisibleButton(
@@ -430,8 +438,8 @@ bool SliderInput(
         track_position.x + track_width,
         track_position.y + track_height);
     const auto track_color = track_active
-        ? colors::kControlActive
-        : track_hovered ? colors::kControlHover : colors::kControl;
+        ? ImGui::GetColorU32(ImGuiCol_FrameBgActive)
+        : track_hovered ? ImGui::GetColorU32(ImGuiCol_FrameBgHovered) : ImGui::GetColorU32(ImGuiCol_FrameBg);
     draw_list->AddRectFilled(
         track_position,
         track_max,
@@ -440,7 +448,7 @@ bool SliderInput(
     draw_list->AddRect(
         track_position,
         track_max,
-        track_active ? colors::kAccent : colors::kHairline,
+        track_active ? ImGui::GetColorU32(ImGuiCol_SliderGrab) : ImGui::GetColorU32(ImGuiCol_Border),
         ImGui::GetStyle().FrameRounding);
     const auto fraction = maximum > minimum
         ? std::clamp((value - minimum) / (maximum - minimum), 0.0F, 1.0F)
@@ -453,12 +461,12 @@ bool SliderInput(
     draw_list->AddLine(
         ImVec2(track_position.x + 3.0F * g_scale, track_position.y + track_height * 0.5F),
         ImVec2(knob_x, track_position.y + track_height * 0.5F),
-        colors::kAccent,
+        ImGui::GetColorU32(ImGuiCol_SliderGrab),
         std::max(2.0F, 2.0F * g_scale));
     draw_list->AddCircleFilled(
         ImVec2(knob_x, track_position.y + track_height * 0.5F),
         knob_radius,
-        colors::kAccent);
+        ImGui::GetColorU32(ImGuiCol_SliderGrab));
     if (edited) {
         MarkOptimisticEdit(value, minimum, maximum, ImGui::GetTime(), value, pending_since);
         storage->SetFloat(value_id, value);
@@ -466,7 +474,7 @@ bool SliderInput(
         out_value = value;
         changed = true;
     }
-    if (label != nullptr) {
+    if (label != nullptr && !stacked_label) {
         ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Text, Vec4(colors::kMuted));
         ImGui::TextUnformatted(label);

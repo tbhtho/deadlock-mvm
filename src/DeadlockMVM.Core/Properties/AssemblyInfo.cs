@@ -4,3 +4,5 @@ using System.Runtime.CompilerServices;
 // harness (LiveVerify); they stay internal to the shipping app surface.
 [assembly: InternalsVisibleTo("DeadlockMVM.Core.Tests")]
 [assembly: InternalsVisibleTo("LiveVerify")]
+
+[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("ReshadeVerify")]

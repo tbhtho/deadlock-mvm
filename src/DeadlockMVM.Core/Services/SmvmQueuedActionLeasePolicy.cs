@@ -157,6 +157,14 @@ public static class SmvmQueuedActionLeasePolicy
         SmvmActionType.SetCustomFogValue or
         SmvmActionType.SetCustomFogColor or
         SmvmActionType.ResetCustomFog or
+        SmvmActionType.SetLookEnabled or
+        SmvmActionType.SetLookValue or
+        SmvmActionType.ResetLook or
+        SmvmActionType.SelectLookPreset or
+        SmvmActionType.SaveLookPreset or
+        SmvmActionType.ImportLookPreset or
+        SmvmActionType.ExportLookPreset or
+        SmvmActionType.LoadLookLut or
         SmvmActionType.SetGreenscreenMode or
         SmvmActionType.SetDeadlockUiMode or
         SmvmActionType.CycleReplayInterface;

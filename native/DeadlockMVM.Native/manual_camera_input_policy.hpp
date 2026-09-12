@@ -164,6 +164,17 @@ enum class RecordingEscapeAction {
     return (active_modifiers & ~kShiftModifier) == 0;
 }
 
+// The main-row '-' and '+' keys are shifted symbols on common layouts: '-' is
+// unshifted and '+' requires Shift. The camera-speed bindings must therefore
+// tolerate a held Shift so one modifier-free binding fires for both symbols.
+// Ctrl, Alt, and Windows-key chords still require their explicit binding.
+[[nodiscard]] constexpr bool CameraSpeedModifiersMatch(
+    const std::uint32_t required_modifiers,
+    const std::uint32_t active_modifiers) noexcept {
+    constexpr auto kShiftModifier = 4u;
+    return (required_modifiers & ~kShiftModifier) == (active_modifiers & ~kShiftModifier);
+}
+
 // The restart workflow intentionally exposes one coarse camera-speed control:
 // - slows Free Camera and + speeds it up. Reciprocal factors make one step in
 // either direction reversible (600 -> 750 -> 600) without a settings page.

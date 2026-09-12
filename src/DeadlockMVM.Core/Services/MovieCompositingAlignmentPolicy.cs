@@ -13,7 +13,8 @@ public readonly record struct MovieGreenscreenPlateMetrics(
     long? BackgroundPixels,
     long? SubjectPixels,
     long? FramesWithBackground,
-    long? FramesWithSubject);
+    long? FramesWithSubject,
+    long? RepeatedVisualSamples = null);
 
 public static class MovieCompositingAlignmentPolicy
 {
@@ -23,7 +24,13 @@ public static class MovieCompositingAlignmentPolicy
         plate.SubjectPixels is > 0 &&
         plate.FramesWithBackground == plate.Frames &&
         plate.FramesWithSubject is > 0 &&
-        plate.FramesWithSubject <= plate.Frames;
+        plate.FramesWithSubject <= plate.Frames &&
+        // A plate whose sampled frames barely change is a still image, not a
+        // key layer. Unknown legacy metrics stay permitted so old reports can
+        // still be inspected; new writes always carry the counter.
+        (plate.RepeatedVisualSamples is not { } repeated ||
+         plate.Frames is not { } frames ||
+         repeated * 2 < frames);
 
     public static bool IsFrameTickAndTimingAligned(
         MoviePassAlignmentMetrics world,

@@ -63,6 +63,23 @@ public sealed class ReplayController : IReplayPlaybackState, IDisposable
     /// <summary>Raised whenever the known replay state changes.</summary>
     public event EventHandler<ReplayState>? StateChanged;
 
+    /// <summary>
+    /// Raised for every raw engine console line on the shared VConsole
+    /// connection. Raised on the transport read thread; observers must marshal
+    /// to their own UI thread.
+    /// </summary>
+    public event EventHandler<string>? ConsoleLine;
+
+    /// <summary>
+    /// Sends a raw console command over the shared VConsole connection so the
+    /// optional custom console never opens a second (single-client) socket.
+    /// </summary>
+    public void SendConsoleCommand(string command)
+    {
+        if (!string.IsNullOrWhiteSpace(command))
+            Send(command.Trim());
+    }
+
     /// <summary>Raised from authoritative engine output after a demo seek finishes.</summary>
     public event EventHandler<int>? SeekCompleted;
 
@@ -276,7 +293,8 @@ public sealed class ReplayController : IReplayPlaybackState, IDisposable
         int tick,
         long expectedConnectionGeneration,
         long expectedReplaySessionGeneration,
-        string expectedReplayName)
+        string expectedReplayName,
+        out int? baselineTick)
     {
         lock (_telemetryGate)
         {
@@ -284,6 +302,11 @@ public sealed class ReplayController : IReplayPlaybackState, IDisposable
             lock (_gate)
                 current = _state;
 
+            // The exact position the fenced seek starts from, captured under the
+            // same lock as the send. Callers fence landing against this so a late
+            // completion line or poll from the previous position cannot complete
+            // the new seek.
+            baselineTick = current.CurrentTick;
             if (expectedConnectionGeneration <= 0 ||
                 expectedConnectionGeneration != _connectionGeneration ||
                 expectedReplaySessionGeneration <= 0 ||
@@ -456,6 +479,7 @@ public sealed class ReplayController : IReplayPlaybackState, IDisposable
     private void OnOutputLine(object? sender, string line)
     {
         Interlocked.Exchange(ref _lastOutputUtcTicks, DateTime.UtcNow.Ticks);
+        ConsoleLine?.Invoke(this, line);
         ReplayState? changedState = null;
         int? completedSeekTick = null;
 

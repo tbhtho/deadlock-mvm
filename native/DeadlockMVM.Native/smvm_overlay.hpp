@@ -84,6 +84,10 @@ void PumpSmvmOverlayResidentRecovery() noexcept;
 // Invalidates replay-owned prompt/input state before a replacement replay
 // snapshot becomes visible on the same native pipe.
 void InvalidateSmvmReplaySessionState() noexcept;
+// Validated bounded LUT data arrives on the pipe thread. Resource publication
+// is performed by the existing maintenance thread, never by UI/Present.
+bool SetSmvmLookLut(std::uint64_t revision, std::uint32_t size,
+    const float* values, std::size_t count) noexcept;
 // Re-runs only the Free Camera pointer acquisition path. Camera transform,
 // FOV, Roll, and camera ownership remain untouched.
 void SmvmReacquireFreeCameraInput() noexcept;
