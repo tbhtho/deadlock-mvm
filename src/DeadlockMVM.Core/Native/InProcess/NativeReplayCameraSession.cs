@@ -26,6 +26,13 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
     private const double DefaultCameraHeight = 63.0;
     private const string QueuedActionLeaseExpiredMessage =
         "The queued SMVM action expired before native camera access began.";
+    /// <summary>
+    /// The lease was still current when the request was sent and was superseded
+    /// while it was in flight. Both cases mean "the replay moved on", and both
+    /// must be retried against the new lease instead of retiring the pipe.
+    /// </summary>
+    private const string ReplayLeaseChangedInFlightMessage =
+        "The replay session changed while a native heartbeat was in flight.";
     private const int SeekTickTolerance = 2;
     private const int ObservationTickTolerance = 8;
     private readonly ReplayController _controller;
@@ -2399,10 +2406,8 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         Exception exception,
         bool clientConnected) =>
         clientConnected && exception is InvalidOperationException &&
-        string.Equals(
-            exception.Message,
-            QueuedActionLeaseExpiredMessage,
-            StringComparison.Ordinal);
+        (string.Equals(exception.Message, QueuedActionLeaseExpiredMessage, StringComparison.Ordinal) ||
+         string.Equals(exception.Message, ReplayLeaseChangedInFlightMessage, StringComparison.Ordinal));
 
     internal static async Task RunMonitorLoopAsync(
         Func<CancellationToken, Task> runIteration,
@@ -2741,8 +2746,7 @@ public sealed class NativeReplayCameraSession : IAsyncDisposable
         if (responseReplayLease is { } exactReplayLease)
         {
             if (!_controller.RunIfCurrent(exactReplayLease, ApplyHeartbeatResponse))
-                throw new InvalidOperationException(
-                    "The replay session changed while a native heartbeat was in flight.");
+                throw new InvalidOperationException(ReplayLeaseChangedInFlightMessage);
         }
         else
         {

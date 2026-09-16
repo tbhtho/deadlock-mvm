@@ -686,9 +686,13 @@ internal static class InProcessProtocol
         var type = (InProcessMessageType)BinaryPrimitives.ReadUInt16LittleEndian(header[6..]);
         if (!Enum.IsDefined(type))
             throw new InvalidDataException("Native response type is unknown.");
-        var payloadSize = checked((int)BinaryPrimitives.ReadUInt32LittleEndian(header[8..]));
-        if (payloadSize is < 0 or > MaxPayloadSize)
+        // Validate the unsigned length before casting: a checked cast would throw
+        // OverflowException for any wire value above int.MaxValue, which both makes
+        // the negative bound unreachable and escapes the pipe-framing recovery.
+        var declaredPayloadSize = BinaryPrimitives.ReadUInt32LittleEndian(header[8..]);
+        if (declaredPayloadSize > MaxPayloadSize)
             throw new InvalidDataException("Native response payload is too large.");
+        var payloadSize = (int)declaredPayloadSize;
         var replaySessionGeneration = BinaryPrimitives.ReadInt64LittleEndian(header[20..]);
         if (replaySessionGeneration < 0)
             throw new InvalidDataException("Native response replay generation is invalid.");
@@ -997,7 +1001,9 @@ internal static class InProcessProtocol
             WriteUtf8(payload.AsSpan(offset + 64, 64), document.ReplayIdentifier.ReplayName);
             BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(offset + 128),
                 checked((uint)Math.Max(document.KeyframeCount, 0)));
-            BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(offset + 136),
+            // The native entry is packed, so the i64 follows keyframe_count at +132.
+            // Writing it at +136 overlapped the flags word and corrupted the timestamp.
+            BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(offset + 132),
                 document.ModifiedUtc?.Ticks ?? 0);
             var flags = 0u;
             if (document.IsDraft)

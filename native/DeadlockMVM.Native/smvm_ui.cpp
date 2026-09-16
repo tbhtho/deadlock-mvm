@@ -1439,15 +1439,27 @@ void DrawModals(const FrameContext& context) noexcept {
     if (!picker_open)
         state.picker_requested_list = false;
 
+    // One modal, several destructive actions: the wording has to describe the
+    // action that actually queued, and the popup id stays constant so switching
+    // actions never leaks an open modal.
+    const auto confirming_exit = state.confirm_action == SmvmConfirmAction::exit_deadlock;
+    const auto* const confirmation_id = "##smvm_confirmation";
+    const auto* const confirmation_title = confirming_exit
+        ? "Force-close Deadlock?"
+        : "Discard current path changes?";
+    const auto* const confirmation_body = confirming_exit
+        ? "Deadlock closes immediately. An armed or in-progress recording and any unsaved replay position are lost."
+        : "Your current keyframes will be lost. Saved path files are kept.";
+    const auto* const confirmation_label = confirming_exit ? "Exit Deadlock" : "Discard";
     if (state.confirm_pending) {
-        smvm_theme::OpenConfirmation("Discard current path changes?");
+        smvm_theme::OpenConfirmation(confirmation_id);
         state.confirm_pending = false;
     }
     const auto confirmed = smvm_theme::ConfirmationModal(
-        "Discard current path changes?",
-        "Discard current path changes?",
-        "Your current keyframes will be lost. Saved path files are kept.",
-        "Discard");
+        confirmation_id,
+        confirmation_title,
+        confirmation_body,
+        confirmation_label);
     if (confirmed == smvm_theme::ConfirmResult::confirm) {
         switch (state.confirm_action) {
             case SmvmConfirmAction::new_path:
@@ -1458,6 +1470,9 @@ void DrawModals(const FrameContext& context) noexcept {
                 break;
             case SmvmConfirmAction::load_path:
                 QueueAction(context, SmvmActionType::load_path, state.confirm_load_index);
+                break;
+            case SmvmConfirmAction::exit_deadlock:
+                QueueAction(context, SmvmActionType::exit_deadlock);
                 break;
             case SmvmConfirmAction::none:
             default:
@@ -2058,9 +2073,15 @@ void DrawMovieRecordingMenu(const FrameContext& context) noexcept {
                 ImGui::TextWrapped("SDR color grading, bloom, 3D CUBE LUT, sharpening, vignette and deterministic grain. Depth effects require validated scene depth.");
 
                 ImGui::Separator();
-                if (ImGui::Button("Exit Deadlock", ImVec2(ImGui::GetContentRegionAvail().x, 0.0F)))
-                    QueueAction(context, SmvmActionType::exit_deadlock);
-                smvm_theme::Tooltip("Force-closes the game immediately.");
+                // This tab is informational text, so a bare full-width button
+                // here was one misclick away from killing the live session.
+                if (smvm_theme::DangerButton(
+                        "Exit Deadlock", true,
+                        ImVec2(ImGui::GetContentRegionAvail().x, 0.0F))) {
+                    state.confirm_action = SmvmConfirmAction::exit_deadlock;
+                    state.confirm_pending = true;
+                }
+                smvm_theme::Tooltip("Force-closes the game immediately. Asks for confirmation first.");
             } else {
             const auto& look = snapshot.look;
             ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 54.0F * scale);
@@ -3352,6 +3373,10 @@ void DrawFrame(const SmvmUiFrameParams& params, SmvmUiState& state) noexcept {
     if (params.snapshot == nullptr)
         return;
     ObserveReplaySession(params.snapshot, state);
+    // Host-reported notifications are folded into the toast list here; the list
+    // is drawn unconditionally at the end of the frame so a failed action
+    // (QueueAction pushes a local toast) is actually visible to the user.
+    UpdateToasts(*params.snapshot, state);
     const auto show_timeline = ShouldShowReplayTimeline(
         (params.snapshot->flags & smvm_snapshot_internal_enabled) != 0,
         (params.snapshot->flags & smvm_snapshot_replay_active) != 0,
@@ -3417,6 +3442,9 @@ void DrawFrame(const SmvmUiFrameParams& params, SmvmUiState& state) noexcept {
         else
             DrawCinematicStartPrompt(context);
     }
+    // Drawn last and regardless of editor visibility: toasts report host
+    // reconnect and action failures, which can happen while the menu is closed.
+    DrawToasts(context);
 }
 
 } // namespace deadlock_mvm::smvm_ui

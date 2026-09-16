@@ -2,6 +2,7 @@
 
 #include "engine_movie_audio.hpp"
 #include "movie_capture_queue_policy.hpp"
+#include "mp4_encoder.hpp"
 #include "protocol.hpp"
 
 #include <Windows.h>
@@ -106,6 +107,10 @@ struct MovieCaptureState final {
     std::atomic<bool> depth_observer_observed{false};
     std::atomic<bool> depth_available{false};
     std::atomic<bool> avi_available{false};
+    // Small playable H.264 preview beside the uncompressed World AVI. This is
+    // a convenience artifact; its failure never fails a take.
+    std::atomic<bool> mp4_available{false};
+    std::atomic<std::uint64_t> mp4_frames_written{0};
     std::atomic<bool> audio_started{false};
     std::atomic<bool> audio_failed{false};
     std::atomic<bool> fatal_failed{false};
@@ -121,6 +126,13 @@ struct MovieCaptureState final {
     std::atomic<std::uint64_t> greenscreen_subject_pixels{0};
     std::atomic<std::uint64_t> greenscreen_frames_with_background{0};
     std::atomic<std::uint64_t> greenscreen_frames_with_subject{0};
+    // First frame that produced no key background, kept so a failed Chroma pass
+    // names the depth condition that rejected it and the range it observed.
+    std::atomic<std::uint32_t> greenscreen_failure_reason{
+        static_cast<std::uint32_t>(GreenscreenDepthReason::not_observed)};
+    std::atomic<bool> greenscreen_failure_far_is_zero{false};
+    std::atomic<float> greenscreen_failure_depth_min{0.0F};
+    std::atomic<float> greenscreen_failure_depth_max{0.0F};
     std::atomic<std::uint64_t> present_calls{0};
     std::atomic<std::uint64_t> repeated_camera_sequences_captured{0};
     std::atomic<std::uint64_t> repeated_visual_samples_captured{0};
@@ -128,6 +140,7 @@ struct MovieCaptureState final {
     std::atomic<std::uint64_t> depth_frames_unavailable{0};
     std::atomic<std::uint64_t> queue_backpressure_events{0};
     std::atomic<std::uint64_t> queue_backpressure_microseconds{0};
+    std::atomic<std::uint64_t> queue_backpressure_timeouts{0};
     std::atomic<std::uint64_t> maximum_queue_wait_microseconds{0};
     std::atomic<std::uint64_t> maximum_capture_microseconds{0};
     std::atomic<std::uint64_t> maximum_writer_microseconds{0};
@@ -748,9 +761,38 @@ void ReleaseRetainedDepthView() noexcept {
     if (writer != nullptr)
         return true;
     try {
+        // libgmavi only accepts a narrow path, so the name goes through the
+        // active ANSI code page. A capture root that code page cannot represent
+        // would open a different file than the wide path this take later
+        // renames: the rename then fails, the whole take is reported failed for
+        // the wrong reason, and a stray mis-named AVI is left behind. Prove the
+        // conversion round-trips before handing the path over.
         const auto narrow_path = path.string();
+        if (std::filesystem::path(narrow_path) != path)
+            return false;
         writer = gmav_open(narrow_path.c_str(), width, height, fps);
         return writer != nullptr;
+    } catch (...) {
+        return false;
+    }
+}
+
+// Opens the playable H.264 preview with a bounded quality target. Media
+// Foundation or an H.264 encoder may be absent; that only skips the preview.
+[[nodiscard]] bool EnsureMp4(
+    Mp4Encoder& encoder,
+    const std::filesystem::path& path,
+    const std::uint32_t width,
+    const std::uint32_t height,
+    const std::uint32_t fps) noexcept {
+    if (encoder.IsOpen())
+        return true;
+    try {
+        const auto quality =
+            static_cast<std::uint64_t>(width) * height * fps / 5u;
+        const auto bitrate = static_cast<std::uint32_t>(
+            std::clamp<std::uint64_t>(quality, 8'000'000u, 100'000'000u));
+        return encoder.Open(path, width, height, fps, bitrate);
     } catch (...) {
         return false;
     }
@@ -1065,10 +1107,15 @@ void BuildDepthPreview(const MovieFrame& frame, std::vector<std::uint8_t>& outpu
     }
 }
 
-void WriterMain() noexcept {
+// A background worker that throws would terminate the game process, so the
+// whole body (including the startup and finalization allocation paths) is
+// guarded by the caller rather than only the per-frame work.
+void WriterMainBody() {
     auto& state = State();
     static_cast<void>(SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL));
     AviOutputs avi{};
+    Mp4Encoder mp4_preview{};
+    auto mp4_preview_failed = false;
     std::vector<std::uint8_t> converted{};
     MovieFrame resized{};
     std::vector<std::uint8_t> horizontal{};
@@ -1122,6 +1169,31 @@ void WriterMain() noexcept {
                     // A Chroma frame with no physical key-color region is not a
                     // usable Green Screen plate even when libgmavi can encode it.
                     state.pass_incomplete.store(true, std::memory_order_release);
+                    // The verdict alone does not say which depth comparison
+                    // rejected the frame. Record the first failing frame's
+                    // condition and observed depth range so the manifest can
+                    // name the cause instead of only the symptom.
+                    auto unobserved = static_cast<std::uint32_t>(
+                        GreenscreenDepthReason::not_observed);
+                    const auto diagnosis = DiagnoseGreenscreenDepth(
+                        frame.depth.data(),
+                        frame.width,
+                        frame.height,
+                        FarDepthIsZero(frame));
+                    if (state.greenscreen_failure_reason.compare_exchange_strong(
+                            unobserved,
+                            static_cast<std::uint32_t>(diagnosis.reason),
+                            std::memory_order_acq_rel)) {
+                        state.greenscreen_failure_far_is_zero.store(
+                            diagnosis.far_depth_is_zero,
+                            std::memory_order_release);
+                        state.greenscreen_failure_depth_min.store(
+                            diagnosis.minimum,
+                            std::memory_order_release);
+                        state.greenscreen_failure_depth_max.store(
+                            diagnosis.maximum,
+                            std::memory_order_release);
+                    }
                 }
                 if (fill.subject_pixels != 0) {
                     state.greenscreen_frames_with_subject.fetch_add(
@@ -1184,8 +1256,29 @@ void WriterMain() noexcept {
                 output_failed = output_failed || !wrote;
                 wrote_any = wrote_any || wrote;
                 wrote_avi = wrote_avi || wrote;
-                if (wrote)
+                if (wrote) {
                     state.beauty_frames_written.fetch_add(1, std::memory_order_acq_rel);
+                    // Playable preview: the uncompressed AVI cannot stream from
+                    // the capture disk, so a small H.264 sibling is written with
+                    // the same frames. Encoder absence is not a take failure.
+                    if (!mp4_preview_failed) {
+                        const auto ready = EnsureMp4(
+                            mp4_preview,
+                            AviPath(avi_directory, capture_name, "world", ".partial.mp4"),
+                            output_frame.width,
+                            output_frame.height,
+                            fps) &&
+                            mp4_preview.WriteBgrFrame(
+                                output_frame.color_bgr.data(),
+                                output_frame.color_stride);
+                        if (ready) {
+                            state.mp4_frames_written.fetch_add(1, std::memory_order_acq_rel);
+                        } else {
+                            mp4_preview_failed = true;
+                            static_cast<void>(mp4_preview.Close());
+                        }
+                    }
+                }
             }
             if ((passes & movie_capture_pass_world_depth_avi) != 0) {
                 if (output_frame.depth.empty()) {
@@ -1225,12 +1318,15 @@ void WriterMain() noexcept {
                 }
             }
 
+            // A pass that failed for this frame must not hide a complete AVI that
+            // the same frame successfully wrote: the artifact exists on disk and
+            // the manifest has to agree with it.
+            if (wrote_avi)
+                state.avi_available.store(true, std::memory_order_release);
             if (output_failed) {
                 MarkFatalFailure();
             } else if (wrote_any) {
                 state.written_frames.fetch_add(1, std::memory_order_acq_rel);
-                if (wrote_avi)
-                    state.avi_available.store(true, std::memory_order_release);
             }
         } catch (...) {
             MarkFatalFailure();
@@ -1286,8 +1382,40 @@ void WriterMain() noexcept {
         avi.depth_key,
         "chroma",
         state.depth_key_frames_written.load(std::memory_order_acquire));
+    // The preview never blocks a take: it is finalized on its own and an
+    // incomplete encode is discarded.
+    const auto mp4_partial = AviPath(avi_directory, capture_name, "world", ".partial.mp4");
+    const auto mp4_complete = AviPath(avi_directory, capture_name, "world", ".mp4");
+    const auto mp4_frames = mp4_preview.FramesWritten();
+    const auto mp4_closed = mp4_preview.Close();
+    if (mp4_closed && !mp4_preview_failed && mp4_frames > 0) {
+        std::error_code rename_error{};
+        std::filesystem::rename(mp4_partial, mp4_complete, rename_error);
+        if (!rename_error) {
+            state.mp4_available.store(true, std::memory_order_release);
+        } else {
+            // A finished encode that cannot be published must not leave its
+            // partial beside the take either: the preview is either complete
+            // under its published name or absent.
+            std::error_code remove_error{};
+            std::filesystem::remove(mp4_partial, remove_error);
+        }
+    } else {
+        std::error_code remove_error{};
+        std::filesystem::remove(mp4_partial, remove_error);
+    }
     if (!beauty_finished || !depth_finished || !key_finished)
         MarkFatalFailure();
+}
+
+void WriterMain() noexcept {
+    try {
+        WriterMainBody();
+    } catch (...) {
+        // Starting the take and finalizing its files both allocate; an escaped
+        // exception here used to call std::terminate and take Deadlock with it.
+        MarkFatalFailure();
+    }
 }
 
 void WriteManifest(
@@ -1304,6 +1432,8 @@ void WriteManifest(
         const auto expected = state.observed_frames.load(std::memory_order_acquire);
         const auto passes = state.pass_flags.load(std::memory_order_acquire);
         const auto output_mode = state.output_mode.load(std::memory_order_acquire);
+        const auto mp4_requested = output_mode != 0 &&
+            (passes & movie_capture_pass_beauty) != 0;
         const auto audio = GetEngineMovieAudioStatus();
         const auto& look = state.look;
         manifest << std::setprecision(std::numeric_limits<float>::max_digits10)
@@ -1387,6 +1517,8 @@ void WriteManifest(
                 state.queue_backpressure_events.load(std::memory_order_acquire) << '\n'
             << "Queue backpressure total: " <<
                 state.queue_backpressure_microseconds.load(std::memory_order_acquire) / 1000u << " ms\n"
+            << "Queue backpressure wait-budget failures: " <<
+                state.queue_backpressure_timeouts.load(std::memory_order_acquire) << '\n'
             << "Longest queue backpressure wait: " <<
                 state.maximum_queue_wait_microseconds.load(std::memory_order_acquire) / 1000u << " ms\n"
             << "Slowest GPU readback/conversion: " <<
@@ -1449,10 +1581,35 @@ void WriteManifest(
                     ? DescribeEngineMovieAudioError(audio.error)
                     : "not requested") << '\n'
             << "AVI available: " << (avi_was_available ? "yes" : "no") << '\n'
+            << "Playable MP4: " <<
+                (mp4_requested
+                    ? (state.mp4_available.load(std::memory_order_acquire)
+                        ? "yes" : "no")
+                    : "not requested") << '\n'
+            << "Playable MP4 frames: " <<
+                state.mp4_frames_written.load(std::memory_order_acquire) << '\n'
             << "Artifact rule: completed AVIs use .avi; incomplete AVIs are named "
                "_PARTIAL_<written>-of-<observed>.avi\n"
             << "Failure observed: " <<
                 (state.fatal_failed.load(std::memory_order_acquire) ? "yes" : "no") << '\n';
+        // A failed plate names its own cause: the depth condition that rejected
+        // the first failing frame and the device-depth range it observed, so
+        // the far-plane polarity is visible without a debugger. A take with no
+        // failed plate keeps its manifest unchanged.
+        const auto greenscreen_reason = static_cast<GreenscreenDepthReason>(
+            state.greenscreen_failure_reason.load(std::memory_order_acquire));
+        if (greenscreen_reason != GreenscreenDepthReason::not_observed) {
+            manifest
+                << "Green Screen failure reason: "
+                << DescribeGreenscreenDepthReason(greenscreen_reason) << '\n'
+                << "Green Screen failure depth range: "
+                << state.greenscreen_failure_depth_min.load(std::memory_order_acquire) << '/'
+                << state.greenscreen_failure_depth_max.load(std::memory_order_acquire) << '\n'
+                << "Green Screen failure far plane at: "
+                << (state.greenscreen_failure_far_is_zero.load(std::memory_order_acquire)
+                        ? "0" : "1")
+                << '\n';
+        }
         write_pass(
             "World TGA",
             output_mode != 1 && (passes & movie_capture_pass_beauty) != 0,
@@ -1513,6 +1670,8 @@ void StopSession() noexcept {
     }
     state.depth_available.store(false, std::memory_order_release);
     state.avi_available.store(false, std::memory_order_release);
+    state.mp4_available.store(false, std::memory_order_release);
+    state.mp4_frames_written.store(0, std::memory_order_release);
     state.audio_started.store(false, std::memory_order_release);
     state.greenscreen_active.store(false, std::memory_order_release);
     state.frame_composition_ready.store(false, std::memory_order_release);
@@ -1601,6 +1760,8 @@ void StopSession() noexcept {
         state.depth_available.store(false, std::memory_order_release);
         state.depth_observer_observed.store(false, std::memory_order_release);
         state.avi_available.store(false, std::memory_order_release);
+        state.mp4_available.store(false, std::memory_order_release);
+        state.mp4_frames_written.store(0, std::memory_order_release);
         state.audio_started.store(false, std::memory_order_release);
         state.audio_failed.store(false, std::memory_order_release);
         state.observed_frames.store(0, std::memory_order_release);
@@ -1614,6 +1775,12 @@ void StopSession() noexcept {
         state.greenscreen_subject_pixels.store(0, std::memory_order_release);
         state.greenscreen_frames_with_background.store(0, std::memory_order_release);
         state.greenscreen_frames_with_subject.store(0, std::memory_order_release);
+        state.greenscreen_failure_reason.store(
+            static_cast<std::uint32_t>(GreenscreenDepthReason::not_observed),
+            std::memory_order_release);
+        state.greenscreen_failure_far_is_zero.store(false, std::memory_order_release);
+        state.greenscreen_failure_depth_min.store(0.0F, std::memory_order_release);
+        state.greenscreen_failure_depth_max.store(0.0F, std::memory_order_release);
         state.present_calls.store(0, std::memory_order_release);
         state.repeated_camera_sequences_captured.store(0, std::memory_order_release);
         state.repeated_visual_samples_captured.store(0, std::memory_order_release);
@@ -1621,6 +1788,7 @@ void StopSession() noexcept {
         state.depth_frames_unavailable.store(0, std::memory_order_release);
         state.queue_backpressure_events.store(0, std::memory_order_release);
         state.queue_backpressure_microseconds.store(0, std::memory_order_release);
+        state.queue_backpressure_timeouts.store(0, std::memory_order_release);
         state.maximum_queue_wait_microseconds.store(0, std::memory_order_release);
         state.maximum_capture_microseconds.store(0, std::memory_order_release);
         state.maximum_writer_microseconds.store(0, std::memory_order_release);
@@ -1790,8 +1958,12 @@ ID3D11ShaderResourceView* AcquireObservedWorldDepthShaderResourceView(
         default: return nullptr;
     }
 
-    // Fast path: a typeless engine depth surface can be sampled directly.
-    if (state.depth_srv != nullptr && state.depth_srv_resource == resource.Get()) {
+    // Fast path: a typeless engine depth surface can be sampled directly. The
+    // resolved view format is part of the cache key: the same resource can be
+    // bound through a depth view of another format, and the cached SRV would
+    // then sample it with the wrong interpretation.
+    if (state.depth_srv != nullptr && state.depth_srv_resource == resource.Get() &&
+        state.depth_srv_format == srv_format) {
         state.depth_srv->AddRef();
         return state.depth_srv;
     }
@@ -2091,11 +2263,30 @@ void CaptureMovieFrame(
             state.queue_capacity.store(queue_capacity, std::memory_order_release);
             const auto queue_was_full = state.queue.size() >= queue_capacity;
             const auto queue_wait_started = std::chrono::steady_clock::now();
-            state.queue_space.wait(lock, [&state]() noexcept {
-                return state.queue.size() <
-                           state.queue_capacity.load(std::memory_order_acquire) ||
-                       state.writer_stop || state.fatal_failed.load(std::memory_order_acquire);
-            });
+            // A stalled writer must not pin the render thread. The writer can
+            // block on a removed or saturated capture disk, and the previous
+            // unbounded wait froze the game for the whole I/O stall. The wait
+            // is now bounded: past the budget the take is finalized as failed
+            // instead of the game hanging indefinitely.
+            while (state.queue.size() >= queue_capacity &&
+                   !state.writer_stop &&
+                   !state.fatal_failed.load(std::memory_order_acquire)) {
+                state.queue_space.wait_for(lock, std::chrono::milliseconds(50));
+                if (!MovieCaptureQueueWaitExceededBudget(
+                        ElapsedMicroseconds(queue_wait_started) / 1000u)) {
+                    continue;
+                }
+                state.queue_backpressure_timeouts.fetch_add(1, std::memory_order_acq_rel);
+                MarkFatalFailure();
+                // Signal the wedged writer so it drains and exits instead of
+                // blocking on this queue for the rest of the process. The take
+                // itself is still finalized by StopSession; joining the writer
+                // here would deadlock the render thread against it.
+                state.writer_stop = true;
+                state.work_ready.notify_all();
+                state.queue_space.notify_all();
+                break;
+            }
             if (queue_was_full) {
                 const auto waited = ElapsedMicroseconds(queue_wait_started);
                 state.queue_backpressure_events.fetch_add(1, std::memory_order_acq_rel);

@@ -40,4 +40,17 @@ constexpr std::size_t kMaximumMovieCaptureQueuedFrames = 8;
         kMaximumMovieCaptureQueuedFrames);
 }
 
+// The render thread waits for queue space when the writer falls behind. That
+// wait must be bounded: the writer can block on a removed or saturated capture
+// disk, and an unbounded wait freezes the game for as long as the I/O lasts.
+// The budget is far above the slowest frame write observed on a saturated SATA
+// disk (about 1.4 s), so it only fires when the writer is genuinely wedged and
+// the take is finalized instead of the game hanging.
+constexpr std::uint64_t kMovieCaptureQueueWaitBudgetMilliseconds = 15000;
+
+[[nodiscard]] constexpr bool MovieCaptureQueueWaitExceededBudget(
+    const std::uint64_t waited_milliseconds) noexcept {
+    return waited_milliseconds >= kMovieCaptureQueueWaitBudgetMilliseconds;
+}
+
 } // namespace deadlock_mvm

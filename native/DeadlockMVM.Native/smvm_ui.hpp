@@ -51,6 +51,9 @@ enum class SmvmConfirmAction : std::uint32_t {
     new_path = 1,
     close_path = 2,
     load_path = 3,
+    // Force-closing the game cannot be undone, so it goes through the same
+    // modal as the destructive path actions instead of firing on one click.
+    exit_deadlock = 4,
 };
 
 struct SmvmUiState final {

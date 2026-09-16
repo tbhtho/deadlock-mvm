@@ -225,7 +225,13 @@ AudioState& State() noexcept {
             std::memcmp(header.data() + 8, "WAVE", 4) != 0) {
             return false;
         }
+        stream.seekg(0, std::ios::end);
+        const auto file_size = stream.tellg();
+        stream.seekg(static_cast<std::streamoff>(header.size()), std::ios::beg);
+        if (file_size < static_cast<std::streamoff>(header.size()))
+            return false;
         for (;;) {
+            const auto chunk_start = stream.tellg();
             std::array<std::uint8_t, 8> chunk{};
             stream.read(
                 reinterpret_cast<char*>(chunk.data()),
@@ -238,6 +244,13 @@ AudioState& State() noexcept {
                 (static_cast<std::uint32_t>(chunk[6]) << 16) |
                 (static_cast<std::uint32_t>(chunk[7]) << 24);
             if (std::memcmp(chunk.data(), "data", 4) == 0) {
+                // A declared size larger than the file means the header is
+                // lying. Reporting it as samples would tell the take report that
+                // audio exists when nothing was written past the 44-byte header.
+                if (static_cast<std::streamoff>(chunk_bytes) >
+                    file_size - chunk_start - static_cast<std::streamoff>(chunk.size())) {
+                    return false;
+                }
                 data_bytes = chunk_bytes;
                 return true;
             }
@@ -269,8 +282,14 @@ std::uint32_t WaveDataChunkBytes(
             (static_cast<std::uint32_t>(bytes[offset + 5]) << 8) |
             (static_cast<std::uint32_t>(bytes[offset + 6]) << 16) |
             (static_cast<std::uint32_t>(bytes[offset + 7]) << 24);
-        if (std::memcmp(bytes + offset, "data", 4) == 0)
+        if (std::memcmp(bytes + offset, "data", 4) == 0) {
+            // The declared size has to fit in the buffer that was read. A
+            // truncated header-only file otherwise reports its header's promise
+            // rather than what is actually there.
+            if (static_cast<std::size_t>(chunk_bytes) > size - offset - 8)
+                return 0;
             return chunk_bytes;
+        }
         const std::uint64_t advance =
             8ull + chunk_bytes + (chunk_bytes & 1u);
         if (advance > size - offset)

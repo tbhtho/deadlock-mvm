@@ -42,8 +42,17 @@ public sealed class CampathStore
             throw new InvalidOperationException("Campath files must remain in the MVM campaths directory.");
 
         var temporary = path + ".tmp";
-        File.WriteAllText(temporary, JsonSerializer.Serialize(project, JsonOptions), new UTF8Encoding(false));
-        File.Move(temporary, path, true);
+        try
+        {
+            File.WriteAllText(temporary, JsonSerializer.Serialize(project, JsonOptions), new UTF8Encoding(false));
+            File.Move(temporary, path, true);
+        }
+        finally
+        {
+            // A failed write or move must not leave a stray .tmp beside the real
+            // document, where it is never listed and never cleaned up.
+            TryDelete(temporary);
+        }
         return path;
     }
 

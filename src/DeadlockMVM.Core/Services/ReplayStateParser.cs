@@ -27,11 +27,19 @@ public sealed partial class ReplayStateParser
 
     public void ResetGameTickOffset() => _gameTickOffset = null;
 
+    /// <summary>
+    /// Engine output is untrusted and this runs on the transport read thread, so an
+    /// out-of-range or malformed number must fail closed instead of throwing out of
+    /// the read loop and dropping the console connection.
+    /// </summary>
+    private static bool TryParseEngineNumber(string text, out int value) =>
+        int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out value);
+
     public bool TryParseSeekCompletedTick(string line, out int tick)
     {
         var match = SkippingFinishedLine().Match(line ?? string.Empty);
-        tick = match.Success ? int.Parse(match.Groups[1].Value) : 0;
-        return match.Success;
+        tick = 0;
+        return match.Success && TryParseEngineNumber(match.Groups[1].Value, out tick);
     }
 
     [GeneratedRegex(@"Currently playing (\d+) of (\d+) ticks\. Minutes:[\d.]+ File:(\S+)")]
@@ -87,10 +95,15 @@ public sealed partial class ReplayStateParser
         var position = PositionLine().Match(line);
         if (position.Success)
         {
+            if (!TryParseEngineNumber(position.Groups[1].Value, out var positionTick) ||
+                !TryParseEngineNumber(position.Groups[2].Value, out var positionTotal))
+            {
+                return null; // Out-of-range engine counter: learn nothing rather than throw.
+            }
             return new ReplayState
             {
-                CurrentTick = int.Parse(position.Groups[1].Value),
-                TotalTicks = int.Parse(position.Groups[2].Value),
+                CurrentTick = positionTick,
+                TotalTicks = positionTotal,
                 ReplayName = position.Groups[3].Value,
             };
         }
@@ -98,7 +111,8 @@ public sealed partial class ReplayStateParser
         var gameRules = GameRulesPauseLine().Match(line);
         if (gameRules.Success)
         {
-            var gameTick = int.Parse(gameRules.Groups[2].Value);
+            if (!TryParseEngineNumber(gameRules.Groups[2].Value, out var gameTick))
+                return null;
             return new ReplayState
             {
                 IsPaused = gameRules.Groups[1].Value == "paused",
@@ -109,28 +123,35 @@ public sealed partial class ReplayStateParser
         var demoPaused = DemoPausedLine().Match(line);
         if (demoPaused.Success)
         {
+            if (!TryParseEngineNumber(demoPaused.Groups[1].Value, out var pausedTick))
+                return null;
             return new ReplayState
             {
                 IsPaused = true,
-                CurrentTick = int.Parse(demoPaused.Groups[1].Value),
+                CurrentTick = pausedTick,
             };
         }
 
         var finished = SkippingFinishedLine().Match(line);
         if (finished.Success)
         {
+            if (!TryParseEngineNumber(finished.Groups[1].Value, out var finishedTick))
+                return null;
             return new ReplayState
             {
                 IsPaused = false,
-                CurrentTick = int.Parse(finished.Groups[1].Value),
+                CurrentTick = finishedTick,
             };
         }
 
         var forward = SkippingForwardLine().Match(line);
         if (forward.Success)
         {
-            var demoTick = int.Parse(forward.Groups[1].Value);
-            var gameTick = int.Parse(forward.Groups[2].Value);
+            if (!TryParseEngineNumber(forward.Groups[1].Value, out var demoTick) ||
+                !TryParseEngineNumber(forward.Groups[2].Value, out var gameTick))
+            {
+                return null;
+            }
             if (gameTick > demoTick)
                 _gameTickOffset = gameTick - demoTick;
 
@@ -145,16 +166,19 @@ public sealed partial class ReplayStateParser
         var serverStart = ServerStartTickLine().Match(line);
         if (serverStart.Success)
         {
-            _gameTickOffset = int.Parse(serverStart.Groups[1].Value);
+            if (TryParseEngineNumber(serverStart.Groups[1].Value, out var offset))
+                _gameTickOffset = offset;
             return null; // calibration only, no user-visible state change
         }
 
         var playbackTicks = PlaybackTicksLine().Match(line);
         if (playbackTicks.Success)
         {
+            if (!TryParseEngineNumber(playbackTicks.Groups[1].Value, out var total))
+                return null;
             return new ReplayState
             {
-                TotalTicks = int.Parse(playbackTicks.Groups[1].Value),
+                TotalTicks = total,
             };
         }
 

@@ -2,9 +2,13 @@
 
 #include "protocol.hpp"
 
+#include <algorithm>
 #include <array>
 #include <bit>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string_view>
 
 struct ID3D11Device;
@@ -58,6 +62,87 @@ inline constexpr auto kGreenscreenFarDepthTolerance = 1.0e-7F;
     return far_depth_is_zero
         ? device_depth <= kGreenscreenFarDepthTolerance
         : device_depth >= 1.0F - kGreenscreenFarDepthTolerance;
+}
+
+// A Green Screen pass that produced no key background is reported as failed by
+// the capture manifest, but the bare verdict does not say which comparison
+// rejected the frame. These reasons name the observed depth condition together
+// with the depth range, so an unusable plate identifies its own cause instead
+// of only its symptom.
+enum class GreenscreenDepthReason : std::uint32_t {
+    not_observed = 0,
+    depth_missing = 1,
+    no_far_plane_samples = 2,
+    whole_frame_is_far = 3,
+    far_plane_present = 4,
+};
+
+[[nodiscard]] constexpr std::string_view DescribeGreenscreenDepthReason(
+    const GreenscreenDepthReason reason) noexcept {
+    switch (reason) {
+        case GreenscreenDepthReason::depth_missing: return "depth_missing";
+        case GreenscreenDepthReason::no_far_plane_samples: return "no_far_plane_samples";
+        case GreenscreenDepthReason::whole_frame_is_far: return "whole_frame_is_far";
+        case GreenscreenDepthReason::far_plane_present: return "far_plane_present";
+        default: return "not_observed";
+    }
+}
+
+struct GreenscreenDepthDiagnosis final {
+    GreenscreenDepthReason reason{GreenscreenDepthReason::not_observed};
+    bool far_depth_is_zero{};
+    std::uint64_t samples{};
+    float minimum{};
+    float maximum{};
+};
+
+// Classifies the captured device depth on a coarse grid over the whole frame.
+// `whole_frame_is_far` is the polarity-mismatch case: every sample matched the
+// far plane that the border detection chose, so the detection picked the wrong
+// end and the key fill keyed nothing. `no_far_plane_samples` is the opposite
+// and by far the likelier live cause: depth was captured, but nothing in the
+// frame matched the far plane the detection chose.
+[[nodiscard]] inline GreenscreenDepthDiagnosis DiagnoseGreenscreenDepth(
+    const float* const depth,
+    const std::size_t width,
+    const std::size_t height,
+    const bool far_depth_is_zero) noexcept {
+    GreenscreenDepthDiagnosis diagnosis{};
+    diagnosis.far_depth_is_zero = far_depth_is_zero;
+    if (depth == nullptr || width == 0 || height == 0) {
+        diagnosis.reason = GreenscreenDepthReason::depth_missing;
+        return diagnosis;
+    }
+    const auto step_x = std::max<std::size_t>(1, width / 64u);
+    const auto step_y = std::max<std::size_t>(1, height / 64u);
+    auto minimum = std::numeric_limits<float>::max();
+    auto maximum = std::numeric_limits<float>::lowest();
+    auto far_samples = std::uint64_t{};
+    for (std::size_t y = 0; y < height; y += step_y) {
+        for (std::size_t x = 0; x < width; x += step_x) {
+            const auto value = depth[y * width + x];
+            if (!std::isfinite(value))
+                continue;
+            minimum = std::min(minimum, value);
+            maximum = std::max(maximum, value);
+            ++diagnosis.samples;
+            if (IsGreenscreenFarPlaneDepth(value, far_depth_is_zero))
+                ++far_samples;
+        }
+    }
+    if (diagnosis.samples == 0) {
+        diagnosis.reason = GreenscreenDepthReason::depth_missing;
+        return diagnosis;
+    }
+    diagnosis.minimum = minimum;
+    diagnosis.maximum = maximum;
+    if (far_samples == 0)
+        diagnosis.reason = GreenscreenDepthReason::no_far_plane_samples;
+    else if (far_samples == diagnosis.samples)
+        diagnosis.reason = GreenscreenDepthReason::whole_frame_is_far;
+    else
+        diagnosis.reason = GreenscreenDepthReason::far_plane_present;
+    return diagnosis;
 }
 
 [[nodiscard]] constexpr std::uint64_t AppendReplayTimingDigest(

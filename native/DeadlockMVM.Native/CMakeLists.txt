@@ -1,6 +1,7 @@
 add_library(DeadlockMVM.Native SHARED
     dllmain.cpp
     engine_movie_audio.cpp
+    mp4_encoder.cpp
     npc_healthbar_hook.cpp
     pattern_scan.cpp
     replay_camera.cpp
@@ -22,7 +23,7 @@ target_compile_definitions(DeadlockMVM.Native PRIVATE
 )
 target_compile_options(DeadlockMVM.Native PRIVATE /W4 /WX /permissive- /EHsc /guard:cf)
 target_link_options(DeadlockMVM.Native PRIVATE /DYNAMICBASE /NXCOMPAT /GUARD:CF)
-target_link_libraries(DeadlockMVM.Native PRIVATE imgui libgmavi Advapi32 D3D11 D3DCompiler DXGI Gdi32 Shell32 User32 Ws2_32)
+target_link_libraries(DeadlockMVM.Native PRIVATE imgui libgmavi Advapi32 D3D11 D3DCompiler DXGI Gdi32 Mfplat Mfreadwrite Mfuuid Ole32 Shell32 User32 Ws2_32)
 
 set_target_properties(DeadlockMVM.Native PROPERTIES
     OUTPUT_NAME "DeadlockMVM.Native"
@@ -79,10 +80,10 @@ target_link_libraries(DeadlockMVM.Look.Tests PRIVATE D3D11 DXGI)
 add_test(NAME DeadlockMVM.Look.Tests COMMAND DeadlockMVM.Look.Tests)
 
 
-add_executable(DeadlockMVM.CaptureLook.Tests ../DeadlockMVM.Native.Tests/capture_look_tests.cpp world_depth_capture.cpp engine_movie_audio.cpp pattern_scan.cpp look_pipeline.cpp)
+add_executable(DeadlockMVM.CaptureLook.Tests ../DeadlockMVM.Native.Tests/capture_look_tests.cpp world_depth_capture.cpp engine_movie_audio.cpp mp4_encoder.cpp pattern_scan.cpp look_pipeline.cpp)
 add_dependencies(DeadlockMVM.CaptureLook.Tests SmvmLookShaders)
 target_include_directories(DeadlockMVM.CaptureLook.Tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}")
 target_compile_definitions(DeadlockMVM.CaptureLook.Tests PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_options(DeadlockMVM.CaptureLook.Tests PRIVATE /W4 /WX /permissive- /EHsc)
-target_link_libraries(DeadlockMVM.CaptureLook.Tests PRIVATE libgmavi D3D11 D3DCompiler DXGI User32)
+target_link_libraries(DeadlockMVM.CaptureLook.Tests PRIVATE libgmavi D3D11 D3DCompiler DXGI Mfplat Mfreadwrite Mfuuid Ole32 User32)
 add_test(NAME DeadlockMVM.CaptureLook.Tests COMMAND DeadlockMVM.CaptureLook.Tests)

@@ -813,6 +813,12 @@ void OverlayPublishStatus(
     std::optional<std::uintptr_t> entity_system;
     const auto* pawn_bytes = reinterpret_cast<const std::uint8_t*>(pawn_start);
     for (std::size_t offset = 0x20; offset <= 0x50; ++offset) {
+        // The pattern match only guarantees the pattern's own bytes are mapped.
+        // Prove the three-byte probe is inside the section before dereferencing;
+        // this loop previously read up to 47 bytes past the validated match and
+        // ran outside any __try, so a fault here was an access violation.
+        if (!backend.client.text.Contains(pawn_start + offset, 3))
+            break;
         if (pawn_bytes[offset] == 0x4C && pawn_bytes[offset + 1] == 0x8B && pawn_bytes[offset + 2] == 0x0D) {
             entity_system = ResolveRipRelative(pawn_start + offset, 3, 7);
             break;
@@ -1231,7 +1237,17 @@ void* __fastcall CameraUpdateHook(void* camera) noexcept {
                     backend->campath_active.store(false, std::memory_order_release);
                     backend->override_requested.store(false, std::memory_order_release);
                     backend->override_active.store(false, std::memory_order_release);
-                    backend->manual_rebase_from_applied.store(true, std::memory_order_release);
+                    // Hand the released camera back to a waiting manual/free camera
+                    // from the campath's final applied sample. The rebase flag is
+                    // only consumed on a manual generation change, so the
+                    // generation has to advance here exactly as it does for
+                    // disable_override and RevokeCameraOwnership. Without it the
+                    // flag was set and never read, and the free camera jumped back
+                    // to its stale pre-campath sample at every hand-off.
+                    if (backend->manual_camera_requested.load(std::memory_order_acquire)) {
+                        backend->manual_rebase_from_applied.store(true, std::memory_order_release);
+                        backend->manual_generation.fetch_add(1, std::memory_order_acq_rel);
+                    }
                 }
             } else {
                 RevokeCameraOwnership(*backend, ErrorCode::hook_runtime_invalid);

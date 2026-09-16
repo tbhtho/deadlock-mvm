@@ -99,17 +99,46 @@ public partial class App : System.Windows.Application
             // Optional first-party dev console reuses this single VConsole
             // connection; the game's own console is left alone.
             window.ConsoleSource = controller;
+            // async void: a fault here is unobservable and would be rethrown on the
+            // dispatcher as an unhandled exception, and the remaining cleanup would
+            // be skipped. Each step is isolated so shutdown always completes.
             window.Closed += async (_, _) =>
             {
-                await smvm.DisposeAsync();
-                campath.Shutdown();
-                pointerForwarder.Dispose();
-                connection.Dispose();
-                await nativeSession.DisposeAsync();
-                controller.Dispose();
-                settings.Save();
+                await SafeShutdownStepAsync("smvm coordinator", () => smvm.DisposeAsync())
+                    .ConfigureAwait(true);
+                SafeShutdownStep("campath", campath.Shutdown);
+                SafeShutdownStep("pointer forwarder", pointerForwarder.Dispose);
+                SafeShutdownStep("vconsole connection", connection.Dispose);
+                await SafeShutdownStepAsync("native session", () => nativeSession.DisposeAsync())
+                    .ConfigureAwait(true);
+                SafeShutdownStep("replay controller", controller.Dispose);
+                SafeShutdownStep("settings", settings.Save);
                 log.Info("=== Launcher closed ===");
                 Shutdown();
+
+                void SafeShutdownStep(string name, Action step)
+                {
+                    try
+                    {
+                        step();
+                    }
+                    catch (Exception ex)
+                    {
+                        log.Warn($"Shutdown step '{name}' failed: {ex.Message}");
+                    }
+                }
+
+                async Task SafeShutdownStepAsync(string name, Func<ValueTask> step)
+                {
+                    try
+                    {
+                        await step().ConfigureAwait(true);
+                    }
+                    catch (Exception ex)
+                    {
+                        log.Warn($"Shutdown step '{name}' failed: {ex.Message}");
+                    }
+                }
             };
 
             MainWindow = window;

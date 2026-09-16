@@ -5131,7 +5131,7 @@ LRESULT CALLBACK SmvmWindowProcedure(
         return 0;
     if ((message == WM_MBUTTONDOWN || message == WM_XBUTTONDOWN) && menu_open)
         return message == WM_XBUTTONDOWN ? TRUE : 0;
-    if (ShouldSuppressGameplayInput(camera_input_takeover, false, false) &&
+    if (OwnsMenuPointerMessages(menu_open, camera_input_takeover) &&
         (message == WM_LBUTTONDBLCLK || message == WM_RBUTTONDBLCLK ||
          message == WM_MBUTTONDBLCLK || message == WM_XBUTTONDBLCLK))
         return message == WM_XBUTTONDBLCLK ? TRUE : 0;
@@ -5181,7 +5181,7 @@ LRESULT CALLBACK SmvmWindowProcedure(
             return 0;
         }
     }
-    if (message == WM_MOUSEHWHEEL && camera_input_takeover)
+    if (message == WM_MOUSEHWHEEL && OwnsMenuPointerMessages(menu_open, camera_input_takeover))
         return 0;
 
     if (has_snapshot && menu_open &&
@@ -6168,6 +6168,11 @@ LRESULT CALLBACK SmvmWindowProcedure(
                     capture(context, replay_session_generation);
             };
             smvm_ui::DrawFrame(params, state.ui);
+            // Campath keyframe labels are collected during the world-space draw
+            // above; they are ImGui text, so they can only be emitted between
+            // NewFrame and Render. Without this call the "Show labels" toggle
+            // collected labels and never drew them.
+            DrawWorldLabels();
             ImGui::Render();
             state.imgui_draw_data_valid = true;
         }

@@ -54,17 +54,21 @@ public sealed class VConsoleTransport : IGameCommandTransport
                 $"Could not reach the Deadlock console at {host}:{port}.", ex);
         }
 
+        // Publish the client, the reader thread and the connected flag together:
+        // Connect and Disconnect are called from different threads (the poll
+        // timer's auto-reconnect and the launcher's connection service), and
+        // publishing them separately let a Disconnect dispose the new socket
+        // while Connect then reported it as connected and started a reader on it.
         lock (_gate)
         {
             _client = client;
             _raw.SetLength(0);
             _rawScan = 0;
             _textBuffer = string.Empty;
+            _readerThread = new Thread(ReadLoop) { IsBackground = true, Name = "DeadlockMVM.VConsole" };
+            _connected = true;
+            _readerThread.Start(client);
         }
-
-        _connected = true;
-        _readerThread = new Thread(ReadLoop) { IsBackground = true, Name = "DeadlockMVM.VConsole" };
-        _readerThread.Start(client);
     }
 
     public void Disconnect()
@@ -92,6 +96,12 @@ public sealed class VConsoleTransport : IGameCommandTransport
 
         var payload = Encoding.ASCII.GetBytes(command);
         var total = HeaderLength + payload.Length + 1;
+        // The chunk length is a 16-bit field. An oversized command used to wrap
+        // silently and desynchronise the engine's stream; refuse it instead.
+        if (total > ushort.MaxValue)
+            throw new ArgumentException(
+                $"A VConsole command must fit the 16-bit chunk length (limit {ushort.MaxValue - HeaderLength - 1} characters).",
+                nameof(command));
 
         var message = new byte[total];
         Encoding.ASCII.GetBytes("CMND").CopyTo(message, 0);
