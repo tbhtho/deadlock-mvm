@@ -17,6 +17,7 @@ public sealed class LauncherWindowLifecycle
     private readonly TimeSpan _launchObservationTimeout;
     private DateTime _launchArmedAtUtc;
     private bool _launchArmed;
+    private bool _restoreRequested;
 
     public LauncherWindowLifecycle(TimeSpan? launchObservationTimeout = null)
     {
@@ -33,14 +34,19 @@ public sealed class LauncherWindowLifecycle
         _launchArmed = true;
     }
 
-    public void CancelLaunch() => _launchArmed = false;
+    public void CancelLaunch()
+    {
+        _launchArmed = false;
+        _restoreRequested = IsHidden;
+    }
 
     public LauncherWindowAction Observe(bool deadlockRunning, bool hideEnabled, DateTime utcNow)
     {
-        if (IsHidden && (!deadlockRunning || !hideEnabled))
+        if (IsHidden && (_restoreRequested || !deadlockRunning || !hideEnabled))
         {
             IsHidden = false;
             _launchArmed = false;
+            _restoreRequested = false;
             return LauncherWindowAction.Restore;
         }
 

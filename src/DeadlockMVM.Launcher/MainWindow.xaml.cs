@@ -112,7 +112,8 @@ public partial class MainWindow : Window
                 ShowInTaskbar = true;
                 Show();
                 WindowState = WindowState.Normal;
-                viewModel.RestoreAfterDeadlockExit();
+                if (!viewModel.DeadlockRunning)
+                    viewModel.RestoreAfterDeadlockExit();
                 Activate();
                 break;
         }

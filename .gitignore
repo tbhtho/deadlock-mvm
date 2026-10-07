@@ -51,17 +51,19 @@ tools/research/ida/
 /tools/
 /tests/DeadlockMVM.Core.Tests/
 
-# Local development records
-/docs/
+## Local agent state and capture evidence
+/.agents/
+/.commandcode/
+/menu-ui-evidence/
+/crop.png
+/*_t*-*_*fps_*/
+
+## Local archive records and verification tools
 /.history/
-/.github/
+/.github/ISSUE_TEMPLATE/
 /KeyboardVerify/
 /LiveVerify/
 /ReshadeVerify/
 /native/DeadlockMVM.Native.Tests/
-/BUILDING.md
-/CHANGELOG.md
-/FINAL_STATUS.md
 /KNOWN-ISSUES.md
-/PROJECT_MEMORY.md
-/RESHade-IMPLEMENTATION.md
+/BUILDING.md

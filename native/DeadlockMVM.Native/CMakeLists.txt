@@ -71,19 +71,3 @@ set(SMVM_LOOK_GENERATED "${CMAKE_CURRENT_BINARY_DIR}/look_vs.h" "${CMAKE_CURRENT
 # One producer avoids parallel DLL/test shader-generation races.
 add_custom_target(SmvmLookShaders DEPENDS ${SMVM_LOOK_GENERATED})
 add_dependencies(DeadlockMVM.Native SmvmLookShaders)
-add_executable(DeadlockMVM.Look.Tests ../DeadlockMVM.Native.Tests/look_pipeline_tests.cpp look_pipeline.cpp)
-add_dependencies(DeadlockMVM.Look.Tests SmvmLookShaders)
-target_include_directories(DeadlockMVM.Look.Tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}")
-target_compile_definitions(DeadlockMVM.Look.Tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_compile_options(DeadlockMVM.Look.Tests PRIVATE /W4 /WX /permissive- /EHsc)
-target_link_libraries(DeadlockMVM.Look.Tests PRIVATE D3D11 DXGI)
-add_test(NAME DeadlockMVM.Look.Tests COMMAND DeadlockMVM.Look.Tests)
-
-
-add_executable(DeadlockMVM.CaptureLook.Tests ../DeadlockMVM.Native.Tests/capture_look_tests.cpp world_depth_capture.cpp engine_movie_audio.cpp mp4_encoder.cpp pattern_scan.cpp look_pipeline.cpp)
-add_dependencies(DeadlockMVM.CaptureLook.Tests SmvmLookShaders)
-target_include_directories(DeadlockMVM.CaptureLook.Tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}")
-target_compile_definitions(DeadlockMVM.CaptureLook.Tests PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_compile_options(DeadlockMVM.CaptureLook.Tests PRIVATE /W4 /WX /permissive- /EHsc)
-target_link_libraries(DeadlockMVM.CaptureLook.Tests PRIVATE libgmavi D3D11 D3DCompiler DXGI Mfplat Mfreadwrite Mfuuid Ole32 User32)
-add_test(NAME DeadlockMVM.CaptureLook.Tests COMMAND DeadlockMVM.CaptureLook.Tests)

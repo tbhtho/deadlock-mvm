@@ -814,6 +814,7 @@ public sealed class MainViewModel : ViewModelBase
         var launchAttempt = Interlocked.Increment(ref _launchAttemptGeneration);
         StatusMessage = "Launching replay...";
 
+        var launchStartedAt = DateTime.Now;
         var result = _launcher.Launch(request);
 
         if (result.Success)
@@ -833,7 +834,7 @@ public sealed class MainViewModel : ViewModelBase
             }
             StatusMessage = "Launching replay...";
             BeginLaunchDetectionTimeout(launchAttempt, replay.FileName);
-            BeginVerifyPlayback(launchOperation, replay.GamePath, launchThroughSteam);
+            BeginVerifyPlayback(launchOperation, replay.GamePath, launchThroughSteam, launchStartedAt);
         }
         else
         {
@@ -980,15 +981,10 @@ public sealed class MainViewModel : ViewModelBase
         });
     }
 
-    /// <summary>
-    /// Watches Deadlock's console log for engine confirmation that the demo
-    /// actually started. The game truncates the log on every launch, so the
-    /// whole file is scanned; readiness comes from file writes, not sleeps.
-    /// </summary>
-    private void BeginVerifyPlayback(int launchOperation, string gamePath, bool launchedThroughSteam)
+    private void BeginVerifyPlayback(int launchOperation, string gamePath, bool launchedThroughSteam,
+        DateTime launchStartedAt)
     {
         var consoleLogPath = DeadlockConsoleLog.GetConsoleLogPath(_gameExecutablePath);
-        var startedAfterLocal = DateTime.Now.AddMinutes(-1);
         var uiScheduler = SynchronizationContext.Current is { }
             ? TaskScheduler.FromCurrentSynchronizationContext()
             : TaskScheduler.Default;
@@ -997,7 +993,7 @@ public sealed class MainViewModel : ViewModelBase
 
         _ = Task.Run(async () =>
         {
-            var confirmed = false;
+            var playback = ReplayPlaybackStatus.Loading;
             var deadline = DateTime.UtcNow.AddSeconds(150);
 
             while (DateTime.UtcNow < deadline)
@@ -1007,12 +1003,10 @@ public sealed class MainViewModel : ViewModelBase
                 if (launchOperation != Volatile.Read(ref _launchOperationGeneration))
                     return;
 
-                if (DeadlockConsoleLog.ContainsPlaybackConfirmation(
-                        consoleLogPath, gamePath, startedAfterLocal))
-                {
-                    confirmed = true;
+                playback = DeadlockConsoleLog.ReadPlaybackStatus(
+                    consoleLogPath, gamePath, launchStartedAt);
+                if (playback != ReplayPlaybackStatus.Loading)
                     break;
-                }
             }
 
             await Task.Factory.StartNew(
@@ -1020,15 +1014,23 @@ public sealed class MainViewModel : ViewModelBase
                 {
                     if (launchOperation != Volatile.Read(ref _launchOperationGeneration))
                         return;
-                    StatusMessage = confirmed
-                        ? "Replay playback confirmed."
+                    var confirmed = playback == ReplayPlaybackStatus.Playing;
+                    StatusMessage = playback == ReplayPlaybackStatus.Failed
+                        ? "Deadlock rejected this replay while loading. Try a replay from the current game build."
+                        : confirmed ? "Replay playback confirmed."
                         : launchedThroughSteam
-                            ? "Launched via Steam but playback was not confirmed. Turn off 'Launch through Steam' and try direct launch."
+                            ? "Launched via Steam but replay playback was not confirmed. Check Deadlock's console log."
                             : "Could not confirm playback in Deadlock's console log.";
-                    _log.Info(confirmed
-                        ? $"Playback confirmed by engine: '{gamePath}.dem'"
-                        : $"Playback NOT confirmed within timeout: '{gamePath}.dem' (viaSteam={launchedThroughSteam}). " +
-                          "If via Steam, retry with direct launch so +playdemo stays on the game command line.");
+                    if (confirmed)
+                        _log.Info($"Playback confirmed by engine: '{gamePath}.dem'");
+                    else
+                        _log.Warn($"Replay '{gamePath}.dem': {StatusMessage}");
+                    if (!confirmed)
+                    {
+                        Interlocked.Increment(ref _launchOperationGeneration);
+                        CompleteLaunchOpening();
+                        LaunchCompleted?.Invoke(this, false);
+                    }
                 },
                 CancellationToken.None,
                 TaskCreationOptions.None,

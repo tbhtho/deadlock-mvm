@@ -31,7 +31,7 @@ foreach ($pack in @('Microsoft.NETCore.App.Runtime.win-x64', 'Microsoft.WindowsD
         Copy-Item -LiteralPath $notice.FullName -Destination (Join-Path $payload "THIRD_PARTY_LICENSES/$pack-$($notice.BaseName).txt")
     }
 }
-$required = @('DeadlockMVM.Launcher.exe', 'DeadlockMVM.Native.dll', 'THIRD_PARTY_NOTICES.md',
+$required = @('DeadlockMVM.Launcher.exe', 'DeadlockMVM.Native.dll', 'LICENSE', 'THIRD_PARTY_NOTICES.md',
     'THIRD_PARTY_LICENSES/DearImGui-LICENSE.txt', 'THIRD_PARTY_LICENSES/libgmavi-LICENSE.txt')
 foreach ($name in $required) {
     if (-not (Test-Path -LiteralPath (Join-Path $payload $name) -PathType Leaf)) { throw "Missing $name" }

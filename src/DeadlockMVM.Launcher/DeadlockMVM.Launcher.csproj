@@ -10,6 +10,10 @@
 
   <ItemGroup>
     <ProjectReference Include="..\DeadlockMVM.Core\DeadlockMVM.Core.csproj" />
+    <Content Include="..\..\LICENSE"
+             Link="LICENSE"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest" />
     <Content Include="..\..\THIRD_PARTY_NOTICES.md"
              Link="THIRD_PARTY_NOTICES.md"
              CopyToOutputDirectory="PreserveNewest"

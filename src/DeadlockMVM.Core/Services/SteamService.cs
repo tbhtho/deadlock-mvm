@@ -79,7 +79,15 @@ public sealed class SteamService : ISteamService
         if (string.IsNullOrWhiteSpace(path))
             return null;
 
-        var fullPath = Path.GetFullPath(path.Trim());
+        string fullPath;
+        try
+        {
+            fullPath = Path.GetFullPath(path.Trim());
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return null;
+        }
         if (File.Exists(fullPath))
             return CreateGameLocation(fullPath);
 

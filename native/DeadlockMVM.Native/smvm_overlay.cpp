@@ -87,6 +87,7 @@ constexpr auto kInstallRetryInterval = std::chrono::milliseconds(1);
 // ready for the exact RTTI/signature transaction. Retry missing presentation
 // owners after renderer capture instead of treating that first race as final.
 constexpr auto kPresentationInstallRetryInterval = std::chrono::milliseconds(1000);
+constexpr std::uint32_t kMaxPresentationInstallAttempts = 3;
 constexpr std::uint32_t kPresentationCreepHealthbarRetrying = 1u << 0;
 constexpr std::uint32_t kPresentationTowerOutlineRetrying = 1u << 1;
 constexpr std::uint32_t kPresentationTowerFadeRetrying = 1u << 2;
@@ -329,6 +330,7 @@ struct OverlayState final {
     std::atomic<bool> bootstrap_replay_presentation_suppression{false};
     std::atomic<std::uint32_t> presentation_install_retrying{0};
     std::atomic<std::uint64_t> presentation_install_last_attempt_ms{0};
+    std::atomic<std::uint32_t> presentation_install_attempts{0};
     std::atomic<std::uint32_t> previous_visible_mode{
         static_cast<std::uint32_t>(DeadlockUiMode::deadlock_ui)};
     std::atomic<std::uint32_t> last_vconsole_port{29000};
@@ -6851,6 +6853,12 @@ void PumpPresentationHookInstallation() noexcept {
     const auto client_module = GetModuleHandleW(L"client.dll");
     if (client_module == nullptr)
         return;
+    if (state.presentation_install_attempts.load(std::memory_order_acquire) >=
+            kMaxPresentationInstallAttempts) {
+        state.presentation_install_retrying.store(0, std::memory_order_release);
+        static_cast<void>(PumpTowerFadeOverride());
+        return;
+    }
     const auto now = GetTickCount64();
     const auto previous = state.presentation_install_last_attempt_ms.load(
         std::memory_order_acquire);
@@ -6858,6 +6866,7 @@ void PumpPresentationHookInstallation() noexcept {
             static_cast<std::uint64_t>(kPresentationInstallRetryInterval.count()))
         return;
     state.presentation_install_last_attempt_ms.store(now, std::memory_order_release);
+    state.presentation_install_attempts.fetch_add(1, std::memory_order_acq_rel);
 
     std::uint32_t retrying = 0;
     if (!healthbar_installed && !InstallTrooperHealthbarHook(
@@ -6927,6 +6936,7 @@ DWORD InstallerThreadBody() noexcept {
     const auto started = std::chrono::steady_clock::now();
     auto capture_attempted = false;
     std::optional<std::uintptr_t> renderer_global;
+    HMODULE scanned_renderer_module = nullptr;
     while (!g_overlay.stop_requested.load(std::memory_order_acquire)) {
         // Presentation cleanup is renderer-independent. Pump it during cold
         // module discovery as well as after hook installation so a dead host
@@ -6940,8 +6950,11 @@ DWORD InstallerThreadBody() noexcept {
         const auto render_module = GetModuleHandleW(L"rendersystemdx11.dll");
         if (render_module != nullptr) {
             capture_attempted = true;
-            if (!renderer_global)
+            // A missing signature cannot change while this module stays loaded.
+            if (render_module != scanned_renderer_module) {
                 renderer_global = ResolveRenderFactoryGlobal(render_module);
+                scanned_renderer_module = render_module;
+            }
             if (renderer_global && InstallFactoryCaptureHook(*renderer_global)) {
                 PublishStatus(SmvmRendererBackend::d3d11, SmvmRendererError::present_not_observed);
                 break;
@@ -7568,6 +7581,7 @@ bool StartSmvmOverlay(const HMODULE self_module, const SmvmOverlayCallbacks& cal
         std::memory_order_release);
     state.presentation_install_retrying.store(0, std::memory_order_release);
     state.presentation_install_last_attempt_ms.store(0, std::memory_order_release);
+    state.presentation_install_attempts.store(0, std::memory_order_release);
     state.previous_visible_mode.store(
         static_cast<std::uint32_t>(DeadlockUiMode::deadlock_ui), std::memory_order_release);
     state.last_vconsole_port.store(29000, std::memory_order_release);

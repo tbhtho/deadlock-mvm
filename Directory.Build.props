@@ -6,7 +6,7 @@
     <InformationalVersion>1.0.0</InformationalVersion>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <Product>Deadlock MVM</Product>
-    <RepositoryUrl>https://github.com/m4rc3lsowhat/Deadlock-MVM</RepositoryUrl>
+    <RepositoryUrl>https://github.com/tbhtho/deadlock-mvm</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <Deterministic>true</Deterministic>
     <PathMap>$(MSBuildThisFileDirectory)=/_/</PathMap>
